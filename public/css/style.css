@@ -359,3 +359,14 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
   .userbox { margin-left: 0; }
   .brand-text { font-size: 14px; }
 }
+
+/* ---------- v5 additions: dashboard stats, billing tabs, role switcher ---------- */
+.stat-big { font-size: 28px; font-weight: 700; color: var(--ink); margin: 6px 0; }
+.stat-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+.stat-row:last-child { border-bottom: none; }
+.tabs { display: flex; gap: 8px; margin: 12px 0; }
+.tab { background: var(--card); border: 1px solid var(--line); color: var(--ink); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
+.tab.active { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.role-switch { color: #fff; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.role-switch select { background: #fff; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+.userbox .btn-link { color: #fff; }

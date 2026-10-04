@@ -1,7 +1,9 @@
-// iM4 Health Management System (Smart Hub) - v4
+// iM4 Health Management System (Smart Hub) - v5
 // Parent/child companies with payroll roll-ups. Stewards/Companies/Assignments
 // remain import-only. Link-only kanban sync. Stage-duration learning feeds the
 // Claude summary prompt (RAG status, key dates, to-dos with owners/due dates).
+// v5 adds: Top Dog role + multi-role switching, Resend email (password reset +
+// email-code 2FA), Dashboard, Billing (invoices + CSV import).
 
 const express = require('express');
 const cors = require('cors');
@@ -26,7 +28,8 @@ const GITHUB_POST_AS = process.env.GITHUB_POST_AS || 'FTJ Solutions';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const EMAIL_FROM = process.env.EMAIL_FROM || 'no-reply@iam4.health';
+const EMAIL_FROM = process.env.EMAIL_FROM || '';
+const RESEND_FROM = process.env.RESEND_FROM || EMAIL_FROM || 'iM4 Health <no-reply@im4health.com>';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const APP_URL = process.env.APP_URL || '';
@@ -108,6 +111,43 @@ async function migrate() {
     'entered_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'exited_at TIMESTAMPTZ, ' +
     'days INT)');
+  // v5: multi-role support. stewards.role stays for backward compat; user_roles
+  // is the source of truth going forward.
+  await db.query('CREATE TABLE IF NOT EXISTS user_roles (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'steward_id INT REFERENCES stewards(id) ON DELETE CASCADE, ' +
+    "role TEXT NOT NULL CHECK (role IN ('admin', 'steward', 'top_dog')), " +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'UNIQUE(steward_id, role))');
+  // v5: hashed password-reset tokens (new flow; the legacy reset_token columns
+  // on stewards remain for the old /api/auth/forgot + /api/auth/reset flow).
+  await db.query('CREATE TABLE IF NOT EXISTS password_reset_tokens (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'steward_id INT REFERENCES stewards(id) ON DELETE CASCADE, ' +
+    'token_hash TEXT NOT NULL, ' +
+    'expires_at TIMESTAMPTZ NOT NULL, ' +
+    'used_at TIMESTAMPTZ, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  // v5: email-code two-factor authentication.
+  await db.query('CREATE TABLE IF NOT EXISTS two_factor_codes (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'steward_id INT REFERENCES stewards(id) ON DELETE CASCADE, ' +
+    'code_hash TEXT NOT NULL, ' +
+    'expires_at TIMESTAMPTZ NOT NULL, ' +
+    'used_at TIMESTAMPTZ, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  // v5: billing invoices.
+  await db.query('CREATE TABLE IF NOT EXISTS invoices (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'company_code TEXT NOT NULL, ' +
+    'company_name TEXT NOT NULL, ' +
+    'payroll_date DATE, ' +
+    'lives_count INT, ' +
+    'total_invoice NUMERIC(12,2), ' +
+    "status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'paid')), " +
+    'paid_date DATE, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -117,6 +157,7 @@ async function migrate() {
     ['stewards', 'phone', 'TEXT'],
     ['stewards', 'reset_token', 'TEXT'],
     ['stewards', 'reset_expires', 'TIMESTAMPTZ'],
+    ['stewards', 'two_factor_enabled', 'BOOLEAN NOT NULL DEFAULT FALSE'],
     ['stewards', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'github_issue_number', 'INT'],
@@ -149,6 +190,8 @@ async function migrate() {
   await db.query('UPDATE companies SET ee_company_code = parent_company_code WHERE (ee_company_code IS NULL OR ee_company_code = ' + "''" + ') AND parent_company_code IS NOT NULL AND parent_company_code <> ' + "''");
   await db.query('UPDATE companies SET ee_company_name = parent_company_name WHERE (ee_company_name IS NULL OR ee_company_name = ' + "''" + ') AND parent_company_name IS NOT NULL AND parent_company_name <> ' + "''");
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
+  // v5: backfill user_roles from the legacy single-role column (idempotent).
+  await db.query("INSERT INTO user_roles (steward_id, role) SELECT id, role FROM stewards WHERE role IN ('admin', 'steward', 'top_dog') ON CONFLICT DO NOTHING");
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -161,19 +204,34 @@ async function bootstrapAdmin() {
   const found = await db.query('SELECT id, password_hash FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [ADMIN_EMAIL]);
   if (found.rows.length === 0) {
     const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    await db.query("INSERT INTO stewards (email, name, first_name, role, password_hash) VALUES ($1, $2, $3, 'admin', $4)",
+    const ins = await db.query("INSERT INTO stewards (email, name, first_name, role, password_hash) VALUES ($1, $2, $3, 'admin', $4) RETURNING id",
       [ADMIN_EMAIL, 'Administrator', 'Administrator', hash]);
+    await db.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'admin') ON CONFLICT DO NOTHING", [ins.rows[0].id]);
     console.log('Bootstrapped admin account: ' + ADMIN_EMAIL);
-  } else if (!found.rows[0].password_hash) {
-    const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    await db.query("UPDATE stewards SET role = 'admin', password_hash = $1 WHERE id = $2", [hash, found.rows[0].id]);
-    console.log('Set admin password for: ' + ADMIN_EMAIL);
+  } else {
+    await db.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'admin') ON CONFLICT DO NOTHING", [found.rows[0].id]);
+    if (!found.rows[0].password_hash) {
+      const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+      await db.query("UPDATE stewards SET role = 'admin', password_hash = $1 WHERE id = $2", [hash, found.rows[0].id]);
+      console.log('Set admin password for: ' + ADMIN_EMAIL);
+    }
   }
 }
 
-// ---------------------------------------------------------------- auth
-function signToken(user) {
-  return jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '12h' });
+// ---------------------------------------------------------------- auth helpers
+function pickActiveRole(roles) {
+  if (!roles || roles.length === 0) return 'steward';
+  if (roles.indexOf('admin') !== -1) return 'admin';
+  const sorted = roles.slice().sort();
+  return sorted[0];
+}
+
+function signToken(user, roles, activeRole) {
+  return jwt.sign({ id: user.id, email: user.email, roles: roles, activeRole: activeRole }, JWT_SECRET, { expiresIn: '12h' });
+}
+
+function sign2faToken(userId) {
+  return jwt.sign({ id: userId, purpose: '2fa-pending' }, JWT_SECRET, { expiresIn: '10m' });
 }
 
 async function requireAuth(req, res, next) {
@@ -183,9 +241,25 @@ async function requireAuth(req, res, next) {
     const token = header.startsWith('Bearer ') ? header.slice(7) : null;
     if (!token) return res.status(401).json({ error: 'Not signed in' });
     const payload = jwt.verify(token, JWT_SECRET);
-    const r = await getPool().query('SELECT id, email, first_name, last_name, name, role FROM stewards WHERE id = $1 LIMIT 1', [payload.id]);
+    if (payload.purpose === '2fa-pending') {
+      return res.status(401).json({ error: 'Two-factor verification required' });
+    }
+    const r = await getPool().query('SELECT id, email, first_name, last_name, name, role, two_factor_enabled FROM stewards WHERE id = $1 LIMIT 1', [payload.id]);
     if (r.rows.length === 0) return res.status(401).json({ error: 'Account no longer exists' });
-    req.user = r.rows[0];
+    const row = r.rows[0];
+    // Roles come from the JWT; fall back to the legacy single-role column for
+    // tokens minted before v5.
+    let roles = payload.roles;
+    if (!Array.isArray(roles) || roles.length === 0) {
+      roles = row.role ? [row.role] : ['steward'];
+    }
+    let activeRole = payload.activeRole;
+    if (roles.indexOf(activeRole) === -1) activeRole = pickActiveRole(roles);
+    req.user = {
+      id: row.id, email: row.email, first_name: row.first_name, last_name: row.last_name,
+      name: row.name, role: activeRole, roles: roles, activeRole: activeRole,
+      two_factor_enabled: !!row.two_factor_enabled
+    };
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Session expired, please sign in again' });
@@ -194,7 +268,7 @@ async function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   requireAuth(req, res, function () {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    if (req.user.activeRole !== 'admin') return res.status(403).json({ error: 'Admin only' });
     next();
   });
 }
@@ -212,8 +286,10 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-function publicUser(u) {
-  return { id: u.id, email: u.email, name: displayName(u), role: u.role };
+function publicUser(u, roles, activeRole) {
+  const r = roles || u.roles || [u.role || 'steward'];
+  const a = activeRole || u.activeRole || pickActiveRole(r);
+  return { id: u.id, email: u.email, name: displayName(u), role: a, roles: r, activeRole: a };
 }
 
 function num(v) {
@@ -240,6 +316,71 @@ function parentName(c) {
   return ee || par || c.company_name;
 }
 
+async function userRoles(db, stewardId) {
+  const r = await db.query('SELECT role FROM user_roles WHERE steward_id = $1 ORDER BY role', [stewardId]);
+  return r.rows.map(function (x) { return x.role; });
+}
+
+// Visibility: admin and top_dog see ALL companies (null = no filter);
+// stewards see only their assigned companies.
+async function visibleCompanyIds(user) {
+  if (user.activeRole === 'admin' || user.activeRole === 'top_dog') return null;
+  const r = await getPool().query('SELECT company_id FROM assignments WHERE steward_id = $1', [user.id]);
+  return r.rows.map(x => x.company_id);
+}
+
+async function getVisibleCodes(user) {
+  if (user.activeRole === 'admin' || user.activeRole === 'top_dog') return null;
+  const r = await getPool().query(
+    'SELECT DISTINCT c.company_code FROM assignments a JOIN companies c ON c.id = a.company_id WHERE a.steward_id = $1',
+    [user.id]);
+  return r.rows.map(x => x.company_code);
+}
+
+// ---------------------------------------------------------------- email (Resend)
+async function sendEmail(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    console.log('sendEmail skipped (RESEND_API_KEY is not set): to=' + to + ' subject=' + subject);
+    return { skipped: true };
+  }
+  try {
+    const resend = new Resend(RESEND_API_KEY);
+    const result = await resend.emails.send({ from: RESEND_FROM, to: to, subject: subject, html: html });
+    return { ok: true, id: result && result.data ? result.data.id : null };
+  } catch (e) {
+    console.error('sendEmail failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Minimal CSV parser for the billing import (handles quoted commas).
+function parseCsvServer(text) {
+  const rows = [];
+  let headers = null;
+  const lines = String(text).split(String.fromCharCode(10));
+  lines.forEach(function (line) {
+    if (!line.trim()) return;
+    const cells = [];
+    let cur = '';
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === ',' && !inQ) { cells.push(cur.trim()); cur = ''; continue; }
+      cur += ch;
+    }
+    cells.push(cur.trim());
+    if (!headers) {
+      headers = cells.map(function (h) { return h.toLowerCase().trim(); });
+    } else {
+      const obj = {};
+      headers.forEach(function (h, idx) { obj[h] = cells[idx] !== undefined ? cells[idx] : ''; });
+      rows.push(obj);
+    }
+  });
+  return rows;
+}
+
 // ---------------------------------------------------------------- public
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -250,19 +391,202 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
     if (!JWT_SECRET) return res.status(500).json({ error: 'Server auth is not configured (JWT_SECRET)' });
-    const r = await getPool().query('SELECT * FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [String(email).trim()]);
+    const db = getPool();
+    const r = await db.query('SELECT * FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [String(email).trim()]);
     if (r.rows.length === 0 || !r.rows[0].password_hash) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-    const ok = await bcrypt.compare(String(password), r.rows[0].password_hash);
+    const user = r.rows[0];
+    const ok = await bcrypt.compare(String(password), user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
-    res.json({ success: true, token: signToken(r.rows[0]), user: publicUser(r.rows[0]) });
+    const roles = await userRoles(db, user.id);
+    // v5: email-code 2FA. Password is verified; hold the full session until
+    // the code checks out.
+    if (user.two_factor_enabled) {
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+      const expires = new Date(Date.now() + 10 * 60 * 1000);
+      await db.query('INSERT INTO two_factor_codes (steward_id, code_hash, expires_at) VALUES ($1, $2, $3)',
+        [user.id, codeHash, expires.toISOString()]);
+      await sendEmail(user.email, 'Your iM4 Health login code',
+        '<p>Your iM4 Health login code is:</p>' +
+        '<p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">' + code + '</p>' +
+        '<p>This code expires in 10 minutes. If you did not try to sign in, you can ignore this email.</p>');
+      return res.json({ success: true, need2fa: true, tmpToken: sign2faToken(user.id) });
+    }
+    const activeRole = pickActiveRole(roles);
+    res.json({ success: true, token: signToken(user, roles, activeRole), user: publicUser(user, roles, activeRole) });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+function appBaseUrl(req) {
+  if (APP_URL) return APP_URL.replace(/[/]+$/, '');
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+  return proto + '://' + req.get('host');
+}
+
+// v5 password reset: hashed single-use tokens, emailed link. Always returns
+// { ok: true } so nobody can probe which emails have accounts.
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const email = req.body && req.body.email ? String(req.body.email).trim() : '';
+    const done = function () { return res.json({ ok: true }); };
+    if (!email) return done();
+    const db = getPool();
+    const r = await db.query('SELECT id, email FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [email]);
+    if (r.rows.length > 0) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const expires = new Date(Date.now() + 60 * 60 * 1000);
+      await db.query('INSERT INTO password_reset_tokens (steward_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+        [r.rows[0].id, tokenHash, expires.toISOString()]);
+      const link = appBaseUrl(req) + '/#/reset-password?token=' + token;
+      await sendEmail(r.rows[0].email, 'Reset your iM4 Health password',
+        '<p>Someone requested a password reset for your iM4 Health account.</p>' +
+        '<p><a href="' + link + '">Set a new password</a></p>' +
+        '<p>This link expires in one hour. If you did not request this, you can ignore it.</p>');
+    }
+    return done();
+  } catch (error) {
+    console.error('Forgot-password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const token = req.body && req.body.token ? String(req.body.token) : '';
+    const newPassword = req.body && req.body.newPassword ? String(req.body.newPassword) : '';
+    if (!token || newPassword.length < 8) {
+      return res.status(400).json({ error: 'A valid token and a password of at least 8 characters are required' });
+    }
+    const db = getPool();
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const r = await db.query(
+      'SELECT id, steward_id FROM password_reset_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() LIMIT 1',
+      [tokenHash]);
+    if (r.rows.length === 0) return res.status(400).json({ error: 'This reset link is invalid or has expired' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.query('UPDATE stewards SET password_hash = $1 WHERE id = $2', [hash, r.rows[0].steward_id]);
+    await db.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [r.rows[0].id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Reset-password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- 2FA (email codes)
+async function latestCode(db, stewardId) {
+  const r = await db.query(
+    'SELECT id, code_hash FROM two_factor_codes WHERE steward_id = $1 AND used_at IS NULL AND expires_at > NOW() ' +
+    'ORDER BY created_at DESC LIMIT 1', [stewardId]);
+  return r.rows.length > 0 ? r.rows[0] : null;
+}
+
+app.post('/api/auth/2fa/verify-login', async (req, res) => {
+  try {
+    const tmpToken = req.body && req.body.tmpToken ? String(req.body.tmpToken) : '';
+    const code = req.body && req.body.code ? String(req.body.code).trim() : '';
+    if (!tmpToken || !code) return res.status(400).json({ error: 'A login token and code are required' });
+    let payload;
+    try {
+      payload = jwt.verify(tmpToken, JWT_SECRET);
+    } catch (e) {
+      return res.status(401).json({ error: 'Login session expired, please sign in again' });
+    }
+    if (!payload || payload.purpose !== '2fa-pending' || !payload.id) {
+      return res.status(401).json({ error: 'Invalid login session' });
+    }
+    const db = getPool();
+    const row = await latestCode(db, payload.id);
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+    if (!row || row.code_hash !== codeHash) {
+      return res.status(400).json({ error: 'That code is incorrect or has expired' });
+    }
+    await db.query('UPDATE two_factor_codes SET used_at = NOW() WHERE id = $1', [row.id]);
+    const u = await db.query('SELECT * FROM stewards WHERE id = $1 LIMIT 1', [payload.id]);
+    if (u.rows.length === 0) return res.status(401).json({ error: 'Account no longer exists' });
+    const roles = await userRoles(db, u.rows[0].id);
+    const activeRole = pickActiveRole(roles);
+    res.json({ success: true, token: signToken(u.rows[0], roles, activeRole), user: publicUser(u.rows[0], roles, activeRole) });
+  } catch (error) {
+    console.error('2FA verify-login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/auth/2fa/status', requireAuth, async (req, res) => {
+  res.json({ enabled: !!req.user.two_factor_enabled });
+});
+
+app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
+  try {
+    const db = getPool();
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+    const expires = new Date(Date.now() + 10 * 60 * 1000);
+    await db.query('INSERT INTO two_factor_codes (steward_id, code_hash, expires_at) VALUES ($1, $2, $3)',
+      [req.user.id, codeHash, expires.toISOString()]);
+    await sendEmail(req.user.email, 'Your iM4 Health verification code',
+      '<p>Your iM4 Health verification code is:</p>' +
+      '<p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">' + code + '</p>' +
+      '<p>This code expires in 10 minutes.</p>');
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('2FA enable error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/2fa/confirm', requireAuth, async (req, res) => {
+  try {
+    const code = req.body && req.body.code ? String(req.body.code).trim() : '';
+    if (!code) return res.status(400).json({ error: 'A code is required' });
+    const db = getPool();
+    const row = await latestCode(db, req.user.id);
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+    if (!row || row.code_hash !== codeHash) {
+      return res.status(400).json({ error: 'That code is incorrect or has expired' });
+    }
+    await db.query('UPDATE two_factor_codes SET used_at = NOW() WHERE id = $1', [row.id]);
+    await db.query('UPDATE stewards SET two_factor_enabled = TRUE WHERE id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('2FA confirm error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
+  try {
+    await getPool().query('UPDATE stewards SET two_factor_enabled = FALSE WHERE id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('2FA disable error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// v5: switch the active role (only to a role the user actually has).
+app.post('/api/auth/switch-role', requireAuth, async (req, res) => {
+  try {
+    const role = req.body && req.body.role ? String(req.body.role) : '';
+    if (!role || req.user.roles.indexOf(role) === -1) {
+      return res.status(403).json({ error: 'That role is not available for this account' });
+    }
+    const token = signToken(req.user, req.user.roles, role);
+    res.json({ success: true, token: token, user: publicUser(req.user, req.user.roles, role) });
+  } catch (error) {
+    console.error('Switch-role error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Legacy password-reset flow (kept working): raw token on the steward row.
 function baseUrl(req) {
   if (APP_URL) return APP_URL.replace(/[/]+$/, '');
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
@@ -276,23 +600,14 @@ app.post('/api/auth/forgot', async (req, res) => {
     if (!email) return done();
     const r = await getPool().query('SELECT id, email FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [String(email).trim()]);
     if (r.rows.length === 0) return done();
-    if (!RESEND_API_KEY) {
-      console.error('Password reset requested but RESEND_API_KEY is not set');
-      return done();
-    }
     const token = crypto.randomBytes(32).toString('hex');
     const expires = new Date(Date.now() + 60 * 60 * 1000);
     await getPool().query('UPDATE stewards SET reset_token = $1, reset_expires = $2 WHERE id = $3', [token, expires.toISOString(), r.rows[0].id]);
     const link = baseUrl(req) + '/#reset?token=' + token;
-    const resend = new Resend(RESEND_API_KEY);
-    await resend.emails.send({
-      from: EMAIL_FROM,
-      to: r.rows[0].email,
-      subject: 'Reset your iM4 Health password',
-      html: '<p>Someone requested a password reset for your iM4 Health account.</p>' +
-        '<p><a href="' + link + '">Set a new password</a></p>' +
-        '<p>This link expires in one hour. If you did not request this, you can ignore it.</p>'
-    });
+    await sendEmail(r.rows[0].email, 'Reset your iM4 Health password',
+      '<p>Someone requested a password reset for your iM4 Health account.</p>' +
+      '<p><a href="' + link + '">Set a new password</a></p>' +
+      '<p>This link expires in one hour. If you did not request this, you can ignore it.</p>');
     return done();
   } catch (error) {
     console.error('Forgot-password error:', error);
@@ -320,7 +635,9 @@ app.post('/api/auth/reset', async (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
-  res.json(publicUser(req.user));
+  const u = publicUser(req.user, req.user.roles, req.user.activeRole);
+  u.two_factor_enabled = !!req.user.two_factor_enabled;
+  res.json(u);
 });
 
 // ---------------------------------------------------------------- github helpers
@@ -354,12 +671,6 @@ async function postIssueComment(repo, issueNumber, body) {
   });
   if (!resp.ok) throw new Error('GitHub comment post returned ' + resp.status);
   return resp.json();
-}
-
-async function visibleCompanyIds(user) {
-  if (user.role === 'admin') return null;
-  const r = await getPool().query('SELECT company_id FROM assignments WHERE steward_id = $1', [user.id]);
-  return r.rows.map(x => x.company_id);
 }
 
 function numericCodeSort(prefix) {
@@ -582,11 +893,150 @@ app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- admin: stewards (read-only list; import only; password set)
+// ---------------------------------------------------------------- v5: dashboard
+app.get('/api/dashboard', requireAuth, async (req, res) => {
+  try {
+    const db = getPool();
+    const ids = await visibleCompanyIds(req.user);
+    const codes = await getVisibleCodes(req.user);
+    let coWhere = '';
+    const coParams = [];
+    if (ids) {
+      if (ids.length === 0) {
+        return res.json({ totalClients: 0, clientsByStage: [], totalLives: 0, billingOpen: { count: 0, total: 0 }, billingPaid: { count: 0, total: 0 } });
+      }
+      coWhere = 'WHERE c.id = ANY($1)';
+      coParams.push(ids);
+    }
+    const tc = await db.query('SELECT COUNT(*)::int AS c FROM companies c ' + coWhere, coParams);
+    const tl = await db.query(
+      'SELECT COALESCE(SUM(COALESCE(c.payroll_qualified, c.payroll_total - COALESCE(c.payroll_ineligible, 0) - COALESCE(c.payroll_opted_out, 0))), 0)::int AS t ' +
+      'FROM companies c ' + coWhere, coParams);
+    let stWhere = '';
+    const stParams = [];
+    if (ids) {
+      stWhere = 'WHERE c.id = ANY($1)';
+      stParams.push(ids);
+    }
+    const st = await db.query(
+      'SELECT i.stage AS stage, COUNT(*)::int AS count FROM implementations i ' +
+      'JOIN companies c ON c.id = i.company_id ' + stWhere + ' GROUP BY i.stage ORDER BY i.stage', stParams);
+    let billingOpen = { count: 0, total: 0 };
+    let billingPaid = { count: 0, total: 0 };
+    if (codes === null || codes.length > 0) {
+      let bWhere = '';
+      const bParams = [];
+      if (codes) {
+        bWhere = 'WHERE company_code = ANY($1)';
+        bParams.push(codes);
+      }
+      const b = await db.query(
+        "SELECT status, COUNT(*)::int AS count, COALESCE(SUM(total_invoice), 0)::float AS total FROM invoices " +
+        bWhere + ' GROUP BY status', bParams);
+      b.rows.forEach(function (x) {
+        if (x.status === 'open') billingOpen = { count: x.count, total: x.total };
+        if (x.status === 'paid') billingPaid = { count: x.count, total: x.total };
+      });
+    }
+    res.json({
+      totalClients: tc.rows[0].c,
+      clientsByStage: st.rows,
+      totalLives: tl.rows[0].t,
+      billingOpen: billingOpen,
+      billingPaid: billingPaid
+    });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- v5: billing
+app.get('/api/billing', requireAuth, async (req, res) => {
+  try {
+    const status = req.query.status === 'paid' ? 'paid' : 'open';
+    const codes = await getVisibleCodes(req.user);
+    if (codes && codes.length === 0) return res.json([]);
+    let where = 'WHERE status = $1';
+    const params = [status];
+    if (codes) {
+      params.push(codes);
+      where += ' AND company_code = ANY($2)';
+    }
+    const r = await getPool().query(
+      'SELECT * FROM invoices ' + where + ' ORDER BY payroll_date DESC NULLS LAST, company_code', params);
+    res.json(r.rows);
+  } catch (error) {
+    console.error('Billing error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// v5: billing CSV import (admin only). Accepts { csv } text or { rows } array.
+// Columns: company_code, company_name, payroll_date, lives_count,
+// total_invoice, status, paid_date. Upserts on (company_code, payroll_date).
+app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    let rows = [];
+    if (Array.isArray(body.rows)) rows = body.rows;
+    else if (body.csv) rows = parseCsvServer(body.csv);
+    else return res.status(400).json({ error: 'Provide { csv } text or { rows }' });
+    const db = getPool();
+    let imported = 0;
+    let updated = 0;
+    const errors = [];
+    for (let idx = 0; idx < rows.length; idx++) {
+      const row = rows[idx];
+      const line = idx + 2;
+      try {
+        const company_code = row.company_code !== undefined && row.company_code !== null ? String(row.company_code).trim() : '';
+        const company_name = row.company_name !== undefined && row.company_name !== null ? String(row.company_name).trim() : '';
+        if (!company_code) throw new Error('company_code is required');
+        if (!company_name) throw new Error('company_name is required');
+        const payroll_date = toISODate(row.payroll_date);
+        const lives_count = num(row.lives_count);
+        let total_invoice = null;
+        if (row.total_invoice !== undefined && row.total_invoice !== null && String(row.total_invoice).trim() !== '') {
+          total_invoice = parseFloat(String(row.total_invoice));
+          if (isNaN(total_invoice)) throw new Error('total_invoice must be a number');
+        }
+        let status = row.status !== undefined && row.status !== null && String(row.status).trim() !== ''
+          ? String(row.status).trim().toLowerCase() : 'open';
+        if (status !== 'open' && status !== 'paid') throw new Error("status must be 'open' or 'paid'");
+        const paid_date = toISODate(row.paid_date);
+        const up = await db.query(
+          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, updated_at = NOW() ' +
+          'WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL))',
+          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date]);
+        if (up.rowCount > 0) {
+          updated++;
+        } else {
+          await db.query(
+            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date) ' +
+            'VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date]);
+          imported++;
+        }
+      } catch (e) {
+        errors.push('Row ' + line + ': ' + e.message);
+      }
+    }
+    res.json({ success: true, imported: imported, updated: updated, errors: errors });
+  } catch (error) {
+    console.error('Billing import error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)
 app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
   try {
     const r = await getPool().query(
-      "SELECT id, email, first_name, last_name, name, phone, role, created_at FROM stewards ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, id");
+      "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.role, s.created_at, " +
+      "COALESCE(array_agg(ur.role) FILTER (WHERE ur.role IS NOT NULL), '{}') AS roles " +
+      "FROM stewards s LEFT JOIN user_roles ur ON ur.steward_id = s.id " +
+      "GROUP BY s.id ORDER BY CASE WHEN s.role = 'admin' THEN 0 ELSE 1 END, s.id");
     res.json(r.rows);
   } catch (error) {
     console.error('Admin stewards error:', error);
@@ -606,6 +1056,34 @@ app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Admin set password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// v5: replace a steward's roles (admin only). Keeps at least one role.
+app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
+  try {
+    const steward_id = req.body && req.body.steward_id;
+    const roles = req.body && req.body.roles;
+    const allowed = ['admin', 'steward', 'top_dog'];
+    if (!steward_id || !Array.isArray(roles) || roles.length === 0) {
+      return res.status(400).json({ error: 'steward_id and a non-empty roles array are required' });
+    }
+    for (const r of roles) {
+      if (allowed.indexOf(r) === -1) return res.status(400).json({ error: 'Invalid role: ' + r });
+    }
+    const db = getPool();
+    const s = await db.query('SELECT id FROM stewards WHERE id = $1', [steward_id]);
+    if (s.rows.length === 0) return res.status(404).json({ error: 'Steward not found' });
+    await db.query('DELETE FROM user_roles WHERE steward_id = $1', [steward_id]);
+    for (const r of roles) {
+      await db.query('INSERT INTO user_roles (steward_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING', [steward_id, r]);
+    }
+    // Keep the legacy single-role column in sync for backward compatibility.
+    await db.query('UPDATE stewards SET role = $1 WHERE id = $2', [roles[0], steward_id]);
+    res.json({ success: true, roles: roles });
+  } catch (error) {
+    console.error('Set-roles error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -766,36 +1244,46 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
           const hash = s.password ? await bcrypt.hash(s.password, 10) : null;
           // The live table requires name NOT NULL; keep it in sync with first/last.
           const nm = [s.first_name, s.last_name].filter(Boolean).join(' ').trim() || s.email;
+          let savedId = null;
           if (s.steward_id !== null) {
-            // Explicit Steward ID: upsert on id, never touch role.
+            // Explicit Steward ID: upsert on id, never touch existing roles.
             if (hash) {
-              await db.query(
+              const r = await db.query(
                 'INSERT INTO stewards (id, email, name, first_name, last_name, phone, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, $7, ' + "'steward'" + ') ' +
                 'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, first_name = EXCLUDED.first_name, ' +
-                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash',
+                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash RETURNING id',
                 [s.steward_id, s.email, nm, s.first_name, s.last_name, s.phone, hash]);
+              savedId = r.rows[0].id;
             } else {
-              await db.query(
+              const r = await db.query(
                 'INSERT INTO stewards (id, email, name, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, $6, ' + "'steward'" + ') ' +
                 'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, first_name = EXCLUDED.first_name, ' +
-                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone',
+                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone RETURNING id',
                 [s.steward_id, s.email, nm, s.first_name, s.last_name, s.phone]);
+              savedId = r.rows[0].id;
             }
           } else {
-            // No Steward ID: upsert on email, never touch role.
+            // No Steward ID: upsert on email, never touch existing roles.
             if (hash) {
-              await db.query(
+              const r = await db.query(
                 'INSERT INTO stewards (email, name, first_name, last_name, phone, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, ' + "'steward'" + ') ' +
                 'ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
-                'phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash',
+                'phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash RETURNING id',
                 [s.email, nm, s.first_name, s.last_name, s.phone, hash]);
+              savedId = r.rows[0].id;
             } else {
-              await db.query(
+              const r = await db.query(
                 'INSERT INTO stewards (email, name, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, ' + "'steward'" + ') ' +
                 'ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
-                'phone = EXCLUDED.phone',
+                'phone = EXCLUDED.phone RETURNING id',
                 [s.email, nm, s.first_name, s.last_name, s.phone]);
+              savedId = r.rows[0].id;
             }
+          }
+          // v5: everyone imported here is at least a steward; keep user_roles
+          // in sync without touching roles an admin may have assigned.
+          if (savedId) {
+            await db.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'steward') ON CONFLICT DO NOTHING", [savedId]);
           }
           imported++;
         } catch (err) { commitErrors.push(s.email + ': ' + err.message); }
@@ -1208,6 +1696,7 @@ app.post('/api/admin/run-summaries-now', requireAdmin, async (req, res) => {
   try {
     res.json(await runSummaries());
   } catch (error) {
+    console.error('Summaries error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

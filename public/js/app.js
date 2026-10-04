@@ -1,5 +1,7 @@
-// iM4 Health Management System (Smart Hub) - v4 frontend
+// iM4 Health Management System (Smart Hub) - v5 frontend
 // Full-replacement SPA: hash routing, JWT auth, parent/child cards, hamburger nav.
+// v5 adds: Dashboard landing page, Billing, role switcher, 2FA login + Security
+// page, new password-reset flow (legacy flow kept).
 
 (function () {
 'use strict';
@@ -24,6 +26,12 @@ function fmtDateTime(d) {
   return isNaN(dt.getTime()) ? '' : dt.toLocaleString();
 }
 
+function fmtMoney(v) {
+  var n = Number(v || 0);
+  if (isNaN(n)) n = 0;
+  return '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 function personName(p) {
   var full = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
   return full || p.name || p.email || '';
@@ -31,6 +39,12 @@ function personName(p) {
 
 function num(v) {
   return (v === null || v === undefined) ? null : v;
+}
+
+function roleLabel(r) {
+  if (r === 'admin') return 'Admin';
+  if (r === 'top_dog') return 'Top Dog';
+  return 'Steward';
 }
 
 function rollLine(total, eligible, enrolled) {
@@ -84,15 +98,17 @@ function logoHtml(size) {
 function navLinks() {
   var u = state.user;
   var links = [
-    ['#/clients', 'Clients'],
-    ['#/implementations', 'Implementations']
+    ['#/dashboard', 'Dashboard'],
+    ['#/clients', 'Companies'],
+    ['#/billing', 'Billing'],
+    ['#/implementations', 'Implementation']
   ];
   if (u && u.role === 'admin') {
+    links.push(['#/admin/jobs', 'Jobs']);
     links.push(['#/admin/stewards', 'Stewards']);
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
     links.push(['#/admin/import', 'Import']);
-    links.push(['#/admin/jobs', 'Jobs']);
   }
   return links;
 }
@@ -102,18 +118,28 @@ function shell(inner, active) {
   var menu = '';
   if (u) {
     var items = navLinks().map(function (l) {
-      var on = active === l[1].toLowerCase().replace(/ /g, '-');
+      var on = active === l[0];
       return '<a class="menu-item' + (on ? ' active' : '') + '" href="' + l[0] + '">' + l[1] + '</a>';
     }).join('');
     menu = '<div class="hamb-wrap"><button class="hamb" id="hamb" aria-label="Menu">&#9776;</button>' +
       '<div class="hamb-menu" id="hambmenu">' + items + '</div></div>';
   }
+  // Role switcher: only when the user actually has more than one role.
+  var roleSwitcher = '';
+  if (u && u.roles && u.roles.length > 1) {
+    var opts = u.roles.map(function (r) {
+      return '<option value="' + esc(r) + '"' + (r === u.activeRole ? ' selected' : '') + '>' + esc(roleLabel(r)) + '</option>';
+    }).join('');
+    roleSwitcher = '<label class="role-switch">Viewing as: <select id="roleswitch">' + opts + '</select></label>';
+  }
   var userBox = u
-    ? '<span class="user-email">' + esc(u.name || u.email) + ' <em>(' + esc(u.role) + ')</em></span>' +
+    ? roleSwitcher +
+      '<span class="user-email">' + esc(u.name || u.email) + ' <em>(' + esc(roleLabel(u.activeRole || u.role)) + ')</em></span>' +
+      '<a class="btn btn-link" href="#/security">Security</a>' +
       '<button class="btn btn-link" id="signout">Sign out</button>'
     : '';
   return '<header class="topbar">' + menu +
-    '<a class="brand" href="#/clients">' + logoHtml(34) + '<span class="brand-text">Management System</span></a>' +
+    '<a class="brand" href="#" id="brandlink">' + logoHtml(34) + '<span class="brand-text">Management System</span></a>' +
     '<div class="userbox">' + userBox + '</div></header>' +
     '<main class="main">' + inner + '</main>';
 }
@@ -122,6 +148,22 @@ function render(html) {
   document.getElementById('app').innerHTML = html;
   var so = document.getElementById('signout');
   if (so) so.onclick = function () { api.setToken(null); state.user = null; location.hash = '#/login'; };
+  // Logo click: dashboard when signed in, login screen when not.
+  var brand = document.getElementById('brandlink');
+  if (brand) brand.onclick = function (e) {
+    e.preventDefault();
+    location.hash = api.token ? '#/dashboard' : '#/login';
+  };
+  var rs = document.getElementById('roleswitch');
+  if (rs) rs.onchange = function () {
+    api.post('/api/auth/switch-role', { role: rs.value }).then(function (d) {
+      api.setToken(d.token);
+      state.user = d.user;
+      if (location.hash === '#/dashboard') { route(); } else { location.hash = '#/dashboard'; }
+    }).catch(function (err) {
+      alert('Could not switch role: ' + err.message);
+    });
+  };
   var hamb = document.getElementById('hamb');
   var hm = document.getElementById('hambmenu');
   if (hamb && hm) {
@@ -158,21 +200,92 @@ function viewLogin() {
     '<form id="f"><label>Email<input type="email" id="email" required autocomplete="username"></label>' +
     '<label>Password<input type="password" id="password" required autocomplete="current-password"></label>' +
     '<button class="btn btn-primary" type="submit">Sign in</button></form>' +
-    '<p class="muted"><a href="#/forgot">Forgot your password?</a></p></div></div>');
+    '<p class="muted"><a href="#/reset-password">Forgot your password?</a></p></div></div>');
   document.getElementById('f').onsubmit = function (e) {
     e.preventDefault();
     var email = document.getElementById('email').value;
     var password = document.getElementById('password').value;
-    api.post('/api/auth/login', { email: email, password: password }).then(function (d) {
+    doLogin(email, password);
+  };
+}
+
+function doLogin(email, password) {
+  api.post('/api/auth/login', { email: email, password: password }).then(function (d) {
+    if (d.need2fa) {
+      view2fa(d.tmpToken, email, password);
+      return;
+    }
+    api.setToken(d.token);
+    state.user = d.user;
+    location.hash = '#/dashboard';
+  }).catch(function (err) {
+    var el = document.getElementById('err');
+    if (el) el.innerHTML = errorHtml(err.message);
+  });
+}
+
+// Second step of login when the account has 2FA enabled.
+function view2fa(tmpToken, email, password) {
+  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
+    '<h1>Check your email</h1><div id="err"></div>' +
+    '<p class="muted">We sent a 6-digit code to your email. Enter it below.</p>' +
+    '<form id="f"><label>Code<input id="code" inputmode="numeric" autocomplete="one-time-code" ' +
+    'placeholder="123456" required maxlength="6"></label>' +
+    '<button class="btn btn-primary" type="submit">Verify</button></form>' +
+    '<p class="muted"><a href="#" id="resend">Resend code</a></p></div></div>');
+  document.getElementById('f').onsubmit = function (e) {
+    e.preventDefault();
+    var code = document.getElementById('code').value;
+    api.post('/api/auth/2fa/verify-login', { tmpToken: tmpToken, code: code }).then(function (d) {
       api.setToken(d.token);
       state.user = d.user;
-      location.hash = '#/clients';
+      location.hash = '#/dashboard';
     }).catch(function (err) {
       document.getElementById('err').innerHTML = errorHtml(err.message);
     });
   };
+  document.getElementById('resend').onclick = function (e) {
+    e.preventDefault();
+    document.getElementById('err').innerHTML = '<p class="muted">Sending a new code...</p>';
+    doLogin(email, password);
+  };
 }
 
+// v5 password reset: email step, or new-password step when a token is present.
+function viewResetPassword(token) {
+  if (token) {
+    render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
+      '<h1>Set a new password</h1><div id="msg"></div>' +
+      '<form id="f"><label>New password (8+ characters)<input type="password" id="pw" required minlength="8" autocomplete="new-password"></label>' +
+      '<button class="btn btn-primary" type="submit">Set password</button></form></div></div>');
+    document.getElementById('f').onsubmit = function (e) {
+      e.preventDefault();
+      api.post('/api/auth/reset-password', { token: token, newPassword: document.getElementById('pw').value }).then(function () {
+        document.getElementById('msg').innerHTML = okHtml('Password updated. <a href="#/login">Sign in</a>.');
+        document.getElementById('f').style.display = 'none';
+      }).catch(function (err) {
+        document.getElementById('msg').innerHTML = errorHtml(err.message);
+      });
+    };
+    return;
+  }
+  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
+    '<h1>Reset password</h1><div id="msg"></div>' +
+    '<form id="f"><label>Email<input type="email" id="email" required autocomplete="username"></label>' +
+    '<button class="btn btn-primary" type="submit">Send reset link</button></form>' +
+    '<p class="muted"><a href="#/login">Back to sign in</a></p></div></div>');
+  document.getElementById('f').onsubmit = function (e) {
+    e.preventDefault();
+    api.post('/api/auth/forgot-password', { email: document.getElementById('email').value }).then(function () {
+      document.getElementById('msg').innerHTML = okHtml('If that email has an account, a reset link is on its way.');
+      document.getElementById('f').style.display = 'none';
+    }).catch(function (err) {
+      document.getElementById('msg').innerHTML = errorHtml(err.message);
+    });
+  };
+}
+
+// Legacy reset flow (kept working).
 function viewForgot() {
   render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
     '<h1>Reset password</h1><div id="msg"></div>' +
@@ -212,6 +325,132 @@ function requireUser(next) {
     .catch(function () { location.hash = '#/login'; });
 }
 
+// ---------------------------------------------------------------- dashboard (landing page after login)
+function viewDashboard() {
+  requireUser(function () {
+    api.get('/api/dashboard').then(function (d) {
+      var stageRows = d.clientsByStage.map(function (s) {
+        return '<div class="stat-row"><span>' + esc(s.stage || 'No stage') + '</span><b>' + s.count + '</b></div>';
+      }).join('');
+      render(shell(
+        '<h2>Dashboard</h2><div id="err"></div>' +
+        '<div class="card-grid">' +
+        '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div></div>' +
+        '<div class="card"><div class="card-title">Total Lives</div><div class="stat-big">' + d.totalLives + '</div></div>' +
+        '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div>' +
+        '<div class="muted">' + fmtMoney(d.billingOpen.total) + ' outstanding</div></div>' +
+        '<div class="card"><div class="card-title">Paid Invoices</div><div class="stat-big">' + d.billingPaid.count + '</div>' +
+        '<div class="muted">' + fmtMoney(d.billingPaid.total) + ' collected</div></div>' +
+        '</div>' +
+        '<h3>Clients by Stage</h3>' +
+        '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>',
+        '#/dashboard'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/dashboard')); });
+  });
+}
+
+// ---------------------------------------------------------------- billing
+function viewBilling() {
+  requireUser(function () {
+    var tab = 'open';
+    function load() {
+      api.get('/api/billing?status=' + tab).then(function (rows) {
+        var isAdmin = state.user.role === 'admin';
+        var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
+          (tab === 'paid' ? '<th>Day Paid</th>' : '') + '</tr>';
+        function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
+        var body = rows.map(function (r) {
+          return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+            cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
+            '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
+            (tab === 'paid' ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
+        }).join('');
+        var tabs = '<div class="tabs">' +
+          '<button class="tab' + (tab === 'open' ? ' active' : '') + '" data-tab="open">Open Bills</button>' +
+          '<button class="tab' + (tab === 'paid' ? ' active' : '') + '" data-tab="paid">Paid</button></div>';
+        render(shell(
+          '<h2>Billing</h2><div id="msg"></div>' + tabs +
+          (isAdmin ? '<p><button class="btn btn-primary" id="importbtn">Import billing CSV</button> ' +
+            '<input type="file" id="csvfile" accept=".csv" style="display:none"></p><div id="importout"></div>' : '') +
+          (rows.length === 0
+            ? '<p class="muted">' + (tab === 'open' ? 'No open bills.' : 'No paid invoices yet.') + '</p>'
+            : '<div class="table-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'),
+          '#/billing'));
+        var tabBtns = document.querySelectorAll('[data-tab]');
+        for (var i = 0; i < tabBtns.length; i++) {
+          tabBtns[i].onclick = function () { tab = this.getAttribute('data-tab'); load(); };
+        }
+        var ib = document.getElementById('importbtn');
+        if (ib) ib.onclick = function () { document.getElementById('csvfile').click(); };
+        var cf = document.getElementById('csvfile');
+        if (cf) cf.onchange = function () {
+          var f = cf.files[0];
+          if (!f) return;
+          var reader = new FileReader();
+          reader.onload = function () {
+            var out = document.getElementById('importout');
+            out.innerHTML = '<p class="muted">Importing...</p>';
+            api.post('/api/admin/import-billing', { csv: reader.result }).then(function (r) {
+              out.innerHTML = okHtml('Imported ' + r.imported + ' new, updated ' + r.updated + '.') +
+                (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
+              load();
+            }).catch(function (err) {
+              out.innerHTML = errorHtml(err.message);
+            });
+          };
+          reader.readAsText(f);
+        };
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
+    }
+    load();
+  });
+}
+
+// ---------------------------------------------------------------- security (2FA management)
+function viewSecurity() {
+  requireUser(function () {
+    api.get('/api/auth/2fa/status').then(function (s) {
+      var enabled = !!s.enabled;
+      render(shell(
+        '<h2>Security</h2><div id="msg"></div>' +
+        '<div class="card"><div class="card-title">Two-factor authentication</div>' +
+        '<p class="muted">When enabled, signing in sends a 6-digit code to your email that you enter after your password.</p>' +
+        '<p>Status: <b>' + (enabled ? 'On' : 'Off') + '</b></p>' +
+        (enabled
+          ? '<button class="btn btn-danger" id="disable2fa">Turn off 2FA</button>'
+          : '<button class="btn btn-primary" id="enable2fa">Turn on 2FA</button>') +
+        '<div id="codebox"></div></div>',
+        '#/security'));
+      var en = document.getElementById('enable2fa');
+      if (en) en.onclick = function () {
+        api.post('/api/auth/2fa/enable', {}).then(function () {
+          document.getElementById('codebox').innerHTML =
+            '<h3>Enter the code we emailed you</h3><form id="codef" class="form-inline">' +
+            '<input id="code-in" placeholder="6-digit code" required maxlength="6" inputmode="numeric"> ' +
+            '<button class="btn btn-primary" type="submit">Verify and enable</button></form><div id="codemsg"></div>';
+          document.getElementById('codef').onsubmit = function (e) {
+            e.preventDefault();
+            api.post('/api/auth/2fa/confirm', { code: document.getElementById('code-in').value }).then(function () {
+              document.getElementById('msg').innerHTML = okHtml('Two-factor authentication is now on.');
+              viewSecurity();
+            }).catch(function (err) {
+              document.getElementById('codemsg').innerHTML = errorHtml(err.message);
+            });
+          };
+        }).catch(function (err) {
+          document.getElementById('msg').innerHTML = errorHtml(err.message);
+        });
+      };
+      var dis = document.getElementById('disable2fa');
+      if (dis) dis.onclick = function () {
+        if (!window.confirm('Turn off two-factor authentication?')) return;
+        api.post('/api/auth/2fa/disable', {}).then(function () { viewSecurity(); })
+          .catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
+      };
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/security')); });
+  });
+}
+
 // ---------------------------------------------------------------- clients (parent cards, rolled-up payroll)
 function viewClients() {
   requireUser(function () {
@@ -228,15 +467,15 @@ function viewClients() {
             '<div class="muted">' + sub + '</div></a>';
         }).join('');
         render(shell(
-          '<h2>Clients</h2>' + filterBar(q) + '<div id="err"></div>' +
+          '<h2>Companies</h2>' + filterBar(q) + '<div id="err"></div>' +
           (groups.length === 0
-            ? '<p class="muted">No clients found. Ask your administrator to import companies and assign them to you.</p>'
+            ? '<p class="muted">No companies found. Ask your administrator to import companies and assign them to you.</p>'
             : '<div class="card-grid">' + cards + '</div>'),
-          'clients'));
+          '#/clients'));
         var fq = document.getElementById('fq');
         fq.onchange = function () { q = fq.value; load(); };
         fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
-      }).catch(function (err) { render(shell(errorHtml(err.message), 'clients')); });
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/clients')); });
     }
     load();
   });
@@ -296,15 +535,15 @@ function viewParent(code) {
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
       var implCards = d.implementations.map(implCard).join('');
       render(shell(
-        '<p><a href="#/clients">&larr; Clients</a></p>' +
+        '<p><a href="#/clients">&larr; Companies</a></p>' +
         '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
         '<div class="rollup"><b>Roll-up:</b> ' + rollLine(p.total, p.eligible, p.enrolled) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Companies</h3><div class="card-grid">' + childCards + '</div>' +
         '<h3>Implementations</h3>' +
         (implCards ? '<div class="card-grid">' + implCards + '</div>' : '<p class="muted">No implementations on the kanban for this client yet.</p>'),
-        'clients'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'clients')); });
+        '#/clients'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/clients')); });
   });
 }
 
@@ -340,15 +579,15 @@ function viewChild(id) {
       var eeName = c.ee_company_name || c.parent_company_name || eeCode;
       var parentLink = (eeCode && eeCode !== c.company_code)
         ? '<p><a href="#/parent/' + esc(eeCode) + '">&larr; ' + esc(eeName) + '</a></p>'
-        : '<p><a href="#/clients">&larr; Clients</a></p>';
+        : '<p><a href="#/clients">&larr; Companies</a></p>';
       render(shell(parentLink +
         '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
         '<h3>Last payroll</h3>' + payrollTable(c) +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Implementations</h3>' +
         (implCards ? '<div class="card-grid">' + implCards + '</div>' : '<p class="muted">No implementations on the kanban for this company yet.</p>'),
-        'clients'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'clients')); });
+        '#/clients'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/clients')); });
   });
 }
 
@@ -384,15 +623,15 @@ function viewImplementations() {
           }
         }
         render(shell(
-          '<h2>Implementations</h2>' + filterBar(q, '<select id="fstage">' + stageOpts + '</select>') +
+          '<h2>Implementation</h2>' + filterBar(q, '<select id="fstage">' + stageOpts + '</select>') +
           '<div id="err"></div>' + body,
-          'implementations'));
+          '#/implementations'));
         var fq = document.getElementById('fq');
         var fs = document.getElementById('fstage');
         fq.onchange = function () { q = fq.value; load(); };
         fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
         fs.onchange = function () { stage = fs.value; load(); };
-      }).catch(function (err) { render(shell(errorHtml(err.message), 'implementations')); });
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/implementations')); });
     }
     load();
   });
@@ -475,7 +714,7 @@ function viewProject(id) {
           '<div class="summary-body">' + stripStatusLine(esc(s.body)) + '</div></div>';
       }).join('');
       render(shell(
-        '<p><a href="#/implementations">&larr; Implementations</a></p>' +
+        '<p><a href="#/implementations">&larr; Implementation</a></p>' +
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
@@ -490,7 +729,7 @@ function viewProject(id) {
         '<div id="merr"></div><div id="msglist">' +
         (msgs || '<p class="muted">No messages yet. Start the conversation above.</p>') +
         '</div></div></div>',
-        'implementations'));
+        '#/implementations'));
       document.getElementById('mform').onsubmit = function (e) {
         e.preventDefault();
         var body = document.getElementById('mbody').value;
@@ -500,27 +739,29 @@ function viewProject(id) {
           document.getElementById('merr').innerHTML = errorHtml(err.message);
         });
       };
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'implementations')); });
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/implementations')); });
   });
 }
 
-// ---------------------------------------------------------------- admin: stewards (import only; password set here)
+// ---------------------------------------------------------------- admin: stewards (import only; password + roles set here)
 function viewAdminStewards() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/stewards').then(function (list) {
       var rows = list.map(function (s) {
+        var roles = (s.roles || []).map(roleLabel).join(', ');
         return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
-          '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.role) + '</td>' +
-          '<td class="row-actions"><button class="btn btn-small" data-pw="' + s.id + '">Set password</button></td></tr>';
+          '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role) + '</td>' +
+          '<td class="row-actions"><button class="btn btn-small" data-pw="' + s.id + '">Set password</button> ' +
+          '<button class="btn btn-small" data-roles="' + s.id + '">Set roles</button></td></tr>';
       }).join('');
       render(shell(
         '<h2>Stewards</h2><div id="msg"></div>' +
         '<p class="muted">Stewards are updated by CSV import only (<a href="#/admin/import">Import tab</a>). ' +
-        'Use "Set password" to give a steward their login password.</p>' +
-        '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Role</th><th></th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table><div id="pwbox"></div>',
-        'stewards'));
+        'Use "Set password" to give a steward their login password, "Set roles" to grant Steward, Top Dog, or Admin.</p>' +
+        '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table><div id="pwbox"></div><div id="rolebox"></div>',
+        '#/admin/stewards'));
       var btns = document.querySelectorAll('[data-pw]');
       for (var i = 0; i < btns.length; i++) {
         (function (b) {
@@ -539,14 +780,49 @@ function viewAdminStewards() {
           };
         })(btns[i]);
       }
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'stewards')); });
+      var rbtns = document.querySelectorAll('[data-roles]');
+      for (var j = 0; j < rbtns.length; j++) {
+        (function (b) {
+          b.onclick = function () {
+            var id = b.getAttribute('data-roles');
+            var cur = null;
+            for (var k = 0; k < list.length; k++) {
+              if (String(list[k].id) === String(id)) cur = list[k].roles || [];
+            }
+            function chk(v) { return '<label><input type="checkbox" class="rolechk" value="' + v + '"' + (cur.indexOf(v) !== -1 ? ' checked' : '') + '> ' + roleLabel(v) + '</label>'; }
+            document.getElementById('rolebox').innerHTML =
+              '<h3>Set roles</h3><form id="rolef" class="form-inline">' +
+              chk('steward') + ' ' + chk('top_dog') + ' ' + chk('admin') + ' ' +
+              '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="rolemsg"></div>';
+            document.getElementById('rolef').onsubmit = function (e) {
+              e.preventDefault();
+              var boxes = document.querySelectorAll('.rolechk');
+              var picked = [];
+              for (var m = 0; m < boxes.length; m++) {
+                if (boxes[m].checked) picked.push(boxes[m].value);
+              }
+              if (picked.length === 0) {
+                document.getElementById('rolemsg').innerHTML = errorHtml('Pick at least one role.');
+                return;
+              }
+              api.post('/api/admin/set-roles', { steward_id: parseInt(id, 10), roles: picked }).then(function () {
+                document.getElementById('rolemsg').innerHTML = okHtml('Roles updated.');
+                viewAdminStewards();
+              }).catch(function (err) {
+                document.getElementById('rolemsg').innerHTML = errorHtml(err.message);
+              });
+            };
+          };
+        })(rbtns[j]);
+      }
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
   });
 }
 
 // ---------------------------------------------------------------- admin: companies (import only, with parent columns)
 function viewAdminCompanies() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
       function eeCode(c) { return c.ee_company_code || c.parent_company_code; }
@@ -567,15 +843,15 @@ function viewAdminCompanies() {
         '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th><th></th><th></th>' +
         '<th>Total Employees</th><th>Ineligible</th><th>Opt Out</th><th>Eligible</th><th>New Qualified</th><th>Enrolled</th><th>Not Enrolled</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>',
-        'companies'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'companies')); });
+        '#/admin/companies'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/companies')); });
   });
 }
 
 // ---------------------------------------------------------------- admin: assignments (import only)
 function viewAdminAssignments() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/assignments').then(function (list) {
       var rows = list.map(function (a) {
         return '<tr><td><b>' + a.steward_id + '</b><div class="muted">' + esc(a.steward_email || '') + '</div></td>' +
@@ -586,8 +862,8 @@ function viewAdminAssignments() {
         '<p class="muted">Assignments are updated by CSV import only (<a href="#/admin/import">Import tab</a>).</p>' +
         '<table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table>',
-        'assignments'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'assignments')); });
+        '#/admin/assignments'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/assignments')); });
   });
 }
 
@@ -626,7 +902,7 @@ var IMPORT_FORMATS = {
 
 function viewAdminImport() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     render(shell(
       '<h2>Import</h2><div id="msg"></div>' +
       '<p class="muted">Step 1: choose a type and paste CSV (first row = headers). Step 2: review validation, then confirm. ' +
@@ -639,7 +915,7 @@ function viewAdminImport() {
       '<p class="muted" id="fmt"></p>' +
       '<textarea id="csv" rows="10" class="csvbox" placeholder="paste CSV here"></textarea>' +
       '<div id="preview"></div>',
-      'import'));
+      '#/admin/import'));
     var typeSel = document.getElementById('itype');
     function showFmt() { document.getElementById('fmt').textContent = 'Columns: ' + IMPORT_FORMATS[typeSel.value]; }
     typeSel.onchange = showFmt;
@@ -668,7 +944,7 @@ function viewAdminImport() {
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
 function viewAdminJobs() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     render(shell(
       '<h2>Jobs</h2><div id="msg"></div>' +
       '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; summaries run Sunday through Thursday at 9:00 PM.</p>' +
@@ -709,7 +985,7 @@ function viewAdminJobs() {
       '<input id="delassignkey2" placeholder="Company Code">' +
       '<button class="btn btn-danger" id="delassignone">Delete assignment</button></div>' +
       '</div><div id="delout"></div>',
-      'jobs'));
+      '#/admin/jobs'));
     function pretty(d) {
       return '<pre class="muted">' + esc(JSON.stringify(d, null, 1)) + '</pre>';
     }
@@ -781,6 +1057,10 @@ function viewAdminJobs() {
 // ---------------------------------------------------------------- router
 function route() {
   var h = location.hash || '#/login';
+  if (h === '' || h === '#/') {
+    location.hash = api.token ? '#/dashboard' : '#/login';
+    return;
+  }
   var noHash = h.slice(0, 2) === '#/' ? h.slice(2) : h;
   var parts = noHash.split('?');
   var pathParts = parts[0].split('/');
@@ -789,9 +1069,13 @@ function route() {
     var p = kv.split('=');
     query[p[0]] = decodeURIComponent(p[1] || '');
   });
-  if (h === '#/login' || h === '') return viewLogin();
+  if (h === '#/login') return viewLogin();
   if (h === '#/forgot') return viewForgot();
+  if (pathParts[0] === 'reset-password') return viewResetPassword(query.token || '');
   if (pathParts[0] === 'reset') return viewReset(query.token || '');
+  if (pathParts[0] === 'dashboard') return viewDashboard();
+  if (pathParts[0] === 'billing') return viewBilling();
+  if (pathParts[0] === 'security') return viewSecurity();
   if (pathParts[0] === 'parent' && pathParts[1]) return viewParent(decodeURIComponent(pathParts[1]));
   if (pathParts[0] === 'child' && pathParts[1]) return viewChild(pathParts[1]);
   if (pathParts[0] === 'clients') return viewClients();
