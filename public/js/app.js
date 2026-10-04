@@ -911,7 +911,7 @@ function parseCSV(text) {
       cur += ch;
     }
     cells.push(cur.trim());
-    if (!headers) headers = cells;
+    if (!headers) headers = cells.map(function (h) { return h.toLowerCase().trim(); });
     else {
       var obj = {};
       headers.forEach(function (h, idx) { obj[h] = cells[idx] !== undefined ? cells[idx] : ''; });
