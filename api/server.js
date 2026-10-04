@@ -930,7 +930,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     const coParams = [];
     if (ids) {
       if (ids.length === 0) {
-        return res.json({ totalClients: 0, clientsByStage: [], totalLives: 0, billingOpen: { count: 0, total: 0 }, billingPaid: { count: 0, total: 0 } });
+        return res.json({ totalClients: 0, clientsByStage: [], totalLives: 0, totalEnrolled: 0, billingOpen: { count: 0, total: 0 }, billingPaid: { count: 0, total: 0 } });
       }
       coWhere = 'WHERE c.id = ANY($1)';
       coParams.push(ids);
@@ -939,6 +939,9 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     const tl = await db.query(
       'SELECT COALESCE(SUM(COALESCE(c.payroll_qualified, c.payroll_total - COALESCE(c.payroll_ineligible, 0) - COALESCE(c.payroll_opted_out, 0))), 0)::int AS t ' +
       'FROM companies c ' + coWhere, coParams);
+    // v5.4: Total Enrolled = sum of payroll_enrolled across each company's latest payroll.
+    const te = await db.query(
+      'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t FROM companies c ' + coWhere, coParams);
     let stWhere = '';
     const stParams = [];
     if (ids) {
@@ -985,6 +988,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       totalClients: tc.rows[0].c,
       clientsByStage: st.rows,
       totalLives: tl.rows[0].t,
+      totalEnrolled: te.rows[0].t,
       billingOpen: billingOpen,
       billingPaid: billingPaid,
       enrolledLastPayroll: enrolledLast.rows[0] ? enrolledLast.rows[0].t : 0,

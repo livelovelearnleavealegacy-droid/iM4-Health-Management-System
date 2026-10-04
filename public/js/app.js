@@ -331,22 +331,28 @@ function requireUser(next) {
 function viewDashboard() {
   requireUser(function () {
     api.get('/api/dashboard').then(function (d) {
-      var stageRows = d.clientsByStage.map(function (s) {
-        return '<div class="stat-row"><span>' + esc(s.stage || 'No stage') + '</span><b>' + s.count + '</b></div>';
+      var stageOrder = ['Onboarding IHIA', 'Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
+      var stageMap = {};
+      d.clientsByStage.forEach(function (s) { stageMap[s.stage] = s.count; });
+      var stageRows = stageOrder.map(function (st) {
+        if (!stageMap[st]) return '';
+        return '<div class="stat-row"><span>' + esc(st) + '</span><b>' + stageMap[st] + '</b></div>';
       }).join('');
+      // Any stages not in the canonical order go at the end.
+      d.clientsByStage.forEach(function (s) {
+        if (stageOrder.indexOf(s.stage) === -1) {
+          stageRows += '<div class="stat-row"><span>' + esc(s.stage || 'No stage') + '</span><b>' + s.count + '</b></div>';
+        }
+      });
       render(shell(
         '<h2>Dashboard</h2><div id="err"></div>' +
         '<div class="card-grid">' +
-        '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div>' +
-        '<div class="muted">Enrolled last payroll: <b>' + (d.enrolledLastPayroll || 0) + '</b>' +
-        (d.lastPayrollDate ? ' (' + fmtDate(d.lastPayrollDate) + ')' : '') + '</div></div>' +
-        '<div class="card"><div class="card-title">Total Lives</div><div class="stat-big">' + d.totalLives + '</div></div>' +
-        '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div>' +
-        '<div class="muted">' + fmtMoney(d.billingOpen.total) + ' outstanding</div></div>' +
-        '<div class="card"><div class="card-title">Paid Invoices</div><div class="stat-big">' + d.billingPaid.count + '</div>' +
-        '<div class="muted">' + fmtMoney(d.billingPaid.total) + ' collected</div></div>' +
+        '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div></div>' +
+        '<div class="card"><div class="card-title">Total Enrolled</div><div class="stat-big">' + (d.totalEnrolled || 0) + '</div></div>' +
+        '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div></div>' +
+        '<div class="card"><div class="card-title">$ Outstanding</div><div class="stat-big">' + fmtMoney(d.billingOpen.total) + '</div></div>' +
         '</div>' +
-        '<h3>Clients by Stage</h3>' +
+        '<h3>Implementation Stage</h3>' +
         '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>',
         '#/dashboard'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/dashboard')); });
