@@ -337,7 +337,9 @@ function viewDashboard() {
       render(shell(
         '<h2>Dashboard</h2><div id="err"></div>' +
         '<div class="card-grid">' +
-        '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div></div>' +
+        '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div>' +
+        '<div class="muted">Enrolled last payroll: <b>' + (d.enrolledLastPayroll || 0) + '</b>' +
+        (d.lastPayrollDate ? ' (' + fmtDate(d.lastPayrollDate) + ')' : '') + '</div></div>' +
         '<div class="card"><div class="card-title">Total Lives</div><div class="stat-big">' + d.totalLives + '</div></div>' +
         '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div>' +
         '<div class="muted">' + fmtMoney(d.billingOpen.total) + ' outstanding</div></div>' +
@@ -354,33 +356,48 @@ function viewDashboard() {
 // ---------------------------------------------------------------- billing
 function viewBilling() {
   requireUser(function () {
-    api.get('/api/billing?status=open').then(function (openRows) {
-      api.get('/api/billing?status=paid').then(function (paidRows) {
-        function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-        function panel(title, rows, showPaid) {
-          var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
-            (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
-          var body = rows.map(function (r) {
-            return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
-              cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
-              '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-              (showPaid ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
-          }).join('');
-          return '<div class="billing-panel"><h3>' + title + ' (' + rows.length + ')</h3>' +
-            (rows.length === 0
-              ? '<p class="muted">' + (showPaid ? 'No paid invoices yet.' : 'No open bills.') + '</p>'
-              : '<div class="table-scroll billing-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>') +
-            '</div>';
-        }
-        render(shell(
-          '<h2>Billing</h2><div id="msg"></div>' +
-          '<div class="billing-panels">' +
-          panel('Open Invoices', openRows, false) +
-          panel('Paid Invoices', paidRows, true) +
-          '</div>',
-          '#/billing'));
+    var codeFilter = '';
+    function load() {
+      api.get('/api/billing?status=open').then(function (openRows) {
+        api.get('/api/billing?status=paid').then(function (paidRows) {
+          function matches(r) {
+            if (!codeFilter) return true;
+            return String(r.company_code || '').toLowerCase().indexOf(codeFilter.toLowerCase()) !== -1;
+          }
+          var openF = openRows.filter(matches);
+          var paidF = paidRows.filter(matches);
+          function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
+          function panel(title, rows, showPaid) {
+            var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
+              (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
+            var body = rows.map(function (r) {
+              return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+                cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
+                '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
+                (showPaid ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
+            }).join('');
+            return '<div class="billing-panel"><h3>' + title + ' (' + rows.length + ')</h3>' +
+              (rows.length === 0
+                ? '<p class="muted">' + (showPaid ? 'No paid invoices yet.' : 'No open bills.') + '</p>'
+                : '<div class="table-scroll billing-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>') +
+              '</div>';
+          }
+          render(shell(
+            '<h2>Billing</h2><div id="msg"></div>' +
+            '<div class="form-inline"><label>Filter by company code: <input id="bcode" placeholder="e.g. 9001" value="' + esc(codeFilter) + '"></label> ' +
+            '<button class="btn btn-small" id="bcodeclear">Clear</button></div>' +
+            '<div class="billing-panels">' +
+            panel('Open Invoices', openF, false) +
+            panel('Paid Invoices', paidF, true) +
+            '</div>',
+            '#/billing'));
+          var bi = document.getElementById('bcode');
+          bi.oninput = function () { codeFilter = bi.value; load(); };
+          document.getElementById('bcodeclear').onclick = function () { codeFilter = ''; load(); };
+        }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
-    }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
+    }
+    load();
   });
 }
 
@@ -438,10 +455,18 @@ function viewClients() {
       api.get(url).then(function (groups) {
         var cards = groups.map(function (g) {
           var sub = g.children.length > 1 ? g.children.length + ' companies' : '1 company';
+          var invLine = '';
+          if (g.open_invoices > 0) {
+            invLine = '<div class="card-invoices"><b>' + g.open_invoices + '</b> open invoice' +
+              (g.open_invoices === 1 ? '' : 's') + ' &mdash; <b>' + fmtMoney(g.open_total) + '</b></div>';
+          } else {
+            invLine = '<div class="muted">No open invoices</div>';
+          }
           return '<a class="card" href="#/parent/' + esc(g.code) + '">' +
             '<div class="card-code">' + esc(g.code) + '</div>' +
             '<div class="card-title">' + esc(g.name) + '</div>' +
             '<div class="card-numbers">' + rollLine(g.total, g.eligible, g.enrolled) + '</div>' +
+            invLine +
             '<div class="muted">' + sub + '</div></a>';
         }).join('');
         render(shell(
@@ -997,6 +1022,10 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">Claude project summaries</div>' +
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
       '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
+      '<div class="card"><div class="card-title">Weekly email</div>' +
+      '<p class="muted">Claude writes a personalized Friday summary for each steward, top dog, and admin — week in review, their to-dos, company updates. Sends via Resend.</p>' +
+      '<label>Days back: <input id="emaildays" type="number" value="7" min="1" max="30" style="width: 60px;"></label> ' +
+      '<button class="btn btn-primary" id="runemail">Send weekly email now</button><div id="emailout"></div></div>' +
       '</div>' +
       '<h3>Delete data</h3>' +
       '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
@@ -1051,6 +1080,17 @@ function viewAdminJobs() {
       out.innerHTML = '<p class="muted">Running... this can take a minute.</p>';
       api.post('/api/admin/run-summaries-now', {}).then(function (d) {
         out.innerHTML = okHtml('Summaries finished.') + pretty(d);
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
+    document.getElementById('runemail').onclick = function () {
+      var out = document.getElementById('emailout');
+      var days = parseInt(document.getElementById('emaildays').value, 10) || 7;
+      if (!window.confirm('Send the weekly email to all stewards, top dogs, and admins?')) return;
+      out.innerHTML = '<p class="muted">Writing and sending emails... this can take a few minutes.</p>';
+      api.post('/api/admin/run-weekly-email', { days: days }).then(function (d) {
+        out.innerHTML = okHtml('Sent ' + d.sent + ' of ' + d.total + ' emails.') + pretty(d);
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });

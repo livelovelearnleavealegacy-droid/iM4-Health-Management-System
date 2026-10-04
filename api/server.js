@@ -737,7 +737,34 @@ app.get('/api/clients', requireAuth, async (req, res) => {
         ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
     const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort('c'), params);
-    res.json(groupParents(r.rows));
+    const groups = groupParents(r.rows);
+    // v5.3: attach open invoice count/total per company_code.
+    try {
+      const inv = await getPool().query(
+        "SELECT company_code, COUNT(*)::int AS open_count, COALESCE(SUM(total_invoice), 0)::float AS open_total " +
+        "FROM invoices WHERE status = 'open' GROUP BY company_code");
+      const invMap = {};
+      inv.rows.forEach(function (x) { invMap[String(x.company_code)] = x; });
+      groups.forEach(function (g) {
+        let oc = 0;
+        let ot = 0;
+        g.children.forEach(function (ch) {
+          const s = invMap[String(ch.company_code)];
+          if (s) {
+            oc += s.open_count;
+            ot += s.open_total;
+            ch.open_invoices = s.open_count;
+            ch.open_total = s.open_total;
+          } else {
+            ch.open_invoices = 0;
+            ch.open_total = 0;
+          }
+        });
+        g.open_invoices = oc;
+        g.open_total = ot;
+      });
+    } catch (e) { console.error('Invoice stats error:', e); }
+    res.json(groups);
   } catch (error) {
     console.error('Load clients error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -938,12 +965,30 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         if (x.status === 'paid') billingPaid = { count: x.count, total: x.total };
       });
     }
+    // v5.3: total enrolled from the most recent payroll_dataset_date.
+    let enrolledLast = { rows: [] };
+    try {
+      let eWhere = 'WHERE c.payroll_dataset_date IS NOT NULL';
+      const eParams = [];
+      if (ids) {
+        eParams.push(ids);
+        eWhere += ' AND c.id = ANY($' + eParams.length + ')';
+      }
+      enrolledLast = await db.query(
+        'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t, MAX(c.payroll_dataset_date)::text AS d ' +
+        'FROM companies c ' + eWhere + ' AND c.payroll_dataset_date = (' +
+        'SELECT MAX(c2.payroll_dataset_date) FROM companies c2 ' +
+        (ids ? 'WHERE c2.id = ANY($1) AND c2.payroll_dataset_date IS NOT NULL' : 'WHERE c2.payroll_dataset_date IS NOT NULL') + ')',
+        eParams);
+    } catch (e) { console.error('Enrolled last payroll error:', e); }
     res.json({
       totalClients: tc.rows[0].c,
       clientsByStage: st.rows,
       totalLives: tl.rows[0].t,
       billingOpen: billingOpen,
-      billingPaid: billingPaid
+      billingPaid: billingPaid,
+      enrolledLastPayroll: enrolledLast.rows[0] ? enrolledLast.rows[0].t : 0,
+      lastPayrollDate: enrolledLast.rows[0] ? enrolledLast.rows[0].d : null
     });
   } catch (error) {
     console.error('Dashboard error:', error);
@@ -1643,7 +1688,182 @@ app.post('/api/admin/delete-data', requireAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
+// v5.3: Weekly email. Gathers the last 7 days of activity, asks Claude to write
+// a personalized summary for each steward/top dog/admin, and sends via Resend.
+// Emphasis: to-dos assigned to the recipient, updates on their companies.
+async function runWeeklyEmail(daysBack) {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
+  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set (weekly email needs Resend)');
+  const db = getPool();
+  const days = daysBack || 7;
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const nl = String.fromCharCode(10);
+
+  // All recipients: stewards with an email who hold steward, top_dog, or admin.
+  const recips = await db.query(
+    "SELECT DISTINCT s.id, s.email, s.first_name, s.last_name, s.name " +
+    "FROM stewards s JOIN user_roles r ON r.steward_id = s.id " +
+    "WHERE s.email IS NOT NULL AND s.email <> '' AND r.role IN ('steward', 'top_dog', 'admin')");
+  if (recips.rows.length === 0) return { success: true, sent: 0, note: 'No recipients with email addresses' };
+
+  const results = [];
+  for (const recip of recips.rows) {
+    try {
+      const roles = await userRoles(db, recip.id);
+      const isTopDog = roles.indexOf('top_dog') !== -1;
+      const isAdmin = roles.indexOf('admin') !== -1;
+
+      // Companies in scope: assigned ones, or all for top dog / admin.
+      let companies = [];
+      if (isTopDog || isAdmin) {
+        const c = await db.query('SELECT id, company_code, company_name FROM companies ORDER BY company_code');
+        companies = c.rows;
+      } else {
+        const c = await db.query(
+          'SELECT c.id, c.company_code, c.company_name FROM companies c ' +
+          'JOIN assignments a ON a.company_id = c.id WHERE a.steward_id = $1 ORDER BY c.company_code', [recip.id]);
+        companies = c.rows;
+      }
+      const companyIds = companies.map(function (c) { return c.id; });
+      const companyCodes = companies.map(function (c) { return String(c.company_code); });
+      const recipName = [recip.first_name, recip.last_name].filter(Boolean).join(' ') || recip.name || recip.email;
+
+      // Activity in the window.
+      let summaries = [];
+      let messages = [];
+      let stageChanges = [];
+      let invoices = [];
+      if (companyIds.length > 0) {
+        const s = await db.query(
+          'SELECT s.summary_date, s.body, c.company_name, c.company_code FROM implementation_summaries s ' +
+          'JOIN implementations i ON i.id = s.implementation_id ' +
+          'JOIN companies c ON c.id = i.company_id ' +
+          'WHERE i.company_id = ANY($1) AND s.summary_date >= $2 ORDER BY s.summary_date DESC LIMIT 30',
+          [companyIds, since]);
+        summaries = s.rows;
+        const m = await db.query(
+          'SELECT m.created_at, m.body, m.author_name, c.company_name, c.company_code FROM messages m ' +
+          'JOIN implementations i ON i.id = m.implementation_id ' +
+          'JOIN companies c ON c.id = i.company_id ' +
+          'WHERE i.company_id = ANY($1) AND m.created_at >= $2 ORDER BY m.created_at DESC LIMIT 40',
+          [companyIds, since]);
+        messages = m.rows;
+        const sh = await db.query(
+          'SELECT sh.changed_at, sh.old_stage, sh.new_stage, c.company_name, c.company_code FROM stage_history sh ' +
+          'JOIN implementations i ON i.id = sh.implementation_id ' +
+          'JOIN companies c ON c.id = i.company_id ' +
+          'WHERE i.company_id = ANY($1) AND sh.changed_at >= $2 ORDER BY sh.changed_at DESC LIMIT 30',
+          [companyIds, since]);
+        stageChanges = sh.rows;
+      }
+      if (companyCodes.length > 0) {
+        const inv = await db.query(
+          'SELECT company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, created_at ' +
+          'FROM invoices WHERE company_code = ANY($1) AND created_at >= $2 ORDER BY created_at DESC LIMIT 30',
+          [companyCodes, since]);
+        invoices = inv.rows;
+      }
+      // Open invoices (current to-dos on the money side).
+      let openInv = [];
+      if (companyCodes.length > 0) {
+        const oi = await db.query(
+          "SELECT company_code, company_name, payroll_date, total_invoice FROM invoices " +
+          "WHERE company_code = ANY($1) AND status = 'open' ORDER BY payroll_date DESC LIMIT 20",
+          [companyCodes]);
+        openInv = oi.rows;
+      }
+
+      const fmtList = function (arr, fn) {
+        return arr.length === 0 ? '(none)' : arr.map(fn).join(nl);
+      };
+      const prompt =
+        'You are writing a Friday weekly summary email for ' + recipName +
+        ' (' + roles.join(', ') + ') at iM4 Health. Cover the last ' + days + ' days.' + nl + nl +
+        'THEIR COMPANIES (' + companies.length + '):' + nl +
+        fmtList(companies.slice(0, 40), function (c) { return '- ' + c.company_name + ' (' + c.company_code + ')'; }) + nl + nl +
+        'NEW SUMMARIES THIS WEEK:' + nl +
+        fmtList(summaries, function (s) {
+          return '- ' + s.company_name + ' (' + s.company_code + '), ' + String(s.summary_date).slice(0, 10) + ': ' + String(s.body || '').slice(0, 500);
+        }) + nl + nl +
+        'STAGE CHANGES THIS WEEK:' + nl +
+        fmtList(stageChanges, function (s) {
+          return '- ' + s.company_name + ' (' + s.company_code + '): ' + s.old_stage + ' -> ' + s.new_stage;
+        }) + nl + nl +
+        'RECENT MESSAGES:' + nl +
+        fmtList(messages, function (m) {
+          return '- ' + m.company_name + ' (' + m.company_code + '), ' + (m.author_name || 'unknown') + ': ' + String(m.body || '').slice(0, 300);
+        }) + nl + nl +
+        'NEW INVOICES THIS WEEK:' + nl +
+        fmtList(invoices, function (v) {
+          return '- ' + v.company_name + ' (' + v.company_code + '): $' + v.total_invoice + ' (' + v.status + ')';
+        }) + nl + nl +
+        'OPEN INVOICES (still owed):' + nl +
+        fmtList(openInv, function (v) {
+          return '- ' + v.company_name + ' (' + v.company_code + '): $' + v.total_invoice;
+        }) + nl + nl +
+        'Write the email in this format:' + nl +
+        'Subject line: one line, e.g. "Your iM4 weekly summary: <date range>"' + nl + nl +
+        'WEEK IN REVIEW:' + nl +
+        '- 3-5 bullets on what actually happened this week across their companies' + nl + nl +
+        'YOUR TO-DOS (emphasis here — things assigned to ' + recipName + ' or needing their attention):' + nl +
+        '- each bullet: WHAT, which COMPANY, and DUE DATE or TBD. Pull from summaries, messages, stage stalls, and open invoices.' + nl + nl +
+        'COMPANY UPDATES:' + nl +
+        '- one short paragraph or 1-2 bullets per company that had activity; skip companies with nothing new' + nl + nl +
+        'Keep it plain-spoken and tight. No preamble, no sign-off. If there was genuinely no activity, say so in one line and list the standing open items.';
+
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL,
+          max_tokens: 1500,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!resp.ok) throw new Error('Anthropic API returned ' + resp.status);
+      const data = await resp.json();
+      const text = (data.content || []).filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(nl).trim();
+
+      // Split subject from body.
+      let subject = 'Your iM4 weekly summary';
+      let body = text;
+      const subjMatch = text.match(/^(subject[^:]*:\s*)(.+)$/im);
+      if (subjMatch) {
+        subject = subjMatch[2].trim();
+        body = text.slice(subjMatch[0].length).trim();
+      }
+      const html = '<div style="font-family: sans-serif; max-width: 640px">' +
+        escHtml(body).replace(/\n/g, '<br>') + '</div>';
+
+      const sent = await sendEmail(recip.email, subject, html);
+      results.push({ email: recip.email, sent: !sent.skipped, error: sent.error || null });
+    } catch (e) {
+      console.error('Weekly email failed for ' + recip.email + ':', e.message);
+      results.push({ email: recip.email, sent: false, error: e.message });
+    }
+  }
+  const sentCount = results.filter(function (r) { return r.sent; }).length;
+  return { success: true, sent: sentCount, total: results.length, results: results };
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ---------------------------------------------------------------- weekly email (Friday nights + on demand)
+app.post('/api/admin/run-weekly-email', requireAdmin, async (req, res) => {
+  try {
+    const days = req.body && req.body.days ? parseInt(req.body.days, 10) : 7;
+    res.json(await runWeeklyEmail(days));
+  } catch (error) {
+    console.error('Weekly email error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // Learns stage durations from real cases (stage_history); falls back to defaults.
 async function typicalDurations(db) {
   const out = {};
@@ -1656,6 +1876,7 @@ async function typicalDurations(db) {
   return out;
 }
 
+// ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
 async function claudeSummarize(db, impl, company, recentMessages, typical) {
   const nl = String.fromCharCode(10);
   const msgText = recentMessages.slice(-20).map(m => '- ' + (m.author_name || 'unknown') + ' (' + (m.when || '') + '): ' + String(m.body || '').slice(0, 400)).join(nl);
