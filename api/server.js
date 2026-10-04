@@ -1864,6 +1864,18 @@ app.post('/api/admin/run-weekly-email', requireAdmin, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// Same weekly email, triggered by cron via sync secret (no JWT needed).
+app.post('/api/admin/run-weekly-email-cron', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const days = req.body && req.body.days ? parseInt(req.body.days, 10) : 7;
+    res.json(await runWeeklyEmail(days));
+  } catch (error) {
+    console.error('Weekly email cron error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // Learns stage durations from real cases (stage_history); falls back to defaults.
 async function typicalDurations(db) {
   const out = {};
