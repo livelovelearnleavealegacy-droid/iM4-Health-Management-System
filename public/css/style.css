@@ -370,3 +370,9 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .role-switch { color: #fff; font-size: 12px; display: flex; align-items: center; gap: 6px; }
 .role-switch select { background: #fff; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
 .userbox .btn-link { color: #fff; }
+/* ---------- v5.1: billing two-panel layout ---------- */
+.billing-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .billing-panels { grid-template-columns: 1fr; } }
+.billing-panel { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.billing-panel h3 { margin: 0 0 8px 0; font-size: 14px; }
+.billing-scroll { max-height: 560px; overflow-y: auto; }

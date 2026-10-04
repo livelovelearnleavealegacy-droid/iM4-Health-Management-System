@@ -352,57 +352,33 @@ function viewDashboard() {
 // ---------------------------------------------------------------- billing
 function viewBilling() {
   requireUser(function () {
-    var tab = 'open';
-    function load() {
-      api.get('/api/billing?status=' + tab).then(function (rows) {
-        var isAdmin = state.user.role === 'admin';
-        var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
-          (tab === 'paid' ? '<th>Day Paid</th>' : '') + '</tr>';
+    api.get('/api/billing?status=open').then(function (openRows) {
+      api.get('/api/billing?status=paid').then(function (paidRows) {
         function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-        var body = rows.map(function (r) {
-          return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
-            cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
-            '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-            (tab === 'paid' ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
-        }).join('');
-        var tabs = '<div class="tabs">' +
-          '<button class="tab' + (tab === 'open' ? ' active' : '') + '" data-tab="open">Open Bills</button>' +
-          '<button class="tab' + (tab === 'paid' ? ' active' : '') + '" data-tab="paid">Paid</button></div>';
-        render(shell(
-          '<h2>Billing</h2><div id="msg"></div>' + tabs +
-          (isAdmin ? '<p><button class="btn btn-primary" id="importbtn">Import billing CSV</button> ' +
-            '<input type="file" id="csvfile" accept=".csv" style="display:none"></p><div id="importout"></div>' : '') +
-          (rows.length === 0
-            ? '<p class="muted">' + (tab === 'open' ? 'No open bills.' : 'No paid invoices yet.') + '</p>'
-            : '<div class="table-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'),
-          '#/billing'));
-        var tabBtns = document.querySelectorAll('[data-tab]');
-        for (var i = 0; i < tabBtns.length; i++) {
-          tabBtns[i].onclick = function () { tab = this.getAttribute('data-tab'); load(); };
+        function panel(title, rows, showPaid) {
+          var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
+            (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
+          var body = rows.map(function (r) {
+            return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+              cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
+              '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
+              (showPaid ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
+          }).join('');
+          return '<div class="billing-panel"><h3>' + title + ' (' + rows.length + ')</h3>' +
+            (rows.length === 0
+              ? '<p class="muted">' + (showPaid ? 'No paid invoices yet.' : 'No open bills.') + '</p>'
+              : '<div class="table-scroll billing-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>') +
+            '</div>';
         }
-        var ib = document.getElementById('importbtn');
-        if (ib) ib.onclick = function () { document.getElementById('csvfile').click(); };
-        var cf = document.getElementById('csvfile');
-        if (cf) cf.onchange = function () {
-          var f = cf.files[0];
-          if (!f) return;
-          var reader = new FileReader();
-          reader.onload = function () {
-            var out = document.getElementById('importout');
-            out.innerHTML = '<p class="muted">Importing...</p>';
-            api.post('/api/admin/import-billing', { csv: reader.result }).then(function (r) {
-              out.innerHTML = okHtml('Imported ' + r.imported + ' new, updated ' + r.updated + '.') +
-                (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
-              load();
-            }).catch(function (err) {
-              out.innerHTML = errorHtml(err.message);
-            });
-          };
-          reader.readAsText(f);
-        };
+        render(shell(
+          '<h2>Billing</h2><div id="msg"></div>' +
+          '<div class="billing-panels">' +
+          panel('Open Invoices', openRows, false) +
+          panel('Paid Invoices', paidRows, true) +
+          '</div>',
+          '#/billing'));
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
-    }
-    load();
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
   });
 }
 
@@ -757,7 +733,7 @@ function viewAdminStewards() {
       }).join('');
       render(shell(
         '<h2>Stewards</h2><div id="msg"></div>' +
-        '<p class="muted">Stewards are updated by CSV import only (<a href="#/admin/import">Import tab</a>). ' +
+        '<p class="muted">Stewards are updated by CSV import only. ' +
         'Use "Set password" to give a steward their login password, "Set roles" to grant Steward, Top Dog, or Admin.</p>' +
         '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table><div id="pwbox"></div><div id="rolebox"></div>',
@@ -837,7 +813,7 @@ function viewAdminCompanies() {
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
-        '<p class="muted">Companies are updated by CSV import only (<a href="#/admin/import">Import tab</a>).</p>' +
+        '<p class="muted">Companies are updated by CSV import only.</p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Company Code</th><th>Company Name</th><th>EE Code</th><th>EE Name</th>' +
         '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th><th></th><th></th>' +
@@ -859,7 +835,7 @@ function viewAdminAssignments() {
       }).join('');
       render(shell(
         '<h2>Assignments</h2>' +
-        '<p class="muted">Assignments are updated by CSV import only (<a href="#/admin/import">Import tab</a>).</p>' +
+        '<p class="muted">Assignments are updated by CSV import only.</p>' +
         '<table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table>',
         '#/admin/assignments'));
@@ -897,7 +873,8 @@ function parseCSV(text) {
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
   companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total (or ee_total), payroll_ineligible (or ee_ineligible), payroll_opted_out (or ee_optedout), payroll_qualified (or ee_qualified), payroll_enrolled (or ee_enrolled), payroll_not_enrolled (or ee_not_enrolled), payroll_new_qualified (or ee_new_qualified), payroll_dataset_date (or ee_dataset_date, YYYY-MM-DD). Headers are case-insensitive.',
-  assignments: 'steward_id, company_code'
+  assignments: 'steward_id, company_code',
+  billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)'
 };
 
 function viewAdminImport() {
@@ -906,11 +883,12 @@ function viewAdminImport() {
     render(shell(
       '<h2>Import</h2><div id="msg"></div>' +
       '<p class="muted">Step 1: choose a type and paste CSV (first row = headers). Step 2: review validation, then confirm. ' +
-      'This is the only way Stewards, Companies, and Assignments are updated.</p>' +
+      'This is the only way Stewards, Companies, Assignments, and Billing are updated.</p>' +
       '<div class="form-inline"><select id="itype">' +
       '<option value="stewards">Stewards</option>' +
       '<option value="companies">Companies</option>' +
       '<option value="assignments">Assignments</option>' +
+      '<option value="billing">Billing</option>' +
       '</select> <button class="btn btn-primary" id="validate">Validate</button></div>' +
       '<p class="muted" id="fmt"></p>' +
       '<textarea id="csv" rows="10" class="csvbox" placeholder="paste CSV here"></textarea>' +
@@ -922,8 +900,18 @@ function viewAdminImport() {
     showFmt();
     document.getElementById('validate').onclick = function () {
       var type = typeSel.value;
-      var rows = parseCSV(document.getElementById('csv').value);
+      var csvText = document.getElementById('csv').value;
+      var rows = parseCSV(csvText);
       if (rows.length === 0) { document.getElementById('msg').innerHTML = errorHtml('No data rows found.'); return; }
+      if (type === 'billing') {
+        document.getElementById('preview').innerHTML = '<p class="muted">Importing billing...</p>';
+        api.post('/api/admin/import-billing', { rows: rows }).then(function (r) {
+          document.getElementById('preview').innerHTML = '<h3>Done</h3>' +
+            okHtml('Imported ' + r.imported + ' new, updated ' + r.updated + '.') +
+            (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
+        }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
+        return;
+      }
       api.post('/api/admin/import', { type: type, rows: rows, dry_run: true }).then(function (d) {
         var html = '<h3>Validation</h3>' + okHtml(d.valid_count + ' valid rows.') +
           (d.errors.length ? '<div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' : '') +
