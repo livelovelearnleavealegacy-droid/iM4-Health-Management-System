@@ -1060,6 +1060,61 @@ app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
   }
 });
 
+// v5.2: edit a steward's profile (admin only).
+app.put('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
+  try {
+    const { first_name, last_name, email, phone } = req.body || {};
+    if (!email || String(email).trim() === '') {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    const db = getPool();
+    const r = await db.query(
+      'UPDATE stewards SET first_name = $1, last_name = $2, email = $3, phone = $4, ' +
+      "name = TRIM(COALESCE($1,'') || ' ' || COALESCE($2,'')) WHERE id = $5 RETURNING id",
+      [first_name || null, last_name || null, String(email).trim(), phone || null, req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin edit steward error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// v5.2: delete a steward (admin only). Refuses to delete the last admin.
+app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
+  try {
+    const db = getPool();
+    const id = req.params.id;
+    const target = await db.query('SELECT id FROM stewards WHERE id = $1', [id]);
+    if (target.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const adminCount = await db.query(
+      "SELECT COUNT(*) AS c FROM user_roles WHERE role = 'admin'");
+    const targetRoles = await db.query('SELECT role FROM user_roles WHERE steward_id = $1', [id]);
+    const isAdmin = targetRoles.rows.some(function (r) { return r.role === 'admin'; });
+    if (isAdmin && parseInt(adminCount.rows[0].c, 10) <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last admin' });
+    }
+    if (String(req.user.id) === String(id)) {
+      return res.status(400).json({ error: 'You cannot delete your own account' });
+    }
+    await db.query('BEGIN');
+    try {
+      await db.query('DELETE FROM user_roles WHERE steward_id = $1', [id]);
+      await db.query('DELETE FROM assignments WHERE steward_id = $1', [id]);
+      await db.query('UPDATE messages SET steward_id = NULL WHERE steward_id = $1', [id]);
+      await db.query('DELETE FROM stewards WHERE id = $1', [id]);
+      await db.query('COMMIT');
+    } catch (e) {
+      await db.query('ROLLBACK');
+      throw e;
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin delete steward error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // v5: replace a steward's roles (admin only). Keeps at least one role.
 app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
   try {

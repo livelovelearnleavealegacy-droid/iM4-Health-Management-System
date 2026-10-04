@@ -83,7 +83,9 @@ var api = {
     });
   },
   get: function (url) { return this.call('GET', url); },
-  post: function (url, body) { return this.call('POST', url, body); }
+  post: function (url, body) { return this.call('POST', url, body); },
+  put: function (url, body) { return this.call('PUT', url, body); },
+  delete: function (url) { return this.call('DELETE', url); }
 };
 
 var state = { user: null };
@@ -728,16 +730,65 @@ function viewAdminStewards() {
         var roles = (s.roles || []).map(roleLabel).join(', ');
         return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
           '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role) + '</td>' +
-          '<td class="row-actions"><button class="btn btn-small" data-pw="' + s.id + '">Set password</button> ' +
-          '<button class="btn btn-small" data-roles="' + s.id + '">Set roles</button></td></tr>';
+          '<td class="row-actions"><button class="btn btn-small" data-edit="' + s.id + '">Edit</button> ' +
+          '<button class="btn btn-small" data-pw="' + s.id + '">Set password</button> ' +
+          '<button class="btn btn-small" data-roles="' + s.id + '">Set roles</button> ' +
+          '<button class="btn btn-small btn-danger" data-del="' + s.id + '">Delete</button></td></tr>';
       }).join('');
       render(shell(
         '<h2>Stewards</h2><div id="msg"></div>' +
         '<p class="muted">Stewards are updated by CSV import only. ' +
-        'Use "Set password" to give a steward their login password, "Set roles" to grant Steward, Top Dog, or Admin.</p>' +
+        'Use "Edit" to change name, email, or phone. "Set password" gives a steward their login password, "Set roles" grants Steward, Top Dog, or Admin.</p>' +
         '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table><div id="pwbox"></div><div id="rolebox"></div>',
+        '<tbody>' + rows + '</tbody></table><div id="editbox"></div><div id="pwbox"></div><div id="rolebox"></div>',
         '#/admin/stewards'));
+      var ebtns = document.querySelectorAll('[data-edit]');
+      for (var e = 0; e < ebtns.length; e++) {
+        (function (b) {
+          b.onclick = function () {
+            var id = b.getAttribute('data-edit');
+            var cur = null;
+            for (var k = 0; k < list.length; k++) {
+              if (String(list[k].id) === String(id)) cur = list[k];
+            }
+            document.getElementById('editbox').innerHTML =
+              '<h3>Edit steward</h3><form id="editf">' +
+              '<label>First name <input id="edit-fn" value="' + esc(cur.first_name || '') + '"></label> ' +
+              '<label>Last name <input id="edit-ln" value="' + esc(cur.last_name || '') + '"></label><br>' +
+              '<label>Email <input id="edit-em" type="email" value="' + esc(cur.email || '') + '" required></label> ' +
+              '<label>Phone <input id="edit-ph" value="' + esc(cur.phone || '') + '"></label> ' +
+              '<button class="btn btn-primary" type="submit">Save</button></form><div id="editmsg"></div>';
+            document.getElementById('editf').onsubmit = function (ev) {
+              ev.preventDefault();
+              api.put('/api/admin/stewards/' + id, {
+                first_name: document.getElementById('edit-fn').value,
+                last_name: document.getElementById('edit-ln').value,
+                email: document.getElementById('edit-em').value,
+                phone: document.getElementById('edit-ph').value
+              }).then(function () {
+                document.getElementById('editmsg').innerHTML = okHtml('Steward updated.');
+                viewAdminStewards();
+              }).catch(function (err) {
+                document.getElementById('editmsg').innerHTML = errorHtml(err.message);
+              });
+            };
+          };
+        })(ebtns[e]);
+      }
+      var dbtns = document.querySelectorAll('[data-del]');
+      for (var d = 0; d < dbtns.length; d++) {
+        (function (b) {
+          b.onclick = function () {
+            var id = b.getAttribute('data-del');
+            if (!confirm('Delete this steward? Their assignments will be removed. This cannot be undone.')) return;
+            api.delete('/api/admin/stewards/' + id).then(function () {
+              viewAdminStewards();
+            }).catch(function (err) {
+              document.getElementById('msg').innerHTML = errorHtml(err.message);
+            });
+          };
+        })(dbtns[d]);
+      }
       var btns = document.querySelectorAll('[data-pw]');
       for (var i = 0; i < btns.length; i++) {
         (function (b) {
