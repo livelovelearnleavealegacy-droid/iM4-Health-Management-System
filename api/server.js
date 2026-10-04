@@ -1749,10 +1749,10 @@ async function runWeeklyEmail(daysBack) {
           [companyIds, since]);
         messages = m.rows;
         const sh = await db.query(
-          'SELECT sh.changed_at, sh.old_stage, sh.new_stage, c.company_name, c.company_code FROM stage_history sh ' +
+          'SELECT sh.entered_at, sh.stage, c.company_name, c.company_code FROM stage_history sh ' +
           'JOIN implementations i ON i.id = sh.implementation_id ' +
           'JOIN companies c ON c.id = i.company_id ' +
-          'WHERE i.company_id = ANY($1) AND sh.changed_at >= $2 ORDER BY sh.changed_at DESC LIMIT 30',
+          'WHERE i.company_id = ANY($1) AND sh.entered_at >= $2 ORDER BY sh.entered_at DESC LIMIT 30',
           [companyIds, since]);
         stageChanges = sh.rows;
       }
@@ -1787,7 +1787,7 @@ async function runWeeklyEmail(daysBack) {
         }) + nl + nl +
         'STAGE CHANGES THIS WEEK:' + nl +
         fmtList(stageChanges, function (s) {
-          return '- ' + s.company_name + ' (' + s.company_code + '): ' + s.old_stage + ' -> ' + s.new_stage;
+          return '- ' + s.company_name + ' (' + s.company_code + '): entered ' + s.stage + ' on ' + String(s.entered_at).slice(0, 10);
         }) + nl + nl +
         'RECENT MESSAGES:' + nl +
         fmtList(messages, function (m) {
