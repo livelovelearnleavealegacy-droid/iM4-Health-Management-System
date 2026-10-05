@@ -666,18 +666,28 @@ function timelineHtml(t) {
 }
 
 // ---------------------------------------------------------------- project view: lifecycle visual + summary | messages
-function lifecycleVisual(current, daysInStage) {
+function lifecycleVisual(current, daysInStage, stageEnteredAt) {
   var idx = STAGES.indexOf(current);
   var html = '<div class="lifecycle">';
   STAGES.forEach(function (s, i) {
     var cls = 'lc-step';
     if (i < idx) cls += ' done';
     if (i === idx) cls += ' current';
+    var daysLabel = '';
+    if (i === idx) {
+      if (stageEnteredAt) {
+        var enteredMs = new Date(stageEnteredAt).getTime();
+        var trueDays = isNaN(enteredMs) ? null : Math.max(0, Math.floor((Date.now() - enteredMs) / 86400000));
+        daysLabel = '<div class="lc-days">in stage since ' + fmtDate(stageEnteredAt) +
+          (trueDays === null ? '' : ' (' + trueDays + ' days)') + '</div>';
+      } else if (daysInStage !== null && daysInStage !== undefined) {
+        daysLabel = '<div class="lc-days">' + daysInStage + ' days in stage</div>';
+      }
+    }
     html += '<div class="' + cls + '">' +
       '<div class="lc-node">' + (i < idx ? '&#10003;' : (i + 1)) + '</div>' +
       '<div class="lc-label">' + esc(s) + '</div>' +
-      (i === idx && daysInStage !== null && daysInStage !== undefined
-        ? '<div class="lc-days">' + daysInStage + ' days in stage</div>' : '') +
+      daysLabel +
       '</div>';
     if (i < STAGES.length - 1) html += '<div class="lc-link' + (i < idx ? ' done' : '') + '"></div>';
   });
@@ -746,7 +756,7 @@ function viewProject(id) {
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
-        '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage) +
+        '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage, i.stage_entered_at) +
         '<h3>14-week timeline</h3>' + timelineHtml(d.timeline) +
         '<p>' + statusHtml(i) + '</p>' +
         (i.card_title ? '<p class="muted">' + esc(i.card_title) + '</p>' : '') +
