@@ -2519,6 +2519,20 @@ app.post('/api/onboarding/:id/initiate', requireOnboarder, async (req, res) => {
   } catch (error) { console.error('Onboarding initiate error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
+// Admin: reopen an initiated onboarding card so its documents can be added,
+// changed, or deleted, then re-initiated. Re-initiating creates a brand new
+// GitHub card; the old GitHub issue is left for someone to delete manually.
+app.post('/api/admin/onboarding/:id/reopen', requireAdmin, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT id, status, client_name, github_issue_number FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (c.rows[0].status !== 'complete') return res.status(400).json({ error: 'Only initiated cards can be reopened' });
+    await db.query("UPDATE onboarding_clients SET status = 'in_progress' WHERE id = $1", [req.params.id]);
+    res.json({ ok: true, clientName: c.rows[0].client_name, previousIssue: c.rows[0].github_issue_number });
+  } catch (error) { console.error('Onboarding reopen error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // Delete a whole onboarding client card.
 app.delete('/api/onboarding/:id', requireOnboarder, async (req, res) => {
   try {

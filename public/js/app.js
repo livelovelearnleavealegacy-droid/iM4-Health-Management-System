@@ -1127,6 +1127,10 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">Claude project summaries</div>' +
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
       '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
+      '<div class="card"><div class="card-title">Reopen onboarding card</div>' +
+      '<p class="muted">Reopens an initiated (Complete) onboarding card so its documents can be added, changed, or deleted, then re-initiated. Re-initiating creates a brand new GitHub card — have someone delete the old GitHub issue.</p>' +
+      '<select id="reopencard" style="max-width: 100%;"><option value="">Loading...</option></select> ' +
+      '<button class="btn btn-primary" id="doreopen">Reopen card</button><div id="reopenout"></div></div>' +
       '<div class="card"><div class="card-title">Weekly email</div>' +
       '<p class="muted">Claude writes a personalized Friday summary for each steward, top dog, and admin — week in review, their to-dos, company updates. Sends via Resend.</p>' +
       '<label>Days back: <input id="emaildays" type="number" value="7" min="1" max="30" style="width: 60px;"></label> ' +
@@ -1210,6 +1214,37 @@ function viewAdminJobs() {
         out.innerHTML = errorHtml(err.message);
       });
     }
+    function loadReopenList() {
+      var sel = document.getElementById('reopencard');
+      api.get('/api/onboarding').then(function (list) {
+        var done = list.filter(function (c) { return c.status === 'complete'; });
+        sel.innerHTML = done.length
+          ? '<option value="">Choose a card...</option>' + done.map(function (c) {
+              return '<option value="' + c.id + '">' + esc(c.client_name) +
+                (c.github_issue_number ? ' (GitHub #' + c.github_issue_number + ')' : '') + '</option>';
+            }).join('')
+          : '<option value="">No initiated cards</option>';
+      }).catch(function () {
+        sel.innerHTML = '<option value="">Could not load cards</option>';
+      });
+    }
+    loadReopenList();
+    document.getElementById('doreopen').onclick = function () {
+      var out = document.getElementById('reopenout');
+      var id = document.getElementById('reopencard').value;
+      if (!id) { out.innerHTML = errorHtml('Choose a card first.'); return; }
+      if (!window.confirm('Reopen this card? Its documents can then be added, changed, or deleted, and it can be re-initiated into a brand new GitHub card.')) return;
+      out.innerHTML = '<p class="muted">Reopening...</p>';
+      api.post('/api/admin/onboarding/' + id + '/reopen', {}).then(function (d) {
+        out.innerHTML = okHtml('Card reopened — find it under Onboarding, In Progress.') +
+          (d.previousIssue
+            ? '<p class="muted">When you re-initiate, a brand new GitHub card is created. Have someone delete the old GitHub issue #' + d.previousIssue + '.</p>'
+            : '<p class="muted">When you re-initiate, a brand new GitHub card is created.</p>');
+        loadReopenList();
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
     document.getElementById('delstewards').onclick = function () {
       del('stewards', 'all', '', '', 'Delete ALL non-admin stewards and their assignments? This cannot be undone.');
     };
@@ -1338,7 +1373,7 @@ function viewOnboardingDetail(id) {
           return '<div class="ob-doc"><span>' + esc(d.file_name) + '</span> ' +
             '<span class="muted">' + fmtDate(d.uploaded_at) + '</span> ' +
             '<button class="btn btn-link" data-dl="' + d.id + '" data-fn="' + esc(d.file_name) + '">Download</button>' +
-            (inProg ? '<button class="btn btn-link" data-del="' + d.id + '">Delete</button>' : '') + '</div>';
+            (inProg ? ' <button class="btn btn-danger" data-del="' + d.id + '">Delete</button>' : '') + '</div>';
         }
         function slot(t, label, single) {
           var docs = c.documents.filter(function (d) { return d.doc_type === t; });
