@@ -399,14 +399,18 @@ async function userRoles(db, stewardId) {
 
 // Visibility: admin and top_dog see ALL companies (null = no filter);
 // stewards see only their assigned companies.
+function hasFullVisibility(user) {
+  return user.activeRole === 'admin' || user.activeRole === 'top_dog' || user.activeRole === 'onboarding';
+}
+
 async function visibleCompanyIds(user) {
-  if (user.activeRole === 'admin' || user.activeRole === 'top_dog') return null;
+  if (hasFullVisibility(user)) return null;
   const r = await getPool().query('SELECT company_id FROM assignments WHERE steward_id = $1', [user.id]);
   return r.rows.map(x => x.company_id);
 }
 
 async function getVisibleCodes(user) {
-  if (user.activeRole === 'admin' || user.activeRole === 'top_dog') return null;
+  if (hasFullVisibility(user)) return null;
   const r = await getPool().query(
     'SELECT DISTINCT c.company_code FROM assignments a JOIN companies c ON c.id = a.company_id WHERE a.steward_id = $1',
     [user.id]);
