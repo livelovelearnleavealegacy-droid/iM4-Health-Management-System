@@ -1326,7 +1326,8 @@ function viewOnboardingDetail(id) {
           var cls = x.severity === 'critical' ? 'rag-red' : (x.severity === 'warning' ? 'rag-yellow' : 'rag-green');
           return '<div class="ob-issue"><span class="rag ' + cls + '">' + esc(x.severity) + '</span> ' +
             (x.doc_type ? '<b>' + esc(obDocLabel(x.doc_type)) + ':</b> ' : '') + esc(x.message) +
-            (inProg ? ' <button class="btn btn-link" data-resolve="' + x.id + '">Mark evaluated</button>' : '') + '</div>';
+            (inProg ? ' <button class="btn btn-link" data-dismiss="' + x.id + '" title="Remove this finding">Delete</button>' +
+            ' <button class="btn btn-link" data-override="' + x.id + '" title="Accept the document despite this finding">Override</button>' : '') + '</div>';
         }).join('') : '<p class="muted">No open issues. The documents look complete.</p>';
         var initBtn;
         if (!inProg) {
@@ -1351,6 +1352,7 @@ function viewOnboardingDetail(id) {
           slot('w9', 'W-9s', 0) +
           slot('ach', 'ACH Authorizations', 0) +
           '<h3>Completeness check</h3><div id="obissues">' + issues + '</div>' +
+          ((c.handled && c.handled.length) ? '<p class="muted">' + c.handled.map(function (h) { return h.n + ' ' + esc(h.resolution); }).join(' &middot; ') + '</p>' : '') +
           (inProg ? '<p><button class="btn" id="obreaudit">Re-run check</button></p>' : '') +
           '<h3>Initiate</h3>' + initBtn +
           (inProg ? '<p><button class="btn btn-link" id="obdelete" style="color:#c00">Delete this client card</button></p>' : ''),
@@ -1383,9 +1385,17 @@ function viewOnboardingDetail(id) {
               .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
           };
         });
-        document.querySelectorAll('[data-resolve]').forEach(function (el) {
+        document.querySelectorAll('[data-dismiss]').forEach(function (el) {
           el.onclick = function () {
-            api.post('/api/onboarding/' + id + '/issues/' + el.getAttribute('data-resolve') + '/resolve', {}).then(load)
+            if (!confirm('Delete this finding? It will be removed from the list.')) return;
+            api.post('/api/onboarding/' + id + '/issues/' + el.getAttribute('data-dismiss') + '/resolve', { resolution: 'dismissed' }).then(load)
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+        document.querySelectorAll('[data-override]').forEach(function (el) {
+          el.onclick = function () {
+            if (!confirm('Override this finding? The document will be treated as accepted even though the check flagged it.')) return;
+            api.post('/api/onboarding/' + id + '/issues/' + el.getAttribute('data-override') + '/resolve', { resolution: 'overridden' }).then(load)
               .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
           };
         });

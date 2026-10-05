@@ -267,6 +267,7 @@ async function migrate() {
     'message TEXT NOT NULL, ' +
     'resolved BOOLEAN NOT NULL DEFAULT FALSE, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('ALTER TABLE onboarding_issues ADD COLUMN IF NOT EXISTS resolution TEXT');
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -2305,10 +2306,14 @@ async function runOnboardingAudit(db, clientId) {
     }
   }
 
+  const prev = await db.query('SELECT message, resolution FROM onboarding_issues WHERE client_id = $1 AND resolved = TRUE AND resolution IS NOT NULL', [clientId]);
+  const prevMap = {};
+  prev.rows.forEach(function (r) { prevMap[r.message] = r.resolution; });
   await db.query('DELETE FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE', [clientId]);
   for (const is of issues) {
-    await db.query('INSERT INTO onboarding_issues (client_id, severity, doc_type, message) VALUES ($1, $2, $3, $4)',
-      [clientId, is.severity, is.doc_type, is.message]);
+    const prior = prevMap[is.message] || null;
+    await db.query('INSERT INTO onboarding_issues (client_id, severity, doc_type, message, resolved, resolution) VALUES ($1, $2, $3, $4, $5, $6)',
+      [clientId, is.severity, is.doc_type, is.message, !!prior, prior]);
   }
   const canInitiate = ONBOARDING_DOC_TYPES.every(function (t) { return byType[t] && byType[t].length > 0; }) &&
     !issues.some(function (x) { return x.severity === 'critical'; });
@@ -2401,8 +2406,10 @@ app.get('/api/onboarding/:id', requireOnboarder, async (req, res) => {
     const d = await db.query('SELECT id, doc_type, file_name, mime_type, uploaded_at, LENGTH(file_data) AS size FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [req.params.id]);
     const i = await db.query("SELECT * FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at", [req.params.id]);
     const client = c.rows[0];
+    const h = await db.query("SELECT resolution, COUNT(*)::int AS n FROM onboarding_issues WHERE client_id = $1 AND resolved = TRUE AND resolution IS NOT NULL GROUP BY resolution", [req.params.id]);
     client.documents = d.rows;
     client.issues = i.rows;
+    client.handled = h.rows;
     client.canInitiate = client.status === 'in_progress' &&
       ONBOARDING_DOC_TYPES.every(function (t) { return d.rows.some(function (x) { return x.doc_type === t; }); }) &&
       !i.rows.some(function (x) { return x.severity === 'critical'; });
@@ -2466,7 +2473,8 @@ app.post('/api/onboarding/:id/audit', requireOnboarder, async (req, res) => {
 // Mark one issue as evaluated/resolved.
 app.post('/api/onboarding/:id/issues/:issueId/resolve', requireOnboarder, async (req, res) => {
   try {
-    await getPool().query('UPDATE onboarding_issues SET resolved = TRUE WHERE id = $1 AND client_id = $2', [req.params.issueId, req.params.id]);
+    const resolution = String((req.body && req.body.resolution) || 'dismissed') === 'overridden' ? 'overridden' : 'dismissed';
+    await getPool().query('UPDATE onboarding_issues SET resolved = TRUE, resolution = $1 WHERE id = $2 AND client_id = $3', [resolution, req.params.issueId, req.params.id]);
     res.json({ ok: true });
   } catch (error) { console.error('Onboarding issue resolve error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
