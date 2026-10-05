@@ -44,7 +44,47 @@ function num(v) {
 function roleLabel(r) {
   if (r === 'admin') return 'Admin';
   if (r === 'top_dog') return 'Top Dog';
+  if (r === 'onboarding') return 'Onboarding';
   return 'Steward';
+}
+
+function hasRole(r) {
+  var u = state.user;
+  return !!u && ((u.roles || []).indexOf(r) !== -1);
+}
+function canOnboard() { return hasRole('onboarding') || hasRole('admin'); }
+
+// POST a FormData body (file uploads) with the auth token.
+function uploadFile(url, formData) {
+  var headers = {};
+  if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+  return fetch(url, { method: 'POST', headers: headers, body: formData }).then(function (resp) {
+    if (resp.status === 401 && api.token) {
+      api.setToken(null);
+      location.hash = '#/login';
+      throw new Error('signed out');
+    }
+    return resp.json().then(function (data) {
+      if (!resp.ok) throw new Error((data && data.error) || ('Request failed: ' + resp.status));
+      return data;
+    });
+  });
+}
+
+function downloadOnboardingDoc(clientId, docId, fileName) {
+  var headers = {};
+  if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+  fetch('/api/onboarding/' + clientId + '/documents/' + docId + '/download', { headers: headers }).then(function (resp) {
+    if (!resp.ok) throw new Error('Download failed');
+    return resp.blob();
+  }).then(function (blob) {
+    var el = document.createElement('a');
+    el.href = URL.createObjectURL(blob);
+    el.download = fileName;
+    document.body.appendChild(el);
+    el.click();
+    setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+  }).catch(function (err) { alert(err.message); });
 }
 
 function rollLine(total, eligible, enrolled) {
@@ -105,6 +145,7 @@ function navLinks() {
     ['#/billing', 'Billing'],
     ['#/implementations', 'Implementation']
   ];
+  if (canOnboard()) links.push(['#/onboarding', 'Onboarding']);
   if (u && u.role === 'admin') {
     links.push(['#/admin/jobs', 'Jobs']);
     links.push(['#/admin/stewards', 'Stewards']);
@@ -880,7 +921,7 @@ function viewAdminStewards() {
             function chk(v) { return '<label><input type="checkbox" class="rolechk" value="' + v + '"' + (cur.indexOf(v) !== -1 ? ' checked' : '') + '> ' + roleLabel(v) + '</label>'; }
             document.getElementById('rolebox').innerHTML =
               '<h3>Set roles</h3><form id="rolef" class="form-inline">' +
-              chk('steward') + ' ' + chk('top_dog') + ' ' + chk('admin') + ' ' +
+              chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' +
               '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="rolemsg"></div>';
             document.getElementById('rolef').onsubmit = function (e) {
               e.preventDefault();
@@ -1169,7 +1210,217 @@ function viewAdminJobs() {
   });
 }
 
+
+// ---------------------------------------------------------------- onboarding
+var OB_DOC_TYPES = [
+  ['master_application', 'Master Application', 1],
+  ['pre_implementation', 'Pre-Implementation Form', 1],
+  ['commission_sheet', 'Commission Sheet', 1],
+  ['w9', 'W-9s', 0],
+  ['ach', 'ACH Authorizations', 0]
+];
+function obDocLabel(t) {
+  for (var i = 0; i < OB_DOC_TYPES.length; i++) if (OB_DOC_TYPES[i][0] === t) return OB_DOC_TYPES[i][1];
+  return t;
+}
+
+function viewOnboarding() {
+  requireUser(function () {
+    if (!canOnboard()) { location.hash = '#/dashboard'; return; }
+    api.get('/api/onboarding').then(function (list) {
+      var prog = list.filter(function (c) { return c.status === 'in_progress'; });
+      var done = list.filter(function (c) { return c.status !== 'in_progress'; });
+      function card(c) {
+        var badge = c.critical_open > 0
+          ? '<span class="rag rag-red">' + c.critical_open + ' critical</span>'
+          : '<span class="rag rag-green">Checked</span>';
+        return '<div class="ob-card"><div class="ob-card-head"><b>' + esc(c.client_name) + '</b>' + badge + '</div>' +
+          '<div class="muted">' + c.doc_count + ' document(s) &middot; started ' + fmtDate(c.created_at) +
+          (c.github_issue_number ? ' &middot; GitHub #' + c.github_issue_number : '') + '</div>' +
+          '<p><a class="btn btn-primary" href="#/onboarding/' + c.id + '">Open</a></p></div>';
+      }
+      render(shell(
+        '<h2>Onboarding</h2><div id="err"></div>' +
+        '<p><a class="btn btn-primary" href="#/onboarding/new">+ Add client</a></p>' +
+        '<h3>In Progress (' + prog.length + ')</h3>' +
+        (prog.length ? '<div class="ob-grid">' + prog.map(card).join('') + '</div>' : '<p class="muted">No clients being onboarded right now.</p>') +
+        '<h3>Complete (' + done.length + ')</h3>' +
+        (done.length ? '<div class="ob-grid">' + done.map(card).join('') + '</div>' : '<p class="muted">Nothing completed yet.</p>'),
+        '#/onboarding'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/onboarding')); });
+  });
+}
+
+function viewOnboardingNew() {
+  requireUser(function () {
+    if (!canOnboard()) { location.hash = '#/dashboard'; return; }
+    var masterFile = null;
+    render(shell(
+      '<p><a href="#/onboarding">&larr; Onboarding</a></p>' +
+      '<h2>Add client</h2><div id="err"></div>' +
+      '<div class="card"><h3>Step 1: Upload the Master Application</h3>' +
+      '<p class="muted">Upload the signed Master Application PDF. We will read the Applicant/Policy Holder name from the POLICYHOLDER INFORMATION page.</p>' +
+      '<p><input type="file" id="obmaster" accept=".pdf"></p><div id="obparse"></div></div>' +
+      '<div class="card" id="obconfirm" style="display:none"><h3>Step 2: Confirm the client name</h3>' +
+      '<p><label>Client name<br><input type="text" id="obname" style="width:100%;max-width:420px"></label></p>' +
+      '<p><button class="btn btn-primary" id="obcreate">Lock in and create client</button></p><div id="obcerr"></div></div>',
+      '#/onboarding'));
+    document.getElementById('obmaster').onchange = function (e) {
+      var f = e.target.files[0];
+      if (!f) return;
+      masterFile = f;
+      document.getElementById('obparse').innerHTML = '<p class="muted">Reading the application...</p>';
+      var fd = new FormData();
+      fd.append('file', f);
+      uploadFile('/api/onboarding/parse-master', fd).then(function (d) {
+        var box = document.getElementById('obconfirm');
+        box.style.display = 'block';
+        document.getElementById('obname').value = d.suggestedName || '';
+        document.getElementById('obparse').innerHTML = d.suggestedName
+          ? '<p>Found client name' + (d.page ? ' on page ' + d.page : '') + ': <b>' + esc(d.suggestedName) + '</b>. Confirm or correct it below.</p>'
+          : '<p class="rag rag-yellow">Could not find the applicant name automatically. Type it below.</p>';
+      }).catch(function (err) {
+        document.getElementById('obparse').innerHTML = errorHtml(err.message);
+      });
+    };
+    document.getElementById('obcreate').onclick = function () {
+      var name = document.getElementById('obname').value.trim();
+      if (!name) { document.getElementById('obcerr').innerHTML = errorHtml('Client name is required.'); return; }
+      if (!masterFile) { document.getElementById('obcerr').innerHTML = errorHtml('Upload the Master Application first.'); return; }
+      var fd = new FormData();
+      fd.append('clientName', name);
+      fd.append('masterApp', masterFile);
+      document.getElementById('obcerr').innerHTML = '<p class="muted">Creating...</p>';
+      uploadFile('/api/onboarding', fd).then(function (c) {
+        location.hash = '#/onboarding/' + c.id;
+      }).catch(function (err) {
+        document.getElementById('obcerr').innerHTML = errorHtml(err.message);
+      });
+    };
+  });
+}
+
+function viewOnboardingDetail(id) {
+  requireUser(function () {
+    if (!canOnboard()) { location.hash = '#/dashboard'; return; }
+    function load() {
+      api.get('/api/onboarding/' + id).then(function (c) {
+        var inProg = c.status === 'in_progress';
+        function docRow(d) {
+          return '<div class="ob-doc"><span>' + esc(d.file_name) + '</span> ' +
+            '<span class="muted">' + fmtDate(d.uploaded_at) + '</span> ' +
+            '<button class="btn btn-link" data-dl="' + d.id + '" data-fn="' + esc(d.file_name) + '">Download</button>' +
+            (inProg ? '<button class="btn btn-link" data-del="' + d.id + '">Delete</button>' : '') + '</div>';
+        }
+        function slot(t, label, single) {
+          var docs = c.documents.filter(function (d) { return d.doc_type === t; });
+          var body = docs.length ? docs.map(docRow).join('') : '<p class="muted">No ' + esc(label) + ' uploaded yet.</p>';
+          var up = inProg
+            ? '<p><label class="btn">' + (docs.length && single ? 'Replace' : 'Upload') + ' ' + esc(label) +
+              '<input type="file" data-up="' + t + '" style="display:none"' +
+              (t === 'master_application' ? ' accept=".pdf"' : '') + '></label></p>'
+            : '';
+          return '<div class="card"><h4>' + esc(label) + '</h4>' + body + up + '</div>';
+        }
+        var issues = c.issues.length ? c.issues.map(function (x) {
+          var cls = x.severity === 'critical' ? 'rag-red' : (x.severity === 'warning' ? 'rag-yellow' : 'rag-green');
+          return '<div class="ob-issue"><span class="rag ' + cls + '">' + esc(x.severity) + '</span> ' +
+            (x.doc_type ? '<b>' + esc(obDocLabel(x.doc_type)) + ':</b> ' : '') + esc(x.message) +
+            (inProg ? ' <button class="btn btn-link" data-resolve="' + x.id + '">Mark evaluated</button>' : '') + '</div>';
+        }).join('') : '<p class="muted">No open issues. The documents look complete.</p>';
+        var initBtn;
+        if (!inProg) {
+          initBtn = '<p class="muted">Initiated' + (c.initiated_at ? ' on ' + fmtDate(c.initiated_at) : '') +
+            (c.github_issue_number ? ' &middot; GitHub issue #' + c.github_issue_number : '') + '.</p>';
+        } else if (c.canInitiate) {
+          initBtn = '<p><button class="btn btn-primary" id="obinit">Initiate</button></p><div id="obinitmsg"></div>';
+        } else {
+          initBtn = '<p><button class="btn" disabled title="Upload all documents and clear critical issues first">Initiate</button> ' +
+            '<span class="muted">Available when all documents are uploaded and no critical issues are open.</span></p><div id="obinitmsg"></div>';
+        }
+        render(shell(
+          '<p><a href="#/onboarding">&larr; Onboarding</a></p><div id="err"></div>' +
+          '<h2>' + esc(c.client_name) + '</h2>' +
+          '<p class="muted">Status: <b>' + (inProg ? 'In Progress' : 'Complete') + '</b>' +
+          (c.payroll_provider ? ' &middot; Payroll: ' + esc(c.payroll_provider) : '') +
+          ' &middot; Onboarding started ' + fmtDate(c.created_at) + '</p>' +
+          '<h3>Documents</h3>' +
+          slot('master_application', 'Master Application', 1) +
+          slot('pre_implementation', 'Pre-Implementation Form', 1) +
+          slot('commission_sheet', 'Commission Sheet', 1) +
+          slot('w9', 'W-9s', 0) +
+          slot('ach', 'ACH Authorizations', 0) +
+          '<h3>Completeness check</h3><div id="obissues">' + issues + '</div>' +
+          (inProg ? '<p><button class="btn" id="obreaudit">Re-run check</button></p>' : '') +
+          '<h3>Initiate</h3>' + initBtn +
+          (inProg ? '<p><button class="btn btn-link" id="obdelete" style="color:#c00">Delete this client card</button></p>' : ''),
+          '#/onboarding'));
+        // wire up uploads
+        var ups = document.querySelectorAll('[data-up]');
+        for (var k = 0; k < ups.length; k++) {
+          (function (el) {
+            el.onchange = function () {
+              var f = el.files[0];
+              if (!f) return;
+              var fd = new FormData();
+              fd.append('docType', el.getAttribute('data-up'));
+              fd.append('file', f);
+              document.getElementById('err').innerHTML = '<p class="muted">Uploading and checking...</p>';
+              uploadFile('/api/onboarding/' + id + '/documents', fd).then(load).catch(function (err) {
+                document.getElementById('err').innerHTML = errorHtml(err.message);
+              });
+            };
+          })(ups[k]);
+        }
+        // downloads + deletes + resolves
+        document.querySelectorAll('[data-dl]').forEach(function (el) {
+          el.onclick = function () { downloadOnboardingDoc(id, el.getAttribute('data-dl'), el.getAttribute('data-fn')); };
+        });
+        document.querySelectorAll('[data-del]').forEach(function (el) {
+          el.onclick = function () {
+            if (!confirm('Delete this document? You can upload a replacement.')) return;
+            api.delete('/api/onboarding/' + id + '/documents/' + el.getAttribute('data-del')).then(load)
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+        document.querySelectorAll('[data-resolve]').forEach(function (el) {
+          el.onclick = function () {
+            api.post('/api/onboarding/' + id + '/issues/' + el.getAttribute('data-resolve') + '/resolve', {}).then(load)
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+        var ra = document.getElementById('obreaudit');
+        if (ra) ra.onclick = function () {
+          api.post('/api/onboarding/' + id + '/audit', {}).then(load)
+            .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+        };
+        var ib = document.getElementById('obinit');
+        if (ib) ib.onclick = function () {
+          if (!confirm('Initiate ' + c.client_name + '? This creates the GitHub card and moves the client to Complete.')) return;
+          document.getElementById('obinitmsg').innerHTML = '<p class="muted">Creating the GitHub card...</p>';
+          api.post('/api/onboarding/' + id + '/initiate', {}).then(function (r) {
+            var msg = 'Initiated. GitHub issue <a href="' + esc(r.issueUrl) + '" target="_blank">#' + r.issueNumber + '</a> created.';
+            if (!r.boardOk) msg += ' <span class="rag rag-yellow">Card was not added to the board automatically: ' + esc(r.boardError || 'unknown reason') + '. Add issue #' + r.issueNumber + ' to the board by hand.</span>';
+            document.getElementById('obinitmsg').innerHTML = '<p>' + msg + '</p>';
+            setTimeout(load, 2500);
+          }).catch(function (err) {
+            document.getElementById('obinitmsg').innerHTML = errorHtml(err.message);
+          });
+        };
+        var del = document.getElementById('obdelete');
+        if (del) del.onclick = function () {
+          if (!confirm('Delete this entire onboarding card and all its documents?')) return;
+          api.delete('/api/onboarding/' + id).then(function () { location.hash = '#/onboarding'; })
+            .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+        };
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/onboarding')); });
+    }
+    load();
+  });
+}
+
 // ---------------------------------------------------------------- router
+
 function route() {
   var h = location.hash || '#/login';
   if (h === '' || h === '#/') {
@@ -1195,6 +1446,11 @@ function route() {
   if (pathParts[0] === 'child' && pathParts[1]) return viewChild(pathParts[1]);
   if (pathParts[0] === 'clients') return viewClients();
   if (pathParts[0] === 'implementations') return viewImplementations();
+  if (pathParts[0] === 'onboarding') {
+    if (!pathParts[1]) return viewOnboarding();
+    if (pathParts[1] === 'new') return viewOnboardingNew();
+    return viewOnboardingDetail(pathParts[1]);
+  }
   if (pathParts[0] === 'project' && pathParts[1]) return viewProject(pathParts[1]);
   if (pathParts[0] === 'admin' && pathParts[1] === 'stewards') return viewAdminStewards();
   if (pathParts[0] === 'admin' && pathParts[1] === 'companies') return viewAdminCompanies();

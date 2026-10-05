@@ -233,6 +233,40 @@ async function migrate() {
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
   // v5: backfill user_roles from the legacy single-role column (idempotent).
   await db.query("INSERT INTO user_roles (steward_id, role) SELECT id, role FROM stewards WHERE role IN ('admin', 'steward', 'top_dog') ON CONFLICT DO NOTHING");
+  // v5.6: 'onboarding' joins the allowed roles (drop the old 3-role check first).
+  try {
+    const rc = await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'user_roles'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%top_dog%'");
+    for (const c of rc.rows) { await db.query('ALTER TABLE user_roles DROP CONSTRAINT ' + c.conname); }
+    await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding'))");
+  } catch (e) { console.error('Onboarding role migration:', e.message); }
+  // v5.6: onboarding workflow tables. Documents are stored as bytea in Postgres.
+  await db.query('CREATE TABLE IF NOT EXISTS onboarding_clients (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'client_name TEXT NOT NULL, ' +
+    "status TEXT NOT NULL DEFAULT 'in_progress', " +
+    'payroll_provider TEXT, ' +
+    'created_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'initiated_at TIMESTAMPTZ, ' +
+    'github_issue_number INT, ' +
+    'github_repo TEXT)');
+  await db.query('CREATE TABLE IF NOT EXISTS onboarding_documents (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'client_id INT NOT NULL REFERENCES onboarding_clients(id) ON DELETE CASCADE, ' +
+    "doc_type TEXT NOT NULL CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach')), " +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'uploaded_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS onboarding_issues (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'client_id INT NOT NULL REFERENCES onboarding_clients(id) ON DELETE CASCADE, ' +
+    "severity TEXT NOT NULL CHECK (severity IN ('critical', 'warning', 'info')), " +
+    'doc_type TEXT, ' +
+    'message TEXT NOT NULL, ' +
+    'resolved BOOLEAN NOT NULL DEFAULT FALSE, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -2001,6 +2035,483 @@ async function typicalDurations(db) {
   } catch (e) { console.error('Duration learning query failed:', e.message); }
   return out;
 }
+
+
+// ---------------------------------------------------------------- onboarding workflow (v5.6)
+const ONBOARDING_DOC_TYPES = ['master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach'];
+const SINGLE_DOC_TYPES = ['master_application', 'pre_implementation', 'commission_sheet'];
+const DOC_LABELS = {
+  master_application: 'Master Application',
+  pre_implementation: 'Pre-Implementation Form',
+  commission_sheet: 'Commission Sheet',
+  w9: 'W-9',
+  ach: 'ACH Authorization'
+};
+const GITHUB_ISSUES_OWNER = process.env.GITHUB_ISSUES_OWNER || 'im4health-implementation';
+const GITHUB_ISSUES_REPO = process.env.GITHUB_ISSUES_REPO || 'Implementation';
+const GITHUB_PROJECT_ID = process.env.GITHUB_PROJECT_ID || 'PVT_kwDOEB2rr84BTidM';
+const GITHUB_STATUS_FIELD_ID = process.env.GITHUB_STATUS_FIELD_ID || 'PVTSSF_lADOEB2rr84BTidM';
+
+const multer = require('multer');
+const onboardingUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+function handleUpload(field) {
+  return function (req, res, next) {
+    onboardingUpload.single(field)(req, res, function (err) {
+      if (err) return res.status(400).json({ error: 'Upload failed: ' + err.message });
+      next();
+    });
+  };
+}
+
+function requireOnboarder(req, res, next) {
+  requireAuth(req, res, function () {
+    const roles = req.user.roles || [];
+    if (roles.indexOf('admin') !== -1 || roles.indexOf('onboarding') !== -1) return next();
+    return res.status(403).json({ error: 'Onboarding access only' });
+  });
+}
+
+// Layout-aware PDF text extraction: items are sorted top-to-bottom, left-to-right
+// and grouped into lines, so filled-in form values stay next to their labels.
+let pdfjsLib = null;
+function getPdfjs() {
+  if (!pdfjsLib) pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+  return pdfjsLib;
+}
+
+async function extractPdfLines(pdfBuffer) {
+  const pdfjs = getPdfjs();
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(pdfBuffer), useSystemFonts: true }).promise;
+  const pages = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    const items = tc.items
+      .map(function (it) { return { str: it.str, x: it.transform[4], y: it.transform[5] }; })
+      .filter(function (it) { return it.str.trim() !== ''; });
+    items.sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+    const groups = [];
+    items.forEach(function (it) {
+      let g = null;
+      for (let i = 0; i < groups.length; i++) {
+        if (Math.abs(groups[i].y - it.y) < 4) { g = groups[i]; break; }
+      }
+      if (!g) { g = { y: it.y, items: [] }; groups.push(g); }
+      g.items.push(it);
+    });
+    groups.sort(function (a, b) { return b.y - a.y; });
+    const lines = groups.map(function (g) {
+      g.items.sort(function (a, b) { return a.x - b.x; });
+      return g.items.map(function (it) { return it.str; }).join(' ').replace(/\s+/g, ' ').trim();
+    }).filter(function (x) { return x !== ''; });
+    pages.push({ page: p, lines: lines });
+  }
+  if (doc.destroy) { try { await doc.destroy(); } catch (e) {} }
+  return pages;
+}
+
+async function extractPdfText(pdfBuffer) {
+  const pages = await extractPdfLines(pdfBuffer);
+  return pages.map(function (pg) { return pg.lines.join('\n'); }).join('\n');
+}
+
+// Find the POLICYHOLDER INFORMATION section (usually page 2) and capture the
+// applicant name printed under it. Returns { name, page }.
+async function extractApplicantName(pdfBuffer) {
+  const pages = await extractPdfLines(pdfBuffer);
+  for (const pg of pages) {
+    const lines = pg.lines;
+    for (let i = 0; i < lines.length; i++) {
+      const low = lines[i].toLowerCase();
+      if (low.indexOf('policyholder information') !== -1 || low.indexOf('policy holder information') !== -1) {
+        const parts = [];
+        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+          const l = lines[j];
+          if (!l) continue;
+          const ll = l.toLowerCase();
+          if (ll.indexOf('full legal name') !== -1) break;
+          if (/^(address|city|phone|fax|type of business|requested effective date)/i.test(ll)) break;
+          parts.push(l);
+          if (parts.join(' ').length > 120) break;
+        }
+        const name = parts.join(' ').replace(/\s+/g, ' ').trim();
+        if (name) return { name: name, page: pg.page };
+      }
+    }
+  }
+  return { name: '', page: 0 };
+}
+
+function readWorkbook(buffer) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer' });
+  const out = {};
+  wb.SheetNames.forEach(function (sn) {
+    out[sn] = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: null, blankrows: false });
+  });
+  return out;
+}
+
+// Find a label cell (starts-with, case-insensitive, trailing colon ignored)
+// and return the first non-empty cell after it in the same row.
+function rowValueByLabel(rows, label) {
+  const key = String(label).toLowerCase().replace(/:$/, '');
+  for (const r of rows) {
+    if (!r) continue;
+    for (let i = 0; i < r.length; i++) {
+      const c = r[i];
+      if (c === null || c === undefined) continue;
+      const cell = String(c).trim().toLowerCase().replace(/:$/, '');
+      if (cell === key || cell.indexOf(key) === 0) {
+        for (let j = i + 1; j < r.length; j++) {
+          const v = r[j];
+          if (v !== null && v !== undefined && String(v).trim() !== '') return String(v).trim();
+        }
+        return '';
+      }
+    }
+  }
+  return '';
+}
+
+function normName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\b(inc|llc|ltd|co|corp|corporation|incorporated)\b/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Audit one onboarding client for document completeness. Replaces the open
+// issues with a fresh list and returns { issues, canInitiate }.
+async function runOnboardingAudit(db, clientId) {
+  const issues = [];
+  const push = function (severity, docType, message) { issues.push({ severity: severity, doc_type: docType, message: message }); };
+  const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [clientId]);
+  if (c.rows.length === 0) return { issues: [], canInitiate: false };
+  const docs = await db.query('SELECT * FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [clientId]);
+  const byType = {};
+  docs.rows.forEach(function (d) { (byType[d.doc_type] = byType[d.doc_type] || []).push(d); });
+
+  ONBOARDING_DOC_TYPES.forEach(function (t) {
+    if (!byType[t] || byType[t].length === 0) push('critical', t, 'Missing: ' + DOC_LABELS[t] + ' has not been uploaded yet.');
+  });
+
+  let masterName = '';
+  const md = byType.master_application && byType.master_application[0];
+  if (md) {
+    try {
+      const text = await extractPdfText(md.file_data);
+      masterName = (await extractApplicantName(md.file_data)).name;
+      if (!masterName) push('critical', 'master_application', 'Could not find the applicant name under POLICYHOLDER INFORMATION. Check that this file is the Master Application.');
+      const eff = text.match(/requested effective date\s*:?\s*([^\n\r]{1,40})/i);
+      if (!eff || !eff[1].replace(/[_\s]/g, '')) push('warning', 'master_application', 'Requested Effective Date looks blank on the application.');
+      if (text.toLowerCase().indexOf('in witness whereof') === -1) push('warning', 'master_application', 'No signature page found. The application may be unsigned.');
+    } catch (e) { push('warning', 'master_application', 'Could not read the Master Application PDF (' + e.message + '). Verify it manually.'); }
+  }
+
+  let preName = '', payrollProvider = '';
+  const pd = byType.pre_implementation && byType.pre_implementation[0];
+  if (pd) {
+    try {
+      const sheets = readWorkbook(pd.file_data);
+      const keys = Object.keys(sheets);
+      const rows = keys.length ? sheets[keys[0]] : [];
+      const checks = [
+        ['Legal Name of the Company', true, 'Legal company name'],
+        ['Employer Address', false, 'Employer address'],
+        ['Billing Contact', false, 'Billing contact'],
+        ['Billing Contact Email', false, 'Billing contact email'],
+        ['Employer Tax ID', true, 'Employer Tax ID'],
+        ['Payroll Provider Company', true, 'Payroll provider'],
+        ['Payroll Frequency', false, 'Payroll frequency'],
+        ['Last Payroll Run Date', false, 'Last payroll run date'],
+        ['Name of Individual signing DocuSign', false, 'Signer name']
+      ];
+      checks.forEach(function (ck) {
+        if (!rowValueByLabel(rows, ck[0])) push(ck[1] ? 'critical' : 'warning', 'pre_implementation', 'Pre-Implementation Form: "' + ck[2] + '" is blank.');
+      });
+      preName = rowValueByLabel(rows, 'Legal Name of the Company');
+      payrollProvider = rowValueByLabel(rows, 'Payroll Provider Company');
+      if (payrollProvider) await db.query('UPDATE onboarding_clients SET payroll_provider = $1 WHERE id = $2', [payrollProvider, clientId]);
+    } catch (e) { push('warning', 'pre_implementation', 'Could not read the Pre-Implementation Form (' + e.message + '). Verify it manually.'); }
+  }
+
+  let commName = '';
+  const sd = byType.commission_sheet && byType.commission_sheet[0];
+  if (sd) {
+    try {
+      const sheets = readWorkbook(sd.file_data);
+      const keys = Object.keys(sheets);
+      const rows = keys.length ? sheets[keys[0]] : [];
+      const get = function (label) {
+        const key = label.toLowerCase();
+        for (const r of rows) {
+          if (r && r[0] && String(r[0]).trim().toLowerCase() === key) {
+            const v = r[1];
+            return (v === null || v === undefined) ? '' : String(v).trim();
+          }
+        }
+        return '';
+      };
+      if (!get('Group Name')) push('critical', 'commission_sheet', 'Commission Sheet: Group Name is blank.');
+      else commName = get('Group Name');
+      if (!get('Agency Name')) push('warning', 'commission_sheet', 'Commission Sheet: Agency Name is blank.');
+      if (!get('Agent 1 Name')) push('warning', 'commission_sheet', 'Commission Sheet: Agent 1 Name is blank.');
+      if (!get('Broker Name')) push('warning', 'commission_sheet', 'Commission Sheet: Broker Name is blank.');
+      if (!get('Effective Date')) push('warning', 'commission_sheet', 'Commission Sheet: Effective Date is blank.');
+      if (!get('Product (s)')) push('warning', 'commission_sheet', 'Commission Sheet: Product(s) is blank.');
+    } catch (e) { push('warning', 'commission_sheet', 'Could not read the Commission Sheet (' + e.message + '). Verify it manually.'); }
+  }
+
+  const w9s = byType.w9 || [];
+  for (const w of w9s) {
+    try {
+      const text = await extractPdfText(w.file_data);
+      const digits = text.replace(/[^0-9]/g, '');
+      let nm = '';
+      const m1 = text.match(/name \(as shown on your income tax return\)[^\n\r]*\n([^\n\r]{2,80})/i);
+      if (m1 && m1[1].trim() && !/^(2|business name)/i.test(m1[1].trim())) nm = m1[1].trim();
+      if (!nm) {
+        const m2 = text.match(/business name[^\n\r]*\n([^\n\r]{2,80})/i);
+        if (m2 && m2[1].trim() && !/^(3|check|disregarded)/i.test(m2[1].trim())) nm = m2[1].trim();
+      }
+      if (!nm) push('warning', 'w9', 'W-9 (' + w.file_name + '): could not find the name on line 1.');
+      if (digits.length < 9) push('warning', 'w9', 'W-9 (' + w.file_name + '): no tax ID number found.');
+      push('info', 'w9', 'W-9 (' + w.file_name + '): verify the signature and date visually; neither can be confirmed from the document text.');
+    } catch (e) { push('warning', 'w9', 'W-9 (' + w.file_name + '): could not read the PDF (' + e.message + '). Verify it manually.'); }
+  }
+
+  const achs = byType.ach || [];
+  for (const a of achs) {
+    try {
+      const text = await extractPdfText(a.file_data);
+      if (text.replace(/\s/g, '').length < 60) {
+        push('warning', 'ach', 'ACH (' + a.file_name + '): could not read the document text. Verify the routing and account numbers visually.');
+      } else {
+        const routingHit = text.match(/\b[0123][0-9]{8}\b/);
+        const digitRuns = text.match(/\b[0-9]{4,17}\b/g) || [];
+        const accountHit = digitRuns.filter(function (n) { return !routingHit || n !== routingHit[0]; });
+        if (!routingHit) push('critical', 'ach', 'ACH (' + a.file_name + '): no bank routing number found.');
+        if (accountHit.length === 0) push('critical', 'ach', 'ACH (' + a.file_name + '): no bank account number found.');
+      }
+    } catch (e) { push('warning', 'ach', 'ACH (' + a.file_name + '): could not read the file (' + e.message + '). Verify it manually.'); }
+  }
+
+  const names = [];
+  if (masterName) names.push(['Master Application', masterName]);
+  if (preName) names.push(['Pre-Implementation Form', preName]);
+  if (commName) names.push(['Commission Sheet', commName]);
+  for (let i = 1; i < names.length; i++) {
+    if (normName(names[i][1]) !== normName(names[0][1])) {
+      push('warning', null, 'Name mismatch: ' + names[i][0] + ' says "' + names[i][1] + '" but ' + names[0][0] + ' says "' + names[0][1] + '". Confirm the legal name.');
+    }
+  }
+
+  await db.query('DELETE FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE', [clientId]);
+  for (const is of issues) {
+    await db.query('INSERT INTO onboarding_issues (client_id, severity, doc_type, message) VALUES ($1, $2, $3, $4)',
+      [clientId, is.severity, is.doc_type, is.message]);
+  }
+  const canInitiate = ONBOARDING_DOC_TYPES.every(function (t) { return byType[t] && byType[t].length > 0; }) &&
+    !issues.some(function (x) { return x.severity === 'critical'; });
+  return { issues: issues, canInitiate: canInitiate };
+}
+
+// Create a GitHub issue for an initiated client.
+async function ghCreateIssue(title, body) {
+  const resp = await fetch('https://api.github.com/repos/' + GITHUB_ISSUES_OWNER + '/' + GITHUB_ISSUES_REPO + '/issues', {
+    method: 'POST', headers: ghHeaders(), body: JSON.stringify({ title: title, body: body })
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error('GitHub issue creation failed: ' + (data.message || resp.status));
+  return data;
+}
+
+// Add an issue to the kanban board and set its Status. Throws when the token
+// lacks the project scope; the caller decides how to degrade.
+async function ghBoardAddCard(issueNodeId, statusName) {
+  const q = 'query { organization(login: "' + GITHUB_ORG + '") { projectV2(number: ' + GITHUB_PROJECT + ') { fields(first: 30) { nodes { __typename ... on ProjectV2SingleSelectField { id name options { id name } } } } } } }';
+  let resp = await fetch('https://api.github.com/graphql', { method: 'POST', headers: ghHeaders(), body: JSON.stringify({ query: q }) });
+  let data = await resp.json();
+  if (!resp.ok || data.errors) throw new Error('GitHub board lookup failed' + (data.errors ? ': ' + data.errors[0].message : ''));
+  let fieldId = GITHUB_STATUS_FIELD_ID, optionId = null;
+  const fields = data.data.organization.projectV2.fields.nodes;
+  for (const f of fields) {
+    if (f.name === 'Status') {
+      if (f.id) fieldId = f.id;
+      for (const o of (f.options || [])) { if (o.name === statusName) optionId = o.id; }
+    }
+  }
+  if (!optionId) throw new Error('Status option "' + statusName + '" was not found on the board');
+  const addMut = 'mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) { item { id } } }';
+  resp = await fetch('https://api.github.com/graphql', { method: 'POST', headers: ghHeaders(),
+    body: JSON.stringify({ query: addMut, variables: { projectId: GITHUB_PROJECT_ID, contentId: issueNodeId } }) });
+  data = await resp.json();
+  if (!resp.ok || data.errors) throw new Error('Could not add the card to the board' + (data.errors ? ': ' + data.errors[0].message : ' (HTTP ' + resp.status + ')'));
+  const itemId = data.data.addProjectV2ItemById.item.id;
+  const setMut = 'mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) { updateProjectV2ItemFieldValue(input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: {singleSelectOptionId: $optionId}}) { projectV2Item { id } } }';
+  resp = await fetch('https://api.github.com/graphql', { method: 'POST', headers: ghHeaders(),
+    body: JSON.stringify({ query: setMut, variables: { projectId: GITHUB_PROJECT_ID, itemId: itemId, fieldId: fieldId, optionId: optionId } }) });
+  data = await resp.json();
+  if (!resp.ok || data.errors) throw new Error('Card added, but the status could not be set' + (data.errors ? ': ' + data.errors[0].message : ''));
+  return itemId;
+}
+
+// List clients with document and open-critical-issue counts.
+app.get('/api/onboarding', requireOnboarder, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      "SELECT c.*, " +
+      "(SELECT COUNT(*)::int FROM onboarding_documents d WHERE d.client_id = c.id) AS doc_count, " +
+      "(SELECT COUNT(*)::int FROM onboarding_issues i WHERE i.client_id = c.id AND i.resolved = FALSE AND i.severity = 'critical') AS critical_open " +
+      "FROM onboarding_clients c ORDER BY CASE WHEN c.status = 'in_progress' THEN 0 ELSE 1 END, c.created_at DESC");
+    res.json(r.rows);
+  } catch (error) { console.error('Onboarding list error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Extract the suggested client name from an uploaded Master Application (no storage).
+app.post('/api/onboarding/parse-master', requireOnboarder, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const found = await extractApplicantName(req.file.buffer);
+    res.json({ suggestedName: found.name, page: found.page });
+  } catch (error) { console.error('Parse master error:', error); res.status(500).json({ error: 'Could not read that PDF: ' + error.message }); }
+});
+
+// Create a client: locks in the Master Application and runs the first audit.
+app.post('/api/onboarding', requireOnboarder, handleUpload('masterApp'), async (req, res) => {
+  try {
+    const clientName = String(req.body.clientName || '').trim();
+    if (!clientName) return res.status(400).json({ error: 'Client name is required' });
+    if (!req.file) return res.status(400).json({ error: 'Master Application file is required' });
+    const db = getPool();
+    const r = await db.query('INSERT INTO onboarding_clients (client_name, created_by) VALUES ($1, $2) RETURNING *', [clientName, req.user.id]);
+    const client = r.rows[0];
+    await db.query("INSERT INTO onboarding_documents (client_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, 'master_application', $2, $3, $4, $5)",
+      [client.id, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    await runOnboardingAudit(db, client.id);
+    res.json(client);
+  } catch (error) { console.error('Onboarding create error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Client detail: documents, open issues, and whether Initiate is allowed.
+app.get('/api/onboarding/:id', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const d = await db.query('SELECT id, doc_type, file_name, mime_type, uploaded_at, LENGTH(file_data) AS size FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [req.params.id]);
+    const i = await db.query("SELECT * FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at", [req.params.id]);
+    const client = c.rows[0];
+    client.documents = d.rows;
+    client.issues = i.rows;
+    client.canInitiate = client.status === 'in_progress' &&
+      ONBOARDING_DOC_TYPES.every(function (t) { return d.rows.some(function (x) { return x.doc_type === t; }); }) &&
+      !i.rows.some(function (x) { return x.severity === 'critical'; });
+    res.json(client);
+  } catch (error) { console.error('Onboarding detail error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Upload a document (single-slot types replace; W-9 and ACH append).
+app.post('/api/onboarding/:id/documents', requireOnboarder, handleUpload('file'), async (req, res) => {
+  try {
+    const docType = String(req.body.docType || '');
+    if (ONBOARDING_DOC_TYPES.indexOf(docType) === -1) return res.status(400).json({ error: 'Unknown document type' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const db = getPool();
+    const c = await db.query('SELECT id, status FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    if (SINGLE_DOC_TYPES.indexOf(docType) !== -1) {
+      await db.query('DELETE FROM onboarding_documents WHERE client_id = $1 AND doc_type = $2', [req.params.id, docType]);
+    }
+    await db.query('INSERT INTO onboarding_documents (client_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6)',
+      [req.params.id, docType, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    const audit = await runOnboardingAudit(db, req.params.id);
+    res.json({ ok: true, canInitiate: audit.canInitiate });
+  } catch (error) { console.error('Onboarding upload error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Delete one document, then re-audit.
+app.delete('/api/onboarding/:id/documents/:docId', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT id, status FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    await db.query('DELETE FROM onboarding_documents WHERE id = $1 AND client_id = $2', [req.params.docId, req.params.id]);
+    const audit = await runOnboardingAudit(db, req.params.id);
+    res.json({ ok: true, canInitiate: audit.canInitiate });
+  } catch (error) { console.error('Onboarding doc delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Download a document.
+app.get('/api/onboarding/:id/documents/:docId/download', requireOnboarder, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT file_name, mime_type, file_data FROM onboarding_documents WHERE id = $1 AND client_id = $2', [req.params.docId, req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const d = r.rows[0];
+    res.set('Content-Type', d.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="' + String(d.file_name).replace(/"/g, '') + '"');
+    res.send(d.file_data);
+  } catch (error) { console.error('Onboarding download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Re-run the completeness audit.
+app.post('/api/onboarding/:id/audit', requireOnboarder, async (req, res) => {
+  try {
+    const audit = await runOnboardingAudit(getPool(), req.params.id);
+    res.json({ ok: true, issues: audit.issues, canInitiate: audit.canInitiate });
+  } catch (error) { console.error('Onboarding audit error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Mark one issue as evaluated/resolved.
+app.post('/api/onboarding/:id/issues/:issueId/resolve', requireOnboarder, async (req, res) => {
+  try {
+    await getPool().query('UPDATE onboarding_issues SET resolved = TRUE WHERE id = $1 AND client_id = $2', [req.params.issueId, req.params.id]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Onboarding issue resolve error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Initiate: create the GitHub card, board it under Initiation, move the client to Complete.
+app.post('/api/onboarding/:id/initiate', requireOnboarder, async (req, res) => {
+  try {
+    const nl = String.fromCharCode(10);
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const client = c.rows[0];
+    if (client.status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    const d = await db.query('SELECT doc_type, file_name FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [req.params.id]);
+    const i = await db.query("SELECT COUNT(*)::int AS n FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE AND severity = 'critical'", [req.params.id]);
+    const missing = ONBOARDING_DOC_TYPES.filter(function (t) { return !d.rows.some(function (x) { return x.doc_type === t; }); });
+    if (missing.length > 0) return res.status(400).json({ error: 'Still missing: ' + missing.map(function (t) { return DOC_LABELS[t]; }).join(', ') });
+    if (i.rows[0].n > 0) return res.status(400).json({ error: 'There are still unresolved critical issues. Evaluate them first.' });
+    if (!GITHUB_TOKEN) return res.status(500).json({ error: 'GitHub is not connected on the server' });
+    const title = client.client_name + '; ' + (client.payroll_provider || 'TBD') + '; Onboarding';
+    const body = 'Client onboarded through the iM4 app.' + nl + nl +
+      'Documents collected:' + nl +
+      d.rows.map(function (x) { return '- ' + DOC_LABELS[x.doc_type] + ': ' + x.file_name; }).join(nl) + nl + nl +
+      'Client: ' + client.client_name + nl +
+      'Payroll provider: ' + (client.payroll_provider || 'TBD') + nl +
+      'Onboarded: ' + new Date().toISOString().slice(0, 10);
+    const issue = await ghCreateIssue(title, body);
+    let boardOk = false, boardError = '';
+    try {
+      await ghBoardAddCard(issue.node_id, 'Initiation');
+      boardOk = true;
+    } catch (e) { boardError = e.message; console.error('Board add failed:', e.message); }
+    await db.query("UPDATE onboarding_clients SET status = 'complete', initiated_at = NOW(), github_issue_number = $1, github_repo = $2 WHERE id = $3",
+      [issue.number, GITHUB_ISSUES_OWNER + '/' + GITHUB_ISSUES_REPO, req.params.id]);
+    res.json({ ok: true, issueNumber: issue.number, issueUrl: issue.html_url, boardOk: boardOk, boardError: boardError });
+  } catch (error) { console.error('Onboarding initiate error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// Delete a whole onboarding client card.
+app.delete('/api/onboarding/:id', requireOnboarder, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Onboarding delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
 
 // ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
 async function claudeSummarize(db, impl, company, recentMessages, typical, timeline) {
