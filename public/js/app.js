@@ -1016,7 +1016,12 @@ function parseCSV(text) {
     if (!headers) headers = cells.map(function (h) { return h.toLowerCase().trim(); });
     else {
       var obj = {};
-      headers.forEach(function (h, idx) { obj[h] = cells[idx] !== undefined ? cells[idx] : ''; });
+      var vals = cells.slice();
+      // Tolerate leading blank columns in data rows (common in Excel exports
+      // with empty columns A/B): drop leading empties so values line up
+      // under the headers instead of shifting everything right.
+      while (vals.length > headers.length && vals[0] === '') vals.shift();
+      headers.forEach(function (h, idx) { obj[h] = vals[idx] !== undefined ? vals[idx] : ''; });
       rows.push(obj);
     }
   });
