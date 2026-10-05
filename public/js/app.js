@@ -1128,7 +1128,7 @@ function viewAdminJobs() {
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
       '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
       '<div class="card"><div class="card-title">Reopen onboarding card</div>' +
-      '<p class="muted">Reopens an initiated (Complete) onboarding card so its documents can be added, changed, or deleted, then re-initiated. Re-initiating creates a brand new GitHub card — have someone delete the old GitHub issue.</p>' +
+      '<p class="muted">Reopens an initiated (Complete) onboarding card so its documents can be added, changed, or deleted, then sent to GitHub again. Sending again creates a brand new GitHub card — have someone delete the old GitHub issue.</p>' +
       '<select id="reopencard" style="max-width: 100%;"><option value="">Loading...</option></select> ' +
       '<button class="btn btn-primary" id="doreopen">Reopen card</button><div id="reopenout"></div></div>' +
       '<div class="card"><div class="card-title">Weekly email</div>' +
@@ -1233,13 +1233,13 @@ function viewAdminJobs() {
       var out = document.getElementById('reopenout');
       var id = document.getElementById('reopencard').value;
       if (!id) { out.innerHTML = errorHtml('Choose a card first.'); return; }
-      if (!window.confirm('Reopen this card? Its documents can then be added, changed, or deleted, and it can be re-initiated into a brand new GitHub card.')) return;
+      if (!window.confirm('Reopen this card? Its documents can then be added, changed, or deleted, and it can be sent to GitHub again into a brand new GitHub card.')) return;
       out.innerHTML = '<p class="muted">Reopening...</p>';
       api.post('/api/admin/onboarding/' + id + '/reopen', {}).then(function (d) {
         out.innerHTML = okHtml('Card reopened — find it under Onboarding, In Progress.') +
           (d.previousIssue
-            ? '<p class="muted">When you re-initiate, a brand new GitHub card is created. Have someone delete the old GitHub issue #' + d.previousIssue + '.</p>'
-            : '<p class="muted">When you re-initiate, a brand new GitHub card is created.</p>');
+            ? '<p class="muted">When you send it to GitHub again, a brand new GitHub card is created. Have someone delete the old GitHub issue #' + d.previousIssue + '.</p>'
+            : '<p class="muted">When you send it to GitHub again, a brand new GitHub card is created.</p>');
         loadReopenList();
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
@@ -1394,12 +1394,12 @@ function viewOnboardingDetail(id) {
         }).join('') : '<p class="muted">No open issues. The documents look complete.</p>';
         var initBtn;
         if (!inProg) {
-          initBtn = '<p class="muted">Initiated' + (c.initiated_at ? ' on ' + fmtDate(c.initiated_at) : '') +
+          initBtn = '<p class="muted">Sent to GitHub' + (c.initiated_at ? ' on ' + fmtDate(c.initiated_at) : '') +
             (c.github_issue_number ? ' &middot; GitHub issue #' + c.github_issue_number : '') + '.</p>';
         } else if (c.canInitiate) {
-          initBtn = '<p><button class="btn btn-primary" id="obinit">Initiate</button></p><div id="obinitmsg"></div>';
+          initBtn = '<p><button class="btn btn-primary" id="obinit">Send to GitHub</button></p><div id="obinitmsg"></div>';
         } else {
-          initBtn = '<p><button class="btn" disabled title="Upload all documents and clear critical issues first">Initiate</button> ' +
+          initBtn = '<p><button class="btn" disabled title="Upload all documents and clear critical issues first">Send to GitHub</button> ' +
             '<span class="muted">Available when all documents are uploaded and no critical issues are open.</span></p><div id="obinitmsg"></div>';
         }
         render(shell(
@@ -1417,7 +1417,7 @@ function viewOnboardingDetail(id) {
           '<h3>Completeness check</h3><div id="obissues">' + issues + '</div>' +
           ((c.handled && c.handled.length) ? '<p class="muted">' + c.handled.map(function (h) { return h.n + ' ' + esc(h.resolution); }).join(' &middot; ') + '</p>' : '') +
           (inProg ? '<p><button class="btn" id="obreaudit">Re-run check</button></p>' : '') +
-          '<h3>Initiate</h3>' + initBtn +
+          '<h3>Send to GitHub</h3>' + initBtn +
           (inProg ? '<p><button class="btn btn-link" id="obdelete" style="color:#c00">Delete this client card</button></p>' : ''),
           '#/onboarding'));
         // wire up uploads
@@ -1469,10 +1469,10 @@ function viewOnboardingDetail(id) {
         };
         var ib = document.getElementById('obinit');
         if (ib) ib.onclick = function () {
-          if (!confirm('Initiate ' + c.client_name + '? This creates the GitHub card and moves the client to Complete.')) return;
+          if (!confirm('Send ' + c.client_name + ' to GitHub? This creates the GitHub card and moves the client to Complete.')) return;
           document.getElementById('obinitmsg').innerHTML = '<p class="muted">Creating the GitHub card...</p>';
           api.post('/api/onboarding/' + id + '/initiate', {}).then(function (r) {
-            var msg = 'Initiated. GitHub issue <a href="' + esc(r.issueUrl) + '" target="_blank">#' + r.issueNumber + '</a> created.';
+            var msg = 'Sent to GitHub. Issue <a href="' + esc(r.issueUrl) + '" target="_blank">#' + r.issueNumber + '</a> created.';
             if (!r.boardOk) msg += ' <span class="rag rag-yellow">Card was not added to the board automatically: ' + esc(r.boardError || 'unknown reason') + '. Add issue #' + r.issueNumber + ' to the board by hand.</span>';
             document.getElementById('obinitmsg').innerHTML = '<p>' + msg + '</p>';
             setTimeout(load, 2500);

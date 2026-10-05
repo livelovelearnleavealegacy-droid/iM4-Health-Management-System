@@ -2432,7 +2432,7 @@ app.post('/api/onboarding/:id/documents', requireOnboarder, handleUpload('file')
     const db = getPool();
     const c = await db.query('SELECT id, status FROM onboarding_clients WHERE id = $1', [req.params.id]);
     if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been sent to GitHub' });
     if (SINGLE_DOC_TYPES.indexOf(docType) !== -1) {
       await db.query('DELETE FROM onboarding_documents WHERE client_id = $1 AND doc_type = $2', [req.params.id, docType]);
     }
@@ -2449,7 +2449,7 @@ app.delete('/api/onboarding/:id/documents/:docId', requireOnboarder, async (req,
     const db = getPool();
     const c = await db.query('SELECT id, status FROM onboarding_clients WHERE id = $1', [req.params.id]);
     if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been sent to GitHub' });
     await db.query('DELETE FROM onboarding_documents WHERE id = $1 AND client_id = $2', [req.params.docId, req.params.id]);
     const audit = await runOnboardingAudit(db, req.params.id);
     res.json({ ok: true, canInitiate: audit.canInitiate });
@@ -2493,7 +2493,7 @@ app.post('/api/onboarding/:id/initiate', requireOnboarder, async (req, res) => {
     const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
     if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     const client = c.rows[0];
-    if (client.status !== 'in_progress') return res.status(400).json({ error: 'This client has already been initiated' });
+    if (client.status !== 'in_progress') return res.status(400).json({ error: 'This client has already been sent to GitHub' });
     const d = await db.query('SELECT doc_type, file_name FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [req.params.id]);
     const i = await db.query("SELECT COUNT(*)::int AS n FROM onboarding_issues WHERE client_id = $1 AND resolved = FALSE AND severity = 'critical'", [req.params.id]);
     const missing = ONBOARDING_DOC_TYPES.filter(function (t) { return !d.rows.some(function (x) { return x.doc_type === t; }); });
@@ -2510,7 +2510,7 @@ app.post('/api/onboarding/:id/initiate', requireOnboarder, async (req, res) => {
     const issue = await ghCreateIssue(title, body);
     let boardOk = false, boardError = '';
     try {
-      await ghBoardAddCard(issue.node_id, 'Initiation');
+      await ghBoardAddCard(issue.node_id, 'Onboarding (IHIA)');
       boardOk = true;
     } catch (e) { boardError = e.message; console.error('Board add failed:', e.message); }
     await db.query("UPDATE onboarding_clients SET status = 'complete', initiated_at = NOW(), github_issue_number = $1, github_repo = $2 WHERE id = $3",
