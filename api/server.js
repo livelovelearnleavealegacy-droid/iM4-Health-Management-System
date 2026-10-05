@@ -1252,7 +1252,7 @@ app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
   try {
     const steward_id = req.body && req.body.steward_id;
     const roles = req.body && req.body.roles;
-    const allowed = ['admin', 'steward', 'top_dog'];
+    const allowed = ['admin', 'steward', 'top_dog', 'onboarding'];
     if (!steward_id || !Array.isArray(roles) || roles.length === 0) {
       return res.status(400).json({ error: 'steward_id and a non-empty roles array are required' });
     }
