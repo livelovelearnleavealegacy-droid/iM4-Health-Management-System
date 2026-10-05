@@ -137,16 +137,36 @@ function logoHtml(size) {
   return '<img src="logo.webp" class="brand-logo" width="' + w + '" height="' + size + '" alt="iM4 Health">';
 }
 
+function activeRole() {
+  var u = state.user;
+  return u ? (u.activeRole || u.role || '') : '';
+}
+
+// Screens per role:
+// steward: Dashboard, Companies, Billing, Implementation (assigned accounts only)
+// onboarding: Companies, Implementation, Onboarding (all clients)
+// top_dog: Dashboard, Companies, Billing, Implementation (all accounts)
+// admin: everything
 function navLinks() {
   var u = state.user;
-  var links = [
-    ['#/dashboard', 'Dashboard'],
-    ['#/clients', 'Companies'],
-    ['#/billing', 'Billing'],
-    ['#/implementations', 'Implementation']
-  ];
-  if (canOnboard()) links.push(['#/onboarding', 'Onboarding']);
-  if (u && u.role === 'admin') {
+  var role = activeRole();
+  var links;
+  if (role === 'onboarding') {
+    links = [
+      ['#/clients', 'Companies'],
+      ['#/implementations', 'Implementation'],
+      ['#/onboarding', 'Onboarding']
+    ];
+  } else {
+    links = [
+      ['#/dashboard', 'Dashboard'],
+      ['#/clients', 'Companies'],
+      ['#/billing', 'Billing'],
+      ['#/implementations', 'Implementation']
+    ];
+    if (role === 'admin') links.push(['#/onboarding', 'Onboarding']);
+  }
+  if (role === 'admin') {
     links.push(['#/admin/jobs', 'Jobs']);
     links.push(['#/admin/stewards', 'Stewards']);
     links.push(['#/admin/companies', 'Companies']);
@@ -195,7 +215,8 @@ function render(html) {
   var brand = document.getElementById('brandlink');
   if (brand) brand.onclick = function (e) {
     e.preventDefault();
-    location.hash = api.token ? '#/dashboard' : '#/login';
+    if (!api.token) { location.hash = '#/login'; return; }
+    location.hash = activeRole() === 'onboarding' ? '#/onboarding' : '#/dashboard';
   };
   var rs = document.getElementById('roleswitch');
   if (rs) rs.onchange = function () {
@@ -371,6 +392,7 @@ function requireUser(next) {
 // ---------------------------------------------------------------- dashboard (landing page after login)
 function viewDashboard() {
   requireUser(function () {
+    if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     api.get('/api/dashboard').then(function (d) {
       var stageOrder = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
       var stageMap = {};
@@ -403,6 +425,7 @@ function viewDashboard() {
 // ---------------------------------------------------------------- billing
 function viewBilling() {
   requireUser(function () {
+    if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     var codeFilter = '';
     function load() {
       api.get('/api/billing?status=open').then(function (openRows) {

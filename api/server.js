@@ -1004,6 +1004,7 @@ app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------- v5: dashboard
 app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
+    if (req.user.activeRole === 'onboarding') return res.status(403).json({ error: 'Not available for this role' });
     const db = getPool();
     const ids = await visibleCompanyIds(req.user);
     const codes = await getVisibleCodes(req.user);
@@ -1084,6 +1085,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------- v5: billing
 app.get('/api/billing', requireAuth, async (req, res) => {
   try {
+    if (req.user.activeRole === 'onboarding') return res.status(403).json({ error: 'Not available for this role' });
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
