@@ -6,7 +6,7 @@
 (function () {
 'use strict';
 
-var STAGES = ['Data Gathering', 'Initiation', 'Onboarding IHIA', 'Implementation', 'Go Live', 'Complete'];
+var STAGES = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
 
 function esc(s) {
   return String(s === undefined || s === null ? '' : s)
@@ -331,7 +331,7 @@ function requireUser(next) {
 function viewDashboard() {
   requireUser(function () {
     api.get('/api/dashboard').then(function (d) {
-      var stageOrder = ['Onboarding IHIA', 'Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
+      var stageOrder = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
       var stageMap = {};
       d.clientsByStage.forEach(function (s) { stageMap[s.stage] = s.count; });
       var stageRows = stageOrder.map(function (st) {
@@ -646,6 +646,25 @@ function viewImplementations() {
   });
 }
 
+// ---------------------------------------------------------------- 14-week timeline
+function timelineHtml(t) {
+  if (!t || !t.started) return '<p class="muted">The timeline clock starts the first time this project enters Initiation.</p>';
+  var head = '<div class="tl-head"><b>Week ' + t.weekElapsed + ' of 14</b> &middot; started ' + fmtDate(t.startDate) +
+    ' &middot; expected go-live ' + fmtDate(t.goLiveDate) +
+    ' &middot; expected stage now: <b>' + esc(t.expectedStage) + '</b>' +
+    (t.daysBehind > 0
+      ? ' &middot; <span class="rag rag-red">' + t.daysBehind + ' days behind plan</span>'
+      : ' &middot; <span class="rag rag-green">On pace</span>') + '</div>';
+  var blocks = t.blocks.map(function (b) {
+    var cls = 'tl-block' + (b.current ? ' tl-current' : '') + (b.done ? ' tl-done' : '');
+    return '<div class="' + cls + '">' +
+      '<div class="tl-title">Weeks ' + b.startWeek + '-' + b.endWeek + ': ' + esc(b.block) +
+      ' <span class="muted">(' + esc(b.stage) + ' &middot; ' + fmtDate(b.startDate) + ' &ndash; ' + fmtDate(b.endDate) + ')</span></div>' +
+      '<ul class="tl-duties">' + b.duties.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join('') + '</ul></div>';
+  }).join('');
+  return head + '<div class="timeline">' + blocks + '</div>';
+}
+
 // ---------------------------------------------------------------- project view: lifecycle visual + summary | messages
 function lifecycleVisual(current, daysInStage) {
   var idx = STAGES.indexOf(current);
@@ -728,6 +747,7 @@ function viewProject(id) {
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
         '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage) +
+        '<h3>14-week timeline</h3>' + timelineHtml(d.timeline) +
         '<p>' + statusHtml(i) + '</p>' +
         (i.card_title ? '<p class="muted">' + esc(i.card_title) + '</p>' : '') +
         '<h3>Project summary</h3>' + summaryHtml(latest) + older +

@@ -34,16 +34,57 @@ const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const APP_URL = process.env.APP_URL || '';
 
-const STAGES = ['Data Gathering', 'Initiation', 'Onboarding IHIA', 'Implementation', 'Go Live', 'Complete'];
+const STAGES = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
 // Default expected working days per stage until real cases teach us better.
 const DEFAULT_STAGE_DAYS = {
-  'Data Gathering': 30,
-  'Initiation': 7,
-  'Onboarding IHIA': 7,
-  'Implementation': 30,
+  'Initiation': 14,
+  'Data Gathering': 28,
+  'Implementation': 42,
   'Go Live': 14,
   'Complete': 0
 };
+
+// The 14-week implementation plan. The clock starts the first time a project
+// enters the Initiation stage. Weeks are counted from that start date.
+const TIMELINE = [
+  { stage: 'Initiation', block: 'Kickoff', startWeek: 0, endWeek: 2, duties: [
+    'Receive information from IHIA',
+    'Receive intro from IHIA',
+    'Send intro with availability to client',
+    'Set introduction meeting',
+    'Set up codes for express/2.0 if possible',
+    'Complete introduction meeting and send recap, requirements, and generic education'
+  ] },
+  { stage: 'Data Gathering', block: 'Census and setup', startWeek: 2, endWeek: 6, duties: [
+    'Receive census from client',
+    'Review census from client and unhide reports',
+    'Set up codes',
+    'Unit test'
+  ] },
+  { stage: 'Implementation', block: 'Development and testing', startWeek: 6, endWeek: 8, duties: [
+    'Developers create what is needed for process',
+    'Test run(s)'
+  ] },
+  { stage: 'Implementation', block: 'Dry run 1', startWeek: 8, endWeek: 10, duties: [
+    'Confirm expected date to set up dry run',
+    'Successful dry run 1 (must succeed twice)',
+    'Send recaps with next steps',
+    'Send educational materials',
+    'Confirm expected go live and provide availability'
+  ] },
+  { stage: 'Implementation', block: 'Dry run 2', startWeek: 10, endWeek: 12, duties: [
+    'Successful dry run 2 (must succeed twice)',
+    'Send recaps with next steps',
+    'Confirm expected go live and provide availability',
+    'Set go live meeting'
+  ] },
+  { stage: 'Go Live', block: 'Go live', startWeek: 12, endWeek: 14, duties: [
+    'Complete go live - training',
+    'Send recap and documentation',
+    'Provide follow-up support as needed'
+  ] }
+];
+const TOTAL_TIMELINE_WEEKS = 14;
 
 // ---------------------------------------------------------------- database
 let pool = null;
@@ -884,7 +925,8 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
     const sums = await getPool().query(
       'SELECT summary_date, body, created_at FROM implementation_summaries WHERE implementation_id = $1 ORDER BY summary_date DESC LIMIT 5',
       [req.params.id]);
-    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows });
+    const timeline = await buildTimeline(getPool(), req.params.id);
+    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows, timeline: timeline });
   } catch (error) {
     console.error('Load project error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1472,6 +1514,74 @@ async function trackStage(db, implId, newStage) {
   await db.query('INSERT INTO stage_history (implementation_id, stage) VALUES ($1, $2)', [implId, newStage]);
 }
 
+// Map a GitHub board Status value onto the canonical five phases.
+function normalizeStage(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return 'No Status';
+  for (const c of STAGES) {
+    if (c.toLowerCase() === s.toLowerCase()) return c;
+  }
+  if (s.toLowerCase() === 'onboarding ihia') return 'Initiation';
+  return s;
+}
+
+// Build the 14-week timeline for one implementation. The clock starts the
+// first time the project entered Initiation (falls back to the earliest
+// recorded stage entry for older projects).
+async function buildTimeline(db, implId) {
+  const DAY = 24 * 60 * 60 * 1000;
+  let r = await db.query(
+    "SELECT MIN(entered_at) AS initiation_at FROM stage_history WHERE implementation_id = $1 AND stage = 'Initiation'",
+    [implId]);
+  let start = (r.rows[0] && r.rows[0].initiation_at) ? new Date(r.rows[0].initiation_at) : null;
+  if (!start) {
+    const e = await db.query(
+      'SELECT MIN(entered_at) AS first_at FROM stage_history WHERE implementation_id = $1', [implId]);
+    if (e.rows[0] && e.rows[0].first_at) start = new Date(e.rows[0].first_at);
+  }
+  if (!start || isNaN(start.getTime())) return { started: false, blocks: [] };
+  const st = await db.query('SELECT stage FROM implementations WHERE id = $1', [implId]);
+  const currentStage = st.rows.length ? String(st.rows[0].stage || '') : '';
+  const today = new Date();
+  const weekElapsed = Math.max(0, Math.floor((today.getTime() - start.getTime()) / (7 * DAY)));
+  const blocks = TIMELINE.map(function (b) {
+    const sDate = new Date(start.getTime() + b.startWeek * 7 * DAY);
+    const eDate = new Date(start.getTime() + b.endWeek * 7 * DAY);
+    return {
+      stage: b.stage, block: b.block, startWeek: b.startWeek, endWeek: b.endWeek,
+      startDate: sDate.toISOString().slice(0, 10), endDate: eDate.toISOString().slice(0, 10),
+      duties: b.duties,
+      done: weekElapsed >= b.endWeek,
+      current: weekElapsed >= b.startWeek && weekElapsed < b.endWeek
+    };
+  });
+  let cur = null;
+  for (const b of blocks) { if (b.current) cur = b; }
+  const expectedStage = weekElapsed >= TOTAL_TIMELINE_WEEKS ? 'Complete' : (cur ? cur.stage : blocks[0].stage);
+  const curIdx = STAGES.indexOf(currentStage);
+  const expIdx = STAGES.indexOf(expectedStage);
+  const onTrack = curIdx === -1 || curIdx >= expIdx;
+  let daysBehind = 0;
+  if (!onTrack) {
+    const mine = blocks.filter(function (b) { return b.stage === currentStage; });
+    if (mine.length) {
+      const endMs = new Date(mine[mine.length - 1].endDate + 'T00:00:00Z').getTime();
+      daysBehind = Math.max(0, Math.floor((today.getTime() - endMs) / DAY));
+    }
+  }
+  return {
+    started: true,
+    startDate: start.toISOString().slice(0, 10),
+    weekElapsed: weekElapsed,
+    currentStage: currentStage,
+    expectedStage: expectedStage,
+    onTrack: onTrack,
+    daysBehind: daysBehind,
+    goLiveDate: new Date(start.getTime() + TOTAL_TIMELINE_WEEKS * 7 * DAY).toISOString().slice(0, 10),
+    blocks: blocks
+  };
+}
+
 // Pulls an issue's comments into the app and prunes app copies of comments
 // deleted on GitHub (both directions: the app mirrors the card's comment list).
 // Messages never posted to GitHub (NULL github_comment_id) are never pruned.
@@ -1525,7 +1635,7 @@ async function runGithubSync() {
       const fullTitle = (item.content && item.content.title) ? item.content.title : 'Untitled';
       const issueNumber = (item.content && item.content.__typename === 'Issue') ? item.content.number : null;
       const repo = (item.content && item.content.repository) ? item.content.repository.nameWithOwner : null;
-      const stage = status || 'No Status';
+      const stage = normalizeStage(status);
       const up = await db.query(
         'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, updated_at) ' +
         'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ' +
@@ -1893,7 +2003,7 @@ async function typicalDurations(db) {
 }
 
 // ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
-async function claudeSummarize(db, impl, company, recentMessages, typical) {
+async function claudeSummarize(db, impl, company, recentMessages, typical, timeline) {
   const nl = String.fromCharCode(10);
   const msgText = recentMessages.slice(-20).map(m => '- ' + (m.author_name || 'unknown') + ' (' + (m.when || '') + '): ' + String(m.body || '').slice(0, 400)).join(nl);
   const durLines = STAGES.map(function (s) {
@@ -1902,19 +2012,33 @@ async function claudeSummarize(db, impl, company, recentMessages, typical) {
     return '- ' + s + ': ' + days + ' working days';
   }).join(nl);
   const stageEntered = impl.stage_entered_at ? new Date(impl.stage_entered_at).toLocaleDateString() : 'unknown';
+  let tlText = 'No timeline yet (the project has not entered Initiation).';
+  if (timeline && timeline.started) {
+    tlText = timeline.blocks.map(function (b) {
+      return 'Weeks ' + b.startWeek + '-' + b.endWeek + ' (' + b.startDate + ' to ' + b.endDate + '): ' +
+        b.stage + ' - ' + b.block + '. Duties: ' + b.duties.join('; ') + '.';
+    }).join(nl) +
+    nl + 'Timeline started ' + timeline.startDate + ' (week ' + timeline.weekElapsed + ' of ' + TOTAL_TIMELINE_WEEKS + '). ' +
+    'Current stage: ' + timeline.currentStage + '. Expected stage now: ' + timeline.expectedStage + '. ' +
+    'Expected go-live: ' + timeline.goLiveDate + '. ' +
+    (timeline.daysBehind > 0
+      ? 'The project is ' + timeline.daysBehind + ' days behind the plan.'
+      : 'The project is on the planned pace.');
+  }
   const prompt = 'You are a project manager writing a brief nightly update for the project owner. ' +
     'Project: ' + company.company_name + ' (company code ' + company.company_code + '). ' +
     'Current stage: ' + (impl.stage || 'unknown') + ' (entered ' + stageEntered + ', ' + (impl.days_in_stage || 0) + ' days in stage). ' +
     'Status: ' + (impl.status || 'unknown') + '. Card: ' + (impl.card_title || '') + '.' + nl +
     'Typical working days per stage:' + nl + durLines + nl +
+    'The 14-week implementation plan (the clock starts the day the project first entered Initiation):' + nl + tlText + nl +
     'Recent messages (newest last):' + nl + (msgText || '(none)') + nl + nl +
     'Write the update in EXACTLY this format:' + nl +
     'STATUS: RED, YELLOW, or GREEN (your judgment: RED = blocked or seriously off track, YELLOW = at risk or stalled, GREEN = on track)' + nl +
     'KEY DATES:' + nl +
-    '- one bullet per important date: when the current stage started, expected completion of the current stage (use the typical durations above), expected go-live, and any due dates mentioned in the messages' + nl +
+    '- one bullet per important date: when the current stage started, expected completion of the current stage (use the 14-week plan above), expected go-live, and any due dates mentioned in the messages' + nl +
     'SUMMARY:' + nl +
     '- 1-2 sentences on the current status and what has been accomplished recently' + nl +
-    '- Outstanding to-dos, each with WHAT needs doing, WHO owns it, and the DUE DATE (use TBD where unknown)' + nl +
+    '- Outstanding to-dos, each with WHAT needs doing, WHO owns it, and the DUE DATE (use TBD where unknown; draw the to-dos from the current phase duties in the plan above)' + nl +
     '- Obstacles or roadblocks and who is working on them' + nl +
     'Keep it tight and plain-spoken. No preamble, no sign-off.';
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1957,7 +2081,8 @@ async function runSummaries() {
           'SELECT author_name, body, COALESCE(github_created_at, created_at) AS when FROM messages ' +
           'WHERE implementation_id = $1 ORDER BY COALESCE(github_created_at, created_at) DESC LIMIT 20',
           [impl.id]);
-        const body = await claudeSummarize(db, impl, impl, msgs.rows.reverse(), typical);
+        const timeline = await buildTimeline(db, impl.id);
+        const body = await claudeSummarize(db, impl, impl, msgs.rows.reverse(), typical, timeline);
         await db.query(
           'INSERT INTO implementation_summaries (implementation_id, summary_date, body) VALUES ($1, $2, $3) ' +
           'ON CONFLICT (implementation_id, summary_date) DO UPDATE SET body = EXCLUDED.body',
