@@ -430,9 +430,11 @@ function viewBilling() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     var codeFilter = '';
+    var typeFilter = '';
     function load() {
-      api.get('/api/billing?status=open').then(function (openRows) {
-        api.get('/api/billing?status=paid').then(function (paidRows) {
+      var tq = typeFilter ? '&type=' + encodeURIComponent(typeFilter) : '';
+      api.get('/api/billing?status=open' + tq).then(function (openRows) {
+        api.get('/api/billing?status=paid' + tq).then(function (paidRows) {
           function matches(r) {
             if (!codeFilter) return true;
             return String(r.company_code || '').toLowerCase().indexOf(codeFilter.toLowerCase()) !== -1;
@@ -441,10 +443,11 @@ function viewBilling() {
           var paidF = paidRows.filter(matches);
           function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
           function panel(title, rows, showPaid) {
-            var head = '<tr><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
+            var head = '<tr><th>Type</th><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
               (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
             var body = rows.map(function (r) {
-              return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+              var bt = r.bill_type === 'S' ? 'S' : (r.bill_type === 'F' ? 'F' : '&mdash;');
+              return '<tr><td><b>' + bt + '</b></td><td><b>' + esc(r.company_code) + '</b></td>' +
                 cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
                 '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
                 (showPaid ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
@@ -458,6 +461,11 @@ function viewBilling() {
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
             '<div class="form-inline"><label>Filter by company code: <input id="bcode" placeholder="e.g. 9001" value="' + esc(codeFilter) + '"></label> ' +
+            '<label>Bill type: <select id="btype">' +
+            '<option value="">All types</option>' +
+            '<option value="F"' + (typeFilter === 'F' ? ' selected' : '') + '>F - FTJ</option>' +
+            '<option value="S"' + (typeFilter === 'S' ? ' selected' : '') + '>S - Soluta</option>' +
+            '</select></label> ' +
             '<button class="btn btn-small" id="bcodeclear">Clear</button></div>' +
             '<div class="billing-panels">' +
             panel('Open Invoices', openF, false) +
@@ -466,7 +474,8 @@ function viewBilling() {
             '#/billing'));
           var bi = document.getElementById('bcode');
           bi.oninput = function () { codeFilter = bi.value; load(); };
-          document.getElementById('bcodeclear').onclick = function () { codeFilter = ''; load(); };
+          document.getElementById('btype').onchange = function () { typeFilter = this.value; load(); };
+          document.getElementById('bcodeclear').onclick = function () { codeFilter = ''; typeFilter = ''; load(); };
         }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
     }
@@ -1138,6 +1147,10 @@ function viewAdminJobs() {
       '<p class="muted">Claude writes a personalized Friday summary for each steward, top dog, and admin — week in review, their to-dos, company updates. Sends via Resend.</p>' +
       '<label>Days back: <input id="emaildays" type="number" value="7" min="1" max="30" style="width: 60px;"></label> ' +
       '<button class="btn btn-primary" id="runemail">Send weekly email now</button><div id="emailout"></div></div>' +
+      '<div class="card"><div class="card-title">FTJ billing: Premium Applied Report</div>' +
+      '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
+      '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
+      '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div></div>' +
       '</div>' +
       '<h3>Delete data</h3>' +
       '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
@@ -1206,6 +1219,36 @@ function viewAdminJobs() {
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });
+    };
+    document.getElementById('ftjpreview').onclick = function () {
+      var out = document.getElementById('ftjout');
+      var fi = document.getElementById('ftjfile');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
+      var fd = new FormData();
+      fd.append('file', fi.files[0]);
+      out.innerHTML = '<p class="muted">Parsing the report (400K+ rows) — this can take about a minute...</p>';
+      uploadFile('/api/admin/jobs/ftj-preview', fd).then(function (r) {
+        var s = r.stats;
+        var html = '<p><b>' + s.bills + '</b> paid F bills across <b>' + s.accounts + '</b> accounts, ' +
+          'modals ' + esc(s.modal_from) + ' to ' + esc(s.modal_to) + ', total <b>' + fmtMoney(s.total_invoice) + '</b> ' +
+          '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th></tr></thead><tbody>' +
+          r.sample.map(function (b) {
+            return '<tr><td><b>' + esc(b.company_code) + '</b></td><td>' + esc(b.company_name) + '</td><td>' +
+              esc(b.payroll_date) + '</td><td>' + esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
+          }).join('') + '</tbody></table></div>';
+        html += '<p><button class="btn btn-primary" id="ftjimport">Import ' + s.bills + ' bills</button> ' +
+          '<span class="muted">Adds new, updates changed, deletes F bills missing from the report.</span></p><div id="ftjimportout"></div>';
+        out.innerHTML = html;
+        document.getElementById('ftjimport').onclick = function () {
+          if (!window.confirm('Import ' + s.bills + ' F bills? This adds new bills, updates changed ones, and deletes F bills not in the report.')) return;
+          var iout = document.getElementById('ftjimportout');
+          iout.innerHTML = '<p class="muted">Importing...</p>';
+          api.post('/api/admin/jobs/ftj-import', { token: r.token }).then(function (imp) {
+            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
+          }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
+        };
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
     function del(target, mode, key, key2, confirmText) {
       var out = document.getElementById('delout');

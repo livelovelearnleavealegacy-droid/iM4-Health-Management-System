@@ -187,8 +187,10 @@ async function migrate() {
     'total_invoice NUMERIC(12,2), ' +
     "status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'paid')), " +
     'paid_date DATE, ' +
+    "bill_type TEXT NOT NULL DEFAULT 'F', " +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_type TEXT NOT NULL DEFAULT 'F'");
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -1103,9 +1105,14 @@ app.get('/api/billing', requireAuth, async (req, res) => {
     if (codes && codes.length === 0) return res.json([]);
     let where = 'WHERE status = $1';
     const params = [status];
+    const btype = req.query.type === 'F' || req.query.type === 'S' ? req.query.type : null;
+    if (btype) {
+      params.push(btype);
+      where += ' AND bill_type = $' + params.length;
+    }
     if (codes) {
       params.push(codes);
-      where += ' AND company_code = ANY($2)';
+      where += ' AND company_code = ANY($' + params.length + ')';
     }
     const r = await getPool().query(
       'SELECT * FROM invoices ' + where + ' ORDER BY payroll_date DESC NULLS LAST, company_code', params);
@@ -1118,7 +1125,8 @@ app.get('/api/billing', requireAuth, async (req, res) => {
 
 // v5: billing CSV import (admin only). Accepts { csv } text or { rows } array.
 // Columns: company_code, company_name, payroll_date, lives_count,
-// total_invoice, status, paid_date. Upserts on (company_code, payroll_date).
+// total_invoice, status, paid_date, bill_type ('F' or 'S', default 'F').
+// Upserts on (company_code, payroll_date, bill_type).
 app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
   try {
     const body = req.body || {};
@@ -1149,17 +1157,20 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
           ? String(row.status).trim().toLowerCase() : 'open';
         if (status !== 'open' && status !== 'paid') throw new Error("status must be 'open' or 'paid'");
         const paid_date = toISODate(row.paid_date);
+        let bill_type = row.bill_type !== undefined && row.bill_type !== null && String(row.bill_type).trim() !== ''
+          ? String(row.bill_type).trim().toUpperCase() : 'F';
+        if (bill_type !== 'F' && bill_type !== 'S') throw new Error("bill_type must be 'F' or 'S'");
         const up = await db.query(
           'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, updated_at = NOW() ' +
-          'WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL))',
-          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date]);
+          "WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL)) AND bill_type = $8",
+          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_type]);
         if (up.rowCount > 0) {
           updated++;
         } else {
           await db.query(
-            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date) ' +
-            'VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date]);
+            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type) ' +
+            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type]);
           imported++;
         }
       } catch (e) {
@@ -1171,6 +1182,203 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
     console.error('Billing import error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ---------------------------------------------------------------- v5.8: FTJ billing from Premium Applied Report
+// Bill types: 'F' = FTJ (from the Premium Applied Report), 'S' = Soluta (later).
+const FTJ_PERIODS = { '1': 52, '2': 26, '3': 24, '4': 12, 'M': 12 };
+const ftjPreviewCache = new Map();
+
+function ftjISODate(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+  if (typeof v === 'number' && isFinite(v)) {
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return isNaN(d) ? null : d.toISOString().slice(0, 10);
+  }
+  const str = String(v).trim();
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return m[3] + '-' + ('0' + m[1]).slice(-2) + '-' + ('0' + m[2]).slice(-2);
+  const d2 = new Date(str);
+  return isNaN(d2) ? null : d2.toISOString().slice(0, 10);
+}
+
+// Parse a Premium Applied Report workbook into paid F bills.
+// One bill per (Account, Modal Date): invoice total = sum of Amount Applied
+// across all products; lives = round(admin-only sum / (40*12/periods)).
+function parsePremiumApplied(buffer) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  let headerIdx = -1;
+  let colIdx = null;
+  let dataRows = null;
+  for (const sn of wb.SheetNames) {
+    const ws = wb.Sheets[sn];
+    const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+    for (let i = 0; i < Math.min(arr.length, 25); i++) {
+      const r = arr[i] || [];
+      const up = r.map(function (c) { return String(c === null || c === undefined ? '' : c).toUpperCase().trim(); });
+      const ai = up.indexOf('ACCOUNT');
+      const mi = up.findIndex(function (c) { return c === 'MODAL DATE'; });
+      const bi = up.findIndex(function (c) { return c === 'BILL MODE'; });
+      const ti = up.findIndex(function (c) { return c === 'AMOUNT APPLIED'; });
+      if (ai !== -1 && mi !== -1 && bi !== -1 && ti !== -1) {
+        headerIdx = i;
+        colIdx = {
+          account: ai, modal: mi, billMode: bi, amount: ti,
+          product: up.indexOf('PRODUCT ID'),
+          applied: up.findIndex(function (c) { return c === 'APPLIED DATE'; })
+        };
+        dataRows = arr.slice(i + 1);
+        break;
+      }
+    }
+    if (dataRows) break;
+  }
+  if (!dataRows) throw new Error('Could not find the Premium Applied Report columns (ACCOUNT / MODAL DATE / BILL MODE / AMOUNT APPLIED).');
+  const groups = new Map();
+  for (const r of dataRows) {
+    if (!r) continue;
+    const acctRaw = colIdx.account !== -1 ? r[colIdx.account] : null;
+    if (acctRaw === null || acctRaw === undefined || String(acctRaw).trim() === '') continue;
+    const account = String(acctRaw).trim();
+    const modalDate = ftjISODate(r[colIdx.modal]);
+    if (!modalDate) continue;
+    const billMode = String(r[colIdx.billMode] === null || r[colIdx.billMode] === undefined ? '' : r[colIdx.billMode]).trim().toUpperCase();
+    const product = colIdx.product !== -1 ? String(r[colIdx.product] === null || r[colIdx.product] === undefined ? '' : r[colIdx.product]).trim().toUpperCase() : '';
+    let amount = 0;
+    const av = r[colIdx.amount];
+    if (typeof av === 'number' && isFinite(av)) amount = av;
+    else if (av !== null && av !== undefined && String(av).trim() !== '') {
+      const p = parseFloat(String(av).replace(/[^0-9.\-]/g, ''));
+      if (!isNaN(p)) amount = p;
+    }
+    const appliedDate = colIdx.applied !== -1 ? ftjISODate(r[colIdx.applied]) : null;
+    const key = account + '|' + modalDate;
+    let g = groups.get(key);
+    if (!g) {
+      g = { company_code: account, payroll_date: modalDate, bill_mode: billMode, total_invoice: 0, admin_fees: 0, paid_date: null, rows: 0 };
+      groups.set(key, g);
+    }
+    g.total_invoice += amount;
+    if (product === 'ADMIN') g.admin_fees += amount;
+    if (!g.bill_mode && billMode) g.bill_mode = billMode;
+    if (appliedDate && (!g.paid_date || appliedDate > g.paid_date)) g.paid_date = appliedDate;
+    g.rows += 1;
+  }
+  const bills = [];
+  for (const g of groups.values()) {
+    const periods = FTJ_PERIODS[g.bill_mode] || 0;
+    const rate = periods ? 480 / periods : 0;
+    const lives = rate ? Math.round(g.admin_fees / rate) : 0;
+    bills.push({
+      company_code: g.company_code,
+      company_name: '',
+      payroll_date: g.payroll_date,
+      bill_mode: g.bill_mode,
+      total_invoice: Math.round(g.total_invoice * 100) / 100,
+      admin_fees: Math.round(g.admin_fees * 100) / 100,
+      lives_count: lives,
+      paid_date: g.paid_date,
+      bill_type: 'F'
+    });
+  }
+  bills.sort(function (a, b) {
+    return a.company_code < b.company_code ? -1 : a.company_code > b.company_code ? 1 :
+      (a.payroll_date < b.payroll_date ? -1 : 1);
+  });
+  return bills;
+}
+
+// Preview: upload the report, parse it, cache the bills, show stats + sample.
+app.post('/api/admin/jobs/ftj-preview', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const bills = parsePremiumApplied(req.file.buffer);
+    if (bills.length === 0) return res.status(400).json({ error: 'No bills found in this file' });
+    const db = getPool();
+    const coRes = await db.query('SELECT company_code, company_name FROM companies');
+    const coMap = {};
+    coRes.rows.forEach(function (r) { coMap[String(r.company_code)] = r.company_name; });
+    bills.forEach(function (b) { b.company_name = coMap[b.company_code] || b.company_code; });
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(16).toString('hex');
+    const now = Date.now();
+    for (const [tk, v] of ftjPreviewCache) { if (v.expires < now) ftjPreviewCache.delete(tk); }
+    ftjPreviewCache.set(token, { bills: bills, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
+    let total = 0;
+    const accounts = {};
+    bills.forEach(function (b) { total += b.total_invoice; accounts[b.company_code] = true; });
+    res.json({
+      ok: true,
+      token: token,
+      stats: {
+        bills: bills.length,
+        accounts: Object.keys(accounts).length,
+        total_invoice: Math.round(total * 100) / 100,
+        modal_from: bills[0].payroll_date,
+        modal_to: bills[bills.length - 1].payroll_date,
+        file_name: req.file.originalname
+      },
+      sample: bills.slice(0, 8)
+    });
+  } catch (error) { console.error('FTJ preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// Import: reconcile cached preview bills against F invoices.
+// Adds new, updates changed, deletes F bills missing from the report.
+app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
+  try {
+    const token = req.body && req.body.token;
+    const cached = token ? ftjPreviewCache.get(token) : null;
+    if (!cached || cached.expires < Date.now()) {
+      if (token) ftjPreviewCache.delete(token);
+      return res.status(400).json({ error: 'Preview expired. Upload the report again.' });
+    }
+    const bills = cached.bills;
+    const db = getPool();
+    const exRes = await db.query("SELECT * FROM invoices WHERE bill_type = 'F'");
+    const exMap = {};
+    exRes.rows.forEach(function (r) {
+      const pd = r.payroll_date ? new Date(r.payroll_date).toISOString().slice(0, 10) : '';
+      exMap[r.company_code + '|' + pd] = r;
+    });
+    let added = 0, updated = 0;
+    const seen = {};
+    for (const b of bills) {
+      const key = b.company_code + '|' + b.payroll_date;
+      seen[key] = true;
+      const ex = exMap[key];
+      const paidDate = b.paid_date || null;
+      if (ex) {
+        const exPaid = ex.paid_date ? new Date(ex.paid_date).toISOString().slice(0, 10) : null;
+        const same = String(ex.company_name) === String(b.company_name) &&
+          Number(ex.lives_count) === Number(b.lives_count) &&
+          Number(ex.total_invoice) === Number(b.total_invoice) &&
+          ex.status === 'paid' && exPaid === paidDate;
+        if (!same) {
+          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, updated_at = NOW() WHERE id = $6',
+            [b.company_name, b.lives_count, b.total_invoice, 'paid', paidDate, ex.id]);
+          updated++;
+        }
+      } else {
+        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type) VALUES ($1, $2, $3, $4, $5, 'paid', $6, 'F')",
+          [b.company_code, b.company_name, b.payroll_date, b.lives_count, b.total_invoice, paidDate]);
+        added++;
+      }
+    }
+    let deleted = 0;
+    for (const key of Object.keys(exMap)) {
+      if (!seen[key]) {
+        await db.query('DELETE FROM invoices WHERE id = $1', [exMap[key].id]);
+        deleted++;
+      }
+    }
+    ftjPreviewCache.delete(token);
+    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
+  } catch (error) { console.error('FTJ import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)
@@ -2073,7 +2281,7 @@ const GITHUB_PROJECT_ID = process.env.GITHUB_PROJECT_ID || 'PVT_kwDOEB2rr84BTidM
 const GITHUB_STATUS_FIELD_ID = process.env.GITHUB_STATUS_FIELD_ID || 'PVTSSF_lADOEB2rr84BTidM';
 
 const multer = require('multer');
-const onboardingUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+const onboardingUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 function handleUpload(field) {
   return function (req, res, next) {
     onboardingUpload.single(field)(req, res, function (err) {
