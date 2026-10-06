@@ -87,13 +87,58 @@ function downloadOnboardingDoc(clientId, docId, fileName) {
   }).catch(function (err) { alert(err.message); });
 }
 
-function rollLine(total, eligible, enrolled) {
+function rollLine(total, eligible, enrolled, hasPayroll) {
   var parts = [];
   if (total !== null && total !== undefined) parts.push('<span><b>' + total + '</b> total</span>');
   if (eligible !== null && eligible !== undefined) parts.push('<span><b>' + eligible + '</b> eligible</span>');
   if (enrolled !== null && enrolled !== undefined) parts.push('<span><b>' + enrolled + '</b> enrolled</span>');
-  if (parts.length === 0) return '<span class="muted">No payroll data yet</span>';
-  return parts.join(' ');
+  if (parts.length > 0) return parts.join(' ');
+  // "No payroll data yet" only when there is genuinely no payroll data at all —
+  // never alongside numbers.
+  if (hasPayroll) return '';
+  return '<span class="muted">No payroll data yet</span>';
+}
+
+// True when a company row has any payroll data in any payroll column.
+function hasPayrollData(c) {
+  return ['payroll_total', 'payroll_qualified', 'payroll_ineligible', 'payroll_opted_out',
+    'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date']
+    .some(function (k) { return c[k] !== null && c[k] !== undefined; });
+}
+
+// Arrears from the oldest open invoice: yellow at 30+ days, red at 60+.
+function arrearsInfo(oldestOpen) {
+  if (!oldestOpen) return { days: 0, level: '' };
+  var today = new Date(); today.setHours(0, 0, 0, 0);
+  var d = new Date(String(oldestOpen).slice(0, 10) + 'T00:00:00');
+  var days = Math.round((today - d) / 86400000);
+  if (days < 0) days = 0;
+  return { days: days, level: days >= 60 ? 'red' : (days >= 30 ? 'yellow' : '') };
+}
+
+function invoiceLine(openCount, openTotal, oldestOpen) {
+  var ai = arrearsInfo(oldestOpen);
+  var badge = ai.level
+    ? ' <span class="badge ' + (ai.level === 'red' ? 'badge-overdue' : 'badge-warn') + '">' + ai.days + 'd overdue</span>'
+    : '';
+  if (openCount > 0) {
+    return '<div class="card-invoices"><b>' + openCount + '</b> open invoice' + (openCount === 1 ? '' : 's') +
+      ' &mdash; <b>' + fmtMoney(openTotal) + '</b>' + badge + '</div>';
+  }
+  return '<div class="muted">No open invoices</div>';
+}
+
+// One shared company card: payroll line + invoice line + arrears marking.
+// Used for parent cards (aggregates) and child cards (per-company).
+function companyCard(o) {
+  var ai = arrearsInfo(o.oldestOpen);
+  var cls = 'card' + (ai.level === 'red' ? ' arrears-red' : ai.level === 'yellow' ? ' arrears-yellow' : '');
+  return '<a class="' + cls + '" href="' + o.link + '">' +
+    '<div class="card-code">' + esc(o.code) + '</div>' +
+    '<div class="card-title">' + esc(o.name) + '</div>' +
+    '<div class="card-numbers">' + rollLine(o.total, o.eligible, o.enrolled, o.hasPayroll) + '</div>' +
+    invoiceLine(o.openCount, o.openTotal, o.oldestOpen) +
+    (o.sub ? '<div class="muted">' + o.sub + '</div>' : '') + '</a>';
 }
 
 // ---------------------------------------------------------------- api
@@ -556,19 +601,13 @@ function viewClients() {
       api.get(url).then(function (groups) {
         var cards = groups.map(function (g) {
           var sub = g.children.length > 1 ? g.children.length + ' companies' : '1 company';
-          var invLine = '';
-          if (g.open_invoices > 0) {
-            invLine = '<div class="card-invoices"><b>' + g.open_invoices + '</b> open invoice' +
-              (g.open_invoices === 1 ? '' : 's') + ' &mdash; <b>' + fmtMoney(g.open_total) + '</b></div>';
-          } else {
-            invLine = '<div class="muted">No open invoices</div>';
-          }
-          return '<a class="card" href="#/parent/' + esc(g.code) + '">' +
-            '<div class="card-code">' + esc(g.code) + '</div>' +
-            '<div class="card-title">' + esc(g.name) + '</div>' +
-            '<div class="card-numbers">' + rollLine(g.total, g.eligible, g.enrolled) + '</div>' +
-            invLine +
-            '<div class="muted">' + sub + '</div></a>';
+          return companyCard({
+            link: '#/parent/' + esc(g.code),
+            code: g.code, name: g.name,
+            total: g.total, eligible: g.eligible, enrolled: g.enrolled, hasPayroll: g.has_payroll,
+            openCount: g.open_invoices, openTotal: g.open_total, oldestOpen: g.oldest_open,
+            sub: sub
+          });
         }).join('');
         render(shell(
           '<h2>Companies</h2>' + filterBar(q) + '<div id="err"></div>' +
@@ -631,17 +670,19 @@ function viewParent(code) {
       var childCards = d.children.map(function (c) {
         var elig = (c.payroll_qualified !== null && c.payroll_qualified !== undefined) ? c.payroll_qualified
           : (c.payroll_total !== null && c.payroll_total !== undefined ? (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0) : null);
-        return '<a class="card" href="#/child/' + c.id + '">' +
-          '<div class="card-code">' + esc(c.company_code) + '</div>' +
-          '<div class="card-title">' + esc(c.company_name) + '</div>' +
-          '<div class="card-numbers">' + rollLine(c.payroll_total, elig, c.payroll_enrolled) + '</div></a>';
+        return companyCard({
+          link: '#/child/' + c.id,
+          code: c.company_code, name: c.company_name,
+          total: c.payroll_total, eligible: elig, enrolled: c.payroll_enrolled, hasPayroll: hasPayrollData(c),
+          openCount: c.open_invoices, openTotal: c.open_total, oldestOpen: c.oldest_open
+        });
       }).join('');
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
       var implCards = d.implementations.map(implCard).join('');
       render(shell(
         '<p><a href="#/clients">&larr; Companies</a></p>' +
         '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
-        '<div class="rollup"><b>Roll-up:</b> ' + rollLine(p.total, p.eligible, p.enrolled) + '</div>' +
+        '<div class="rollup"><b>Roll-up:</b> ' + rollLine(p.total, p.eligible, p.enrolled, p.has_payroll) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Companies</h3><div class="card-grid">' + childCards + '</div>' +
         '<h3>Implementations</h3>' +

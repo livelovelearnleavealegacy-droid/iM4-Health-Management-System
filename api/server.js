@@ -780,13 +780,18 @@ function numericCodeSort(prefix) {
 
 // Build parent groups from company rows. Each group: one card on Clients.
 // Payroll is rolled up from the children: Total, Eligible, Enrolled.
+const PAYROLL_FIELDS = ['payroll_total', 'payroll_qualified', 'payroll_ineligible', 'payroll_opted_out',
+  'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date'];
+function hasPayrollRow(c) {
+  return PAYROLL_FIELDS.some(function (k) { return c[k] !== null && c[k] !== undefined; });
+}
 function groupParents(rows) {
   const map = {};
   const order = [];
   rows.forEach(function (c) {
     const key = parentKey(c);
     if (!map[key]) {
-      map[key] = { code: key, name: parentName(c), children: [], total: 0, eligible: 0, enrolled: 0, has_total: false, has_eligible: false, has_enrolled: false };
+      map[key] = { code: key, name: parentName(c), children: [], total: 0, eligible: 0, enrolled: 0, has_total: false, has_eligible: false, has_enrolled: false, has_payroll: false };
       order.push(key);
     }
     const g = map[key];
@@ -794,12 +799,13 @@ function groupParents(rows) {
     const child = {
       id: c.id, company_code: c.company_code, company_name: c.company_name,
       total: c.payroll_total, eligible: eligibleOf(c), enrolled: c.payroll_enrolled,
-      payroll_dataset_date: c.payroll_dataset_date
+      payroll_dataset_date: c.payroll_dataset_date, has_payroll: hasPayrollRow(c)
     };
     g.children.push(child);
     if (child.total !== null && child.total !== undefined) { g.total += child.total; g.has_total = true; }
     if (child.eligible !== null && child.eligible !== undefined) { g.eligible += child.eligible; g.has_eligible = true; }
     if (child.enrolled !== null && child.enrolled !== undefined) { g.enrolled += child.enrolled; g.has_enrolled = true; }
+    if (child.has_payroll) g.has_payroll = true;
   });
   return order.map(function (key) {
     const g = map[key];
@@ -809,9 +815,21 @@ function groupParents(rows) {
       total: g.has_total ? g.total : null,
       eligible: g.has_eligible ? g.eligible : null,
       enrolled: g.has_enrolled ? g.enrolled : null,
+      has_payroll: g.has_payroll,
       children: g.children
     };
   });
+}
+
+// Open-invoice stats per company code: count, total, and oldest open payroll
+// date (arrears are measured from the oldest unpaid bill).
+async function openInvoiceStats(db) {
+  const inv = await db.query(
+    "SELECT company_code, COUNT(*)::int AS open_count, COALESCE(SUM(total_invoice), 0)::float AS open_total, " +
+    "MIN(payroll_date)::text AS oldest_open FROM invoices WHERE status = 'open' GROUP BY company_code");
+  const map = {};
+  inv.rows.forEach(function (x) { map[String(x.company_code)] = x; });
+  return map;
 }
 
 // ---------------------------------------------------------------- steward: clients (parent cards with rolled-up payroll)
@@ -839,30 +857,31 @@ app.get('/api/clients', requireAuth, async (req, res) => {
     where = where ? where + ' AND ' + activeWhere : 'WHERE ' + activeWhere;
     const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort('c'), params);
     const groups = groupParents(r.rows);
-    // v5.3: attach open invoice count/total per company_code.
+    // Attach open invoice count/total/oldest per company_code (arrears from oldest).
     try {
-      const inv = await getPool().query(
-        "SELECT company_code, COUNT(*)::int AS open_count, COALESCE(SUM(total_invoice), 0)::float AS open_total " +
-        "FROM invoices WHERE status = 'open' GROUP BY company_code");
-      const invMap = {};
-      inv.rows.forEach(function (x) { invMap[String(x.company_code)] = x; });
+      const invMap = await openInvoiceStats(getPool());
       groups.forEach(function (g) {
         let oc = 0;
         let ot = 0;
+        let oldest = null;
         g.children.forEach(function (ch) {
-          const s = invMap[String(ch.company_code)];
-          if (s) {
-            oc += s.open_count;
-            ot += s.open_total;
-            ch.open_invoices = s.open_count;
-            ch.open_total = s.open_total;
+          const st = invMap[String(ch.company_code)];
+          if (st) {
+            oc += st.open_count;
+            ot += st.open_total;
+            ch.open_invoices = st.open_count;
+            ch.open_total = st.open_total;
+            ch.oldest_open = st.oldest_open;
+            if (st.oldest_open && (!oldest || st.oldest_open < oldest)) oldest = st.oldest_open;
           } else {
             ch.open_invoices = 0;
             ch.open_total = 0;
+            ch.oldest_open = null;
           }
         });
         g.open_invoices = oc;
         g.open_total = ot;
+        g.oldest_open = oldest;
       });
     } catch (e) { console.error('Invoice stats error:', e); }
     res.json(groups);
@@ -888,6 +907,15 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
     if (rows.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
     const groups = groupParents(rows.rows);
     const group = groups[0];
+    try {
+      const invMap = await openInvoiceStats(getPool());
+      rows.rows.forEach(function (c) {
+        const st = invMap[String(c.company_code)];
+        c.open_invoices = st ? st.open_count : 0;
+        c.open_total = st ? st.open_total : 0;
+        c.oldest_open = st ? st.oldest_open : null;
+      });
+    } catch (e) { console.error('Invoice stats error:', e); }
     const childIds = rows.rows.map(c => c.id);
     const impls = await getPool().query(
       'SELECT i.*, c.company_code, c.company_name, ' +

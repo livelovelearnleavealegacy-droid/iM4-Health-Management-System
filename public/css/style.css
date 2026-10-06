@@ -228,6 +228,10 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 }
 
 .badge-rush { background: var(--secondary); border-color: var(--secondary); color: #fff; }
+.badge-warn { background: var(--accent); border-color: var(--accent); color: #003366; }
+.badge-overdue { background: var(--secondary); border-color: var(--secondary); color: #fff; }
+.card.arrears-yellow { border-left-color: var(--accent); }
+.card.arrears-red { border-left-color: var(--secondary); }
 
 .rag {
   display: inline-block;
