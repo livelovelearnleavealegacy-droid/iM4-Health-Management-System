@@ -166,6 +166,9 @@ function navLinks() {
     ];
     if (role === 'admin') links.push(['#/onboarding', 'Onboarding']);
   }
+  if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
+    links.push(['#/forms', 'Forms']);
+  }
   if (role === 'admin') {
     links.push(['#/admin/jobs', 'Jobs']);
     links.push(['#/admin/stewards', 'Stewards']);
@@ -1287,6 +1290,79 @@ function obDocLabel(t) {
   return t;
 }
 
+function viewForms() {
+  requireUser(function () {
+    var role = activeRole();
+    if (['admin', 'top_dog', 'onboarding'].indexOf(role) === -1) { location.hash = '#/dashboard'; return; }
+    var isAdmin = role === 'admin';
+    function load() {
+      api.get('/api/forms').then(function (list) {
+        var rows = list.length ? list.map(function (f) {
+          return '<div class="ob-doc"><span><b>' + esc(f.name) + '</b></span> ' +
+            '<span class="muted">' + esc(f.file_name) + '</span> ' +
+            '<button class="btn btn-link" data-fdl="' + f.id + '" data-fn="' + esc(f.file_name) + '">Download</button>' +
+            (isAdmin ? ' <button class="btn btn-danger" data-fdel="' + f.id + '">Delete</button>' : '') + '</div>';
+        }).join('') : '<p class="muted">No blank forms stored yet.</p>';
+        var up = isAdmin ?
+          '<div class="card"><h4>Upload a blank form</h4>' +
+          '<p class="muted">Stored as-is. Uploading a form with an existing name replaces it. The Soluta generator looks for a form named exactly "Soluta Billing Intake Form".</p>' +
+          '<p><label>Form name: <input id="formname" value="Soluta Billing Intake Form" style="width: 280px;"></label></p>' +
+          '<p><label class="btn btn-primary">Choose file<input type="file" id="formfile" style="display:none"></label> <span id="formpick" class="muted"></span></p>' +
+          '<p><button class="btn btn-primary" id="formupload">Upload form</button></p><div id="formmsg"></div></div>' : '';
+        render(shell(
+          '<h2>Forms</h2><div id="msg"></div>' +
+          '<p class="muted">Blank forms the system uses to generate client paperwork.</p>' +
+          up + '<div class="card"><h4>Stored forms</h4>' + rows + '</div>',
+          '#/forms'));
+        var ff = document.getElementById('formfile');
+        if (ff) ff.onchange = function () {
+          document.getElementById('formpick').textContent = ff.files[0] ? ff.files[0].name : '';
+        };
+        var fu = document.getElementById('formupload');
+        if (fu) fu.onclick = function () {
+          var nm = document.getElementById('formname').value.trim();
+          var f = document.getElementById('formfile').files[0];
+          var msg = document.getElementById('formmsg');
+          if (!nm) { msg.innerHTML = errorHtml('Enter a form name.'); return; }
+          if (!f) { msg.innerHTML = errorHtml('Choose a file.'); return; }
+          var fd = new FormData();
+          fd.append('name', nm);
+          fd.append('file', f);
+          msg.innerHTML = '<p class="muted">Uploading...</p>';
+          uploadFile('/api/forms', fd).then(function () { load(); })
+            .catch(function (err) { msg.innerHTML = errorHtml(err.message); });
+        };
+        document.querySelectorAll('[data-fdl]').forEach(function (el) {
+          el.onclick = function () {
+            var headers = {};
+            if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+            fetch('/api/forms/' + el.getAttribute('data-fdl') + '/download', { headers: headers }).then(function (resp) {
+              if (!resp.ok) throw new Error('Download failed');
+              return resp.blob();
+            }).then(function (blob) {
+              var url = URL.createObjectURL(blob);
+              var aEl = document.createElement('a');
+              aEl.href = url;
+              aEl.download = el.getAttribute('data-fn');
+              document.body.appendChild(aEl);
+              aEl.click();
+              setTimeout(function () { URL.revokeObjectURL(url); aEl.remove(); }, 500);
+            }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
+          };
+        });
+        document.querySelectorAll('[data-fdel]').forEach(function (el) {
+          el.onclick = function () {
+            if (!confirm('Delete this blank form?')) return;
+            api.delete('/api/forms/' + el.getAttribute('data-fdel')).then(load)
+              .catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
+          };
+        });
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/forms')); });
+    }
+    load();
+  });
+}
+
 function viewOnboarding() {
   requireUser(function () {
     if (!canOnboard()) { location.hash = '#/dashboard'; return; }
@@ -1369,6 +1445,35 @@ function viewOnboardingDetail(id) {
     function load() {
       api.get('/api/onboarding/' + id).then(function (c) {
         var inProg = c.status === 'in_progress';
+        var solutaDoc = null;
+        for (var sdi = 0; sdi < c.documents.length; sdi++) {
+          if (c.documents[sdi].doc_type === 'soluta_billing_intake') { solutaDoc = c.documents[sdi]; break; }
+        }
+        var hasPre = c.documents.some(function (d) { return d.doc_type === 'pre_implementation'; });
+        var hasComm = c.documents.some(function (d) { return d.doc_type === 'commission_sheet'; });
+        var solutaHtml = '';
+        if (inProg) {
+          if (solutaDoc) {
+            solutaHtml += '<p><button class="btn btn-link" data-solutadl="' + solutaDoc.id + '" data-fn="' + esc(solutaDoc.file_name) + '">Download generated form</button> ' +
+              '<span class="muted">' + fmtDate(solutaDoc.uploaded_at) + '</span></p>';
+          } else {
+            solutaHtml += '<p class="muted">No Soluta form generated yet.</p>';
+          }
+          if (hasPre && hasComm) {
+            solutaHtml += '<p><label>Billing mode: <select id="solutamode">' +
+              '<option value="auto" selected>Auto-detect from payroll form</option>' +
+              ['Weekly', 'Bi-weekly', 'Semi-monthly', 'Monthly'].map(function (mo) { return '<option value="' + mo + '">' + mo + '</option>'; }).join('') +
+              '</select></label> ' +
+              '<button class="btn btn-primary" id="solutagen">' + (solutaDoc ? 'Regenerate' : 'Generate') + ' Soluta Billing Intake Form</button></p>' +
+              '<div id="solutamsg"></div>';
+          } else {
+            solutaHtml += '<p class="muted">Upload the Pre-Implementation Form and the Commission Sheet to enable generation.</p>';
+          }
+        } else {
+          solutaHtml = solutaDoc
+            ? '<p><button class="btn btn-link" data-solutadl="' + solutaDoc.id + '" data-fn="' + esc(solutaDoc.file_name) + '">Download Soluta Billing Intake Form</button></p>'
+            : '<p class="muted">No Soluta form was generated.</p>';
+        }
         function docRow(d) {
           return '<div class="ob-doc"><span>' + esc(d.file_name) + '</span> ' +
             '<span class="muted">' + fmtDate(d.uploaded_at) + '</span> ' +
@@ -1417,6 +1522,7 @@ function viewOnboardingDetail(id) {
           '<h3>Completeness check</h3><div id="obissues">' + issues + '</div>' +
           ((c.handled && c.handled.length) ? '<p class="muted">' + c.handled.map(function (h) { return h.n + ' ' + esc(h.resolution); }).join(' &middot; ') + '</p>' : '') +
           (inProg ? '<p><button class="btn" id="obreaudit">Re-run check</button></p>' : '') +
+          '<h3>Soluta Billing Intake Form</h3>' + solutaHtml +
           '<h3>Send to GitHub</h3>' + initBtn +
           (inProg ? '<p><button class="btn btn-link" id="obdelete" style="color:#c00">Delete this client card</button></p>' : ''),
           '#/onboarding'));
@@ -1448,6 +1554,23 @@ function viewOnboardingDetail(id) {
               .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
           };
         });
+        document.querySelectorAll('[data-solutadl]').forEach(function (el) {
+          el.onclick = function () { downloadOnboardingDoc(id, el.getAttribute('data-solutadl'), el.getAttribute('data-fn')); };
+        });
+        var sg = document.getElementById('solutagen');
+        if (sg) sg.onclick = function () {
+          var mode = document.getElementById('solutamode').value;
+          if (!confirm('Generate the Soluta Billing Intake Form from the uploaded documents?')) return;
+          document.getElementById('solutamsg').innerHTML = '<p class="muted">Generating...</p>';
+          api.post('/api/onboarding/' + id + '/generate-soluta', { billingMode: mode }).then(function () {
+            window._solutaMsg = 'Generated and saved with the client documents.';
+            load();
+          }).catch(function (err) { document.getElementById('solutamsg').innerHTML = errorHtml(err.message); });
+        };
+        if (window._solutaMsg && document.getElementById('solutamsg')) {
+          document.getElementById('solutamsg').innerHTML = okHtml(window._solutaMsg);
+          window._solutaMsg = null;
+        }
         document.querySelectorAll('[data-dismiss]').forEach(function (el) {
           el.onclick = function () {
             if (!confirm('Delete this finding? It will be removed from the list.')) return;
@@ -1518,6 +1641,7 @@ function route() {
   if (pathParts[0] === 'parent' && pathParts[1]) return viewParent(decodeURIComponent(pathParts[1]));
   if (pathParts[0] === 'child' && pathParts[1]) return viewChild(pathParts[1]);
   if (pathParts[0] === 'clients') return viewClients();
+  if (pathParts[0] === 'forms') return viewForms();
   if (pathParts[0] === 'implementations') return viewImplementations();
   if (pathParts[0] === 'onboarding') {
     if (!pathParts[1]) return viewOnboarding();

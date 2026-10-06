@@ -253,7 +253,7 @@ async function migrate() {
   await db.query('CREATE TABLE IF NOT EXISTS onboarding_documents (' +
     'id SERIAL PRIMARY KEY, ' +
     'client_id INT NOT NULL REFERENCES onboarding_clients(id) ON DELETE CASCADE, ' +
-    "doc_type TEXT NOT NULL CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach')), " +
+    "doc_type TEXT NOT NULL CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake')), " +
     'file_name TEXT NOT NULL, ' +
     'mime_type TEXT, ' +
     'file_data BYTEA NOT NULL, ' +
@@ -268,6 +268,18 @@ async function migrate() {
     'resolved BOOLEAN NOT NULL DEFAULT FALSE, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query('ALTER TABLE onboarding_issues ADD COLUMN IF NOT EXISTS resolution TEXT');
+  await db.query('CREATE TABLE IF NOT EXISTS forms (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'name TEXT UNIQUE NOT NULL, ' +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('ALTER TABLE onboarding_documents DROP CONSTRAINT IF EXISTS onboarding_documents_doc_type_check');
+  await db.query("ALTER TABLE onboarding_documents ADD CONSTRAINT onboarding_documents_doc_type_check " +
+    "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake'))");
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -2052,7 +2064,8 @@ const DOC_LABELS = {
   pre_implementation: 'Pre-Implementation Form',
   commission_sheet: 'Commission Sheet',
   w9: 'W-9',
-  ach: 'ACH Authorization'
+  ach: 'ACH Authorization',
+  soluta_billing_intake: 'Soluta Billing Intake Form'
 };
 const GITHUB_ISSUES_OWNER = process.env.GITHUB_ISSUES_OWNER || 'im4health-implementation';
 const GITHUB_ISSUES_REPO = process.env.GITHUB_ISSUES_REPO || 'Implementation';
@@ -2075,6 +2088,15 @@ function requireOnboarder(req, res, next) {
     const roles = req.user.roles || [];
     if (roles.indexOf('admin') !== -1 || roles.indexOf('onboarding') !== -1) return next();
     return res.status(403).json({ error: 'Onboarding access only' });
+  });
+}
+
+// Forms tab: visible to top_dog, onboarding, and admin.
+function requireFormsViewer(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r === 'admin' || r === 'top_dog' || r === 'onboarding') return next();
+    return res.status(403).json({ error: 'Not available for this role' });
   });
 }
 
@@ -2188,6 +2210,290 @@ function normName(s) {
 
 // Audit one onboarding client for document completeness. Replaces the open
 // issues with a fresh list and returns { issues, canInitiate }.
+
+// ---------------------------------------------------------------- Soluta Billing Intake generation
+// Data extraction + DOCX fill for the "Generate Soluta Billing Intake Form"
+// button on the onboarding page. The blank is an ordinary Word document
+// (tables); filling is done structurally by table/row/cell position, so the
+// blank stored on the Forms tab needs no template tags.
+
+const PREIMPL_LABELS = [
+  ['Legal Name of the Company', 'legalName'],
+  ['Employer Address', 'address'],
+  ['Billing Contact (First and Last Name)', 'billingContact'],
+  ['Billing Contact Email', 'billingEmail'],
+  ['Employer Tax ID', 'taxId'],
+  ['Name of Individual signing DocuSign', 'signerName'],
+  ['Email of individual signing DocuSign', 'signerEmail'],
+  ['Payroll Provider Company', 'payrollProvider'],
+  ['Payroll Frequency', 'payrollFreq'],
+  ['Payroll Frequency #2 (if applicable)', 'payrollFreq2'],
+  ['Multiple Payroll Batches', 'multiBatches']
+];
+
+function normLabel(s) { return String(s || '').trim().toLowerCase().replace(/:$/, ''); }
+
+// Parse a Pre-Implementation workbook into per-EIN blocks. Handles the
+// multi-EIN layout (an "EIN #1..#N" header row with value columns under each)
+// and the single-EIN layout (label/value pairs).
+function extractPreImplEins(buffer) {
+  const sheets = readWorkbook(buffer);
+  const keys = Object.keys(sheets);
+  const rows = keys.length ? sheets[keys[0]] : [];
+  const cell = function (r, i) {
+    const v = r && r[i];
+    return (v === null || v === undefined) ? '' : String(v).trim();
+  };
+  let valCols = null;
+  for (const r of rows) {
+    if (!r) continue;
+    const cols = [];
+    for (let i = 0; i < r.length; i++) {
+      if (/^EIN #\d+\s*$/i.test(cell(r, i))) cols.push(i);
+    }
+    if (cols.length > 0) { valCols = cols; break; }
+  }
+  if (!valCols) {
+    const one = {};
+    PREIMPL_LABELS.forEach(function (pair) { one[pair[1]] = rowValueByLabel(rows, pair[0]); });
+    return [one];
+  }
+  const blocks = valCols.map(function () { return {}; });
+  PREIMPL_LABELS.forEach(function (pair) { blocks.forEach(function (b) { b[pair[1]] = ''; }); });
+  const labelHit = function (cellLab, want) {
+    if (cellLab === want) return true;
+    return cellLab.indexOf(want) === 0 && /[^a-z0-9]/.test(cellLab.slice(want.length, want.length + 1) || ' ');
+  };
+  for (const r of rows) {
+    if (!r) continue;
+    const lab = normLabel(cell(r, 1) || cell(r, 0));
+    for (const pair of PREIMPL_LABELS) {
+      if (labelHit(lab, normLabel(pair[0]))) {
+        valCols.forEach(function (ci, bi) {
+          const v = cell(r, ci);
+          if (v && !blocks[bi][pair[1]]) blocks[bi][pair[1]] = v;
+        });
+        break;
+      }
+    }
+  }
+  // Some filers misalign columns (e.g. a tax ID typed into the email row).
+  // Reassign by value shape so each field holds what it claims.
+  const isEIN = function (v) { return /^\d{2}-\d{7}$/.test(v); };
+  const isEmail = function (v) { return v.indexOf('@') !== -1; };
+  blocks.forEach(function (b) {
+    if (!isEIN(b.taxId)) {
+      if (isEIN(b.billingEmail)) { b.taxId = b.billingEmail; b.billingEmail = ''; }
+      else if (isEIN(b.billingContact)) { b.taxId = b.billingContact; b.billingContact = ''; }
+      else b.taxId = '';
+    }
+    if (b.billingEmail && !isEmail(b.billingEmail)) {
+      if (isEmail(b.billingContact)) { b.billingEmail = b.billingContact; b.billingContact = ''; }
+      else b.billingEmail = '';
+    }
+    if (isEmail(b.billingContact)) b.billingContact = '';
+  });
+  return blocks.filter(function (b) { return b.legalName || b.taxId; });
+}
+
+function extractCommission(buffer) {
+  const sheets = readWorkbook(buffer);
+  const keys = Object.keys(sheets);
+  const rows = keys.length ? sheets[keys[0]] : [];
+  const get = function (label) {
+    const key = String(label).toLowerCase();
+    for (const r of rows) {
+      if (r && r[0] && String(r[0]).trim().toLowerCase() === key) {
+        const v = r[1];
+        return (v === null || v === undefined) ? '' : String(v).trim();
+      }
+    }
+    return '';
+  };
+  return {
+    groupName: get('Group Name'),
+    agencyName: get('Agency Name'),
+    agents: [get('Agent 1 Name'), get('Agent 2 Name'), get('Agent 3 Name')].filter(function (a) { return !!a; }),
+    effectiveDate: get('Effective Date')
+  };
+}
+
+// Pull {name, taxId} from uploaded W-9 PDFs so agent rows can carry tax IDs.
+async function extractW9TaxIds(w9docs) {
+  const out = [];
+  for (const w of w9docs) {
+    try {
+      const text = await extractPdfText(w.file_data);
+      let nm = '';
+      const m1 = text.match(/name \(as shown on your income tax return\)[^\n\r]*\n([^\n\r]{2,80})/i);
+      if (m1 && m1[1].trim() && !/^(2|business name)/i.test(m1[1].trim())) nm = m1[1].trim();
+      if (!nm) {
+        const m2 = text.match(/business name[^\n\r]*\n([^\n\r]{2,80})/i);
+        if (m2 && m2[1].trim() && !/^(3|check|disregarded)/i.test(m2[1].trim())) nm = m2[1].trim();
+      }
+      let taxId = '';
+      const dashed = text.match(/\b(\d{2})-(\d{7})\b/);
+      if (dashed) taxId = dashed[1] + '-' + dashed[2];
+      else {
+        const plain = text.match(/\b\d{9}\b/);
+        if (plain) taxId = plain[0].slice(0, 2) + '-' + plain[0].slice(2);
+      }
+      out.push({ name: nm, taxId: taxId, fileName: w.file_name });
+    } catch (e) { out.push({ name: '', taxId: '', fileName: w.file_name }); }
+  }
+  return out;
+}
+
+function normCoName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+    .replace(/(llc|incorporated|inc|corporation|corp|company|co|limited|ltd|pllc|group)$/, '');
+}
+
+// Match a location to the app's company list for the iM4H Group ID column.
+function matchCompanyCode(companies, legalName) {
+  const n = normCoName(legalName);
+  if (!n) return '';
+  for (const c of companies) {
+    if (normCoName(c.company_name) === n) return c.company_code;
+  }
+  return '';
+}
+
+function detectBillingMode(eins) {
+  const b = eins && eins[0] ? eins[0] : {};
+  const h = ((b.payrollFreq2 || '') + ' ' + (b.multiBatches || '') + ' ' + (b.payrollFreq || '')).toLowerCase();
+  if (/semi.monthly|semimonthly/.test(h)) return 'Semi-monthly';
+  if (/bi.weekly|biweekly/.test(h)) return 'Bi-weekly';
+  if (/(^|[^a-z])weekly/.test(h)) return 'Weekly';
+  if (/monthly/.test(h)) return 'Monthly';
+  return 'Semi-monthly';
+}
+
+function escXml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Fill the blank Soluta Billing Intake DOCX structurally.
+// data: { groupName, locations:[{name,ein,groupId,notes}], primary:{name,email},
+//         billing:{name,email}, brokerProducer:{name}, agents:[{name,taxId}], mode }
+function fillSolutaDocx(blankBuffer, data) {
+  const PizZip = require('pizzip');
+  const zip = new PizZip(blankBuffer);
+  const file = zip.file('word/document.xml');
+  if (!file) throw new Error('Not a Word document: word/document.xml is missing');
+  let xml = file.asText();
+
+  const tables = [];
+  const tblRe = /<w:tbl[\s\S]*?<\/w:tbl>/g;
+  let tm;
+  while ((tm = tblRe.exec(xml)) !== null) tables.push({ start: tm.index, end: tm.index + tm[0].length, xml: tm[0] });
+  if (tables.length < 4) throw new Error('Unexpected form layout: found ' + tables.length + ' tables, need 4');
+
+  const rowsOf = function (tblXml) {
+    const rows = [];
+    const re = /<w:tr[\s\S]*?<\/w:tr>/g;
+    let mm;
+    while ((mm = re.exec(tblXml)) !== null) rows.push(mm[0]);
+    return rows;
+  };
+  const cellsOf = function (trXml) {
+    const cells = [];
+    const re = /<w:tc[\s\S]*?<\/w:tc>/g;
+    let mm;
+    while ((mm = re.exec(trXml)) !== null) cells.push(mm[0]);
+    return cells;
+  };
+  const setCellText = function (tcXml, text) {
+    const pr = tcXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/);
+    const tcPr = pr ? pr[0] : '';
+    const open = tcXml.match(/^<w:tc(\s[^>]*)?>/);
+    return '<w:tc' + (open && open[1] ? open[1] : '') + '>' + tcPr +
+      '<w:p><w:r><w:t xml:space="preserve">' + escXml(text) + '</w:t></w:r></w:p></w:tc>';
+  };
+  const setRowCells = function (trXml, texts) {
+    const cells = cellsOf(trXml);
+    const out = cells.map(function (c, i) { return setCellText(c, texts[i] !== undefined ? texts[i] : ''); });
+    return trXml.replace(/<w:tc[\s\S]*?<\/w:tc>/g, function () { return out.shift(); });
+  };
+  const buildTable = function (tblXml, newRows) {
+    const first = tblXml.indexOf('<w:tr');
+    const last = tblXml.lastIndexOf('</w:tr>') + '</w:tr>'.length;
+    return tblXml.slice(0, first) + newRows.join('') + tblXml.slice(last);
+  };
+
+  const mode = data.mode || 'Semi-monthly';
+  const newTables = tables.map(function (t) { return t.xml; });
+
+  // Table 0: general info (Group Name value in row 0, second column)
+  let r0 = rowsOf(tables[0].xml);
+  const labelTc = cellsOf(r0[0])[0];
+  let labelText = '';
+  const tRe = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
+  let tM;
+  while ((tM = tRe.exec(labelTc)) !== null) labelText += tM[1];
+  labelText = labelText.replace(/&(amp|lt|gt|quot);/g, function (e) { return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"' }[e]; });
+  r0[0] = setRowCells(r0[0], [labelText, data.groupName || '']);
+  newTables[0] = buildTable(tables[0].xml, r0);
+
+  // Table 1: locations (header + data rows; clone last row if more locations)
+  let r1 = rowsOf(tables[1].xml);
+  const tmplRow = r1[r1.length - 1];
+  const locRows = [r1[0]];
+  data.locations.forEach(function (loc, i) {
+    const src = r1[1 + i] || tmplRow;
+    locRows.push(setRowCells(src, [loc.name, loc.ein, loc.groupId, loc.notes]));
+  });
+  newTables[1] = buildTable(tables[1].xml, locRows);
+
+  // Table 2: contacts
+  let r2 = rowsOf(tables[2].xml);
+  const contactRows = [r2[0]];
+  const mkContact = function (srcRow, type, name, phone, email) {
+    return setRowCells(srcRow, [type, name || '', phone || '', email || '', mode]);
+  };
+  contactRows.push(mkContact(r2[1], 'Primary Contact', data.primary.name, '', data.primary.email));
+  contactRows.push(mkContact(r2[2], 'Billing Contact', data.billing.name, '', data.billing.email));
+  contactRows.push(mkContact(r2[3], 'Broker Producer', data.brokerProducer.name, '', ''));
+  contactRows.push(r2[4]); // Broker Account Manager stays as-is (blank)
+  const otherTmpl = r2[4];
+  contactRows.push(setRowCells(otherTmpl, ['Other', '', '', '', '']));
+  contactRows.push(setRowCells(otherTmpl, ['Other', '', '', '', '']));
+  newTables[2] = buildTable(tables[2].xml, contactRows);
+
+  // Table 3: PEPM rows. Row 1 (agency starter row from the template) is kept as-is;
+  // agent rows fill the blank rows below, cloning if there are more agents.
+  let r3 = rowsOf(tables[3].xml);
+  const pepmRows = [r3[0], r3[1]];
+  const pepmTmpl = r3[r3.length - 1];
+  const modeSuffix = mode.toLowerCase();
+  data.agents.forEach(function (a, i) {
+    const src = r3[2 + i] || pepmTmpl;
+    const who = a.name + (a.taxId ? ' \u2013 ' + a.taxId : '');
+    pepmRows.push(setRowCells(src, [who, '$5.00/' + modeSuffix]));
+  });
+  newTables[3] = buildTable(tables[3].xml, pepmRows);
+
+  // splice tables back (reverse order keeps offsets valid)
+  for (let i = tables.length - 1; i >= 0; i--) {
+    xml = xml.slice(0, tables[i].start) + newTables[i] + xml.slice(tables[i].end);
+  }
+
+  // billing-mode "checkboxes" (box-drawing chars): check the chosen mode
+  const normMode = function (s) { return String(s).replace(/[☐☒]/g, '').toLowerCase().replace(/[^a-z]/g, ''); };
+  const want = normMode(mode);
+  const MODES = ['weekly', 'biweekly', 'semimonthly', 'monthly'];
+  xml = xml.replace(/<w:p[\s\S]*?<\/w:p>/g, function (p) {
+    if (p.indexOf('☐') === -1 && p.indexOf('☒') === -1) return p;
+    const label = normMode(p.replace(/<[^>]+>/g, ''));
+    if (MODES.indexOf(label) === -1) return p;
+    const checked = label === want;
+    return p.replace(/[☐☒]/g, checked ? '☒' : '☐');
+  });
+
+  zip.file('word/document.xml', xml);
+  return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
 async function runOnboardingAudit(db, clientId) {
   const issues = [];
   const push = function (severity, docType, message) { issues.push({ severity: severity, doc_type: docType, message: message }); };
@@ -2531,6 +2837,129 @@ app.post('/api/admin/onboarding/:id/reopen', requireAdmin, async (req, res) => {
     await db.query("UPDATE onboarding_clients SET status = 'in_progress' WHERE id = $1", [req.params.id]);
     res.json({ ok: true, clientName: c.rows[0].client_name, previousIssue: c.rows[0].github_issue_number });
   } catch (error) { console.error('Onboarding reopen error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+
+// ---------------------------------------------------------------- blank forms library
+// The Forms tab stores blank forms (e.g. the Soluta Billing Intake Form)
+// used to generate client paperwork. Visible to top_dog, onboarding, admin;
+// uploads and deletes are admin-only.
+app.get('/api/forms', requireFormsViewer, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT id, name, file_name, mime_type, uploaded_by, created_at, updated_at FROM forms ORDER BY name');
+    res.json(r.rows);
+  } catch (error) { console.error('Forms list error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/forms', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    const name = req.body && req.body.name ? String(req.body.name).trim() : '';
+    if (!name) return res.status(400).json({ error: 'A form name is required' });
+    if (!req.file) return res.status(400).json({ error: 'A file is required' });
+    const db = getPool();
+    const existing = await db.query('SELECT id FROM forms WHERE name = $1', [name]);
+    if (existing.rows.length > 0) {
+      await db.query('UPDATE forms SET file_name = $1, mime_type = $2, file_data = $3, uploaded_by = $4, updated_at = NOW() WHERE id = $5',
+        [req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id, existing.rows[0].id]);
+      return res.json({ ok: true, id: existing.rows[0].id, replaced: true });
+    }
+    const ins = await db.query('INSERT INTO forms (name, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [name, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    res.json({ ok: true, id: ins.rows[0].id });
+  } catch (error) { console.error('Form upload error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/forms/:id/download', requireFormsViewer, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT file_name, mime_type, file_data FROM forms WHERE id = $1', [req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const f = r.rows[0];
+    res.set('Content-Type', f.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="' + String(f.file_name).replace(/"/g, '') + '"');
+    res.send(f.file_data);
+  } catch (error) { console.error('Form download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/forms/:id', requireAdmin, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM forms WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Form delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ---------------------------------------------------------------- generate Soluta Billing Intake Form
+const SOLUTA_FORM_NAME = 'Soluta Billing Intake Form';
+
+app.post('/api/onboarding/:id/generate-soluta', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (c.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (c.rows[0].status !== 'in_progress') return res.status(400).json({ error: 'This client has already been sent to GitHub' });
+    const docs = await db.query('SELECT * FROM onboarding_documents WHERE client_id = $1 ORDER BY uploaded_at', [req.params.id]);
+    const byType = {};
+    docs.rows.forEach(function (d) { (byType[d.doc_type] = byType[d.doc_type] || []).push(d); });
+    if (!byType.pre_implementation || byType.pre_implementation.length === 0) {
+      return res.status(400).json({ error: 'Upload the Pre-Implementation Form first' });
+    }
+    if (!byType.commission_sheet || byType.commission_sheet.length === 0) {
+      return res.status(400).json({ error: 'Upload the Commission Sheet first' });
+    }
+    const fr = await db.query('SELECT * FROM forms WHERE name = $1 ORDER BY updated_at DESC LIMIT 1', [SOLUTA_FORM_NAME]);
+    if (fr.rows.length === 0) {
+      return res.status(400).json({ error: 'No blank "' + SOLUTA_FORM_NAME + '" on the Forms tab yet. Upload it there first.' });
+    }
+
+    const eins = extractPreImplEins(byType.pre_implementation[0].file_data);
+    const comm = extractCommission(byType.commission_sheet[0].file_data);
+    const w9s = await extractW9TaxIds(byType.w9 || []);
+    const coRes = await db.query('SELECT company_code, company_name FROM companies');
+    let mode = req.body && req.body.billingMode ? String(req.body.billingMode) : 'auto';
+    if (mode === 'auto' || ['Weekly', 'Bi-weekly', 'Semi-monthly', 'Monthly'].indexOf(mode) === -1) {
+      mode = detectBillingMode(eins);
+    }
+
+    const w9ByName = function (agentName) {
+      const an = normCoName(agentName);
+      for (const w of w9s) {
+        const wn = normCoName(w.name);
+        if (wn && an && (wn === an || wn.indexOf(an) !== -1 || an.indexOf(wn) !== -1)) return w.taxId;
+      }
+      return '';
+    };
+
+    const first = function (vals) {
+      for (const v of vals) { if (v) return v; }
+      return '';
+    };
+    const data = {
+      groupName: comm.groupName || (eins[0] && eins[0].legalName) || c.rows[0].client_name || '',
+      locations: eins.map(function (e) {
+        return {
+          name: e.legalName || '', ein: e.taxId || '',
+          groupId: matchCompanyCode(coRes.rows, e.legalName), notes: e.address || ''
+        };
+      }),
+      primary: { name: first(eins.map(function (e) { return e.signerName; })), email: first(eins.map(function (e) { return e.signerEmail; })) },
+      billing: { name: first(eins.map(function (e) { return e.billingContact; })), email: first(eins.map(function (e) { return e.billingEmail; })) },
+      brokerProducer: { name: comm.agents[0] || '' },
+      agents: comm.agents.map(function (a) { return { name: a, taxId: w9ByName(a) }; }),
+      mode: mode
+    };
+
+    const filled = fillSolutaDocx(fr.rows[0].file_data, data);
+    const safeGroup = (data.groupName || 'Client').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'Client';
+    const now = new Date();
+    const fileName = safeGroup + '_' + mode.replace(/-/g, '') + '_Billing_Intake_Form_' + (now.getMonth() + 1) + '.' + now.getDate() + '.' + now.getFullYear() + '.docx';
+
+    await db.query("DELETE FROM onboarding_documents WHERE client_id = $1 AND doc_type = 'soluta_billing_intake'", [req.params.id]);
+    const ins = await db.query(
+      "INSERT INTO onboarding_documents (client_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, 'soluta_billing_intake', $2, $3, $4, $5) RETURNING id",
+      [req.params.id, fileName,
+       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+       filled, req.user.id]);
+    res.json({ ok: true, docId: ins.rows[0].id, fileName: fileName });
+  } catch (error) { console.error('Soluta generate error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // Delete a whole onboarding client card.
