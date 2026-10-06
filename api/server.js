@@ -188,9 +188,11 @@ async function migrate() {
     "status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'paid')), " +
     'paid_date DATE, ' +
     "bill_type TEXT NOT NULL DEFAULT 'F', " +
+    'is_estimate BOOLEAN NOT NULL DEFAULT FALSE, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_type TEXT NOT NULL DEFAULT 'F'");
+  await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_estimate BOOLEAN NOT NULL DEFAULT FALSE');
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -1161,7 +1163,7 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
           ? String(row.bill_type).trim().toUpperCase() : 'F';
         if (bill_type !== 'F' && bill_type !== 'S') throw new Error("bill_type must be 'F' or 'S'");
         const up = await db.query(
-          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, updated_at = NOW() ' +
+          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, updated_at = NOW() ' +
           "WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL)) AND bill_type = $8",
           [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_type]);
         if (up.rowCount > 0) {
@@ -1354,12 +1356,12 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
       const paidDate = b.paid_date || null;
       if (ex) {
         const exPaid = ex.paid_date ? new Date(ex.paid_date).toISOString().slice(0, 10) : null;
-        const same = String(ex.company_name) === String(b.company_name) &&
+        const same = !ex.is_estimate && String(ex.company_name) === String(b.company_name) &&
           Number(ex.lives_count) === Number(b.lives_count) &&
           Number(ex.total_invoice) === Number(b.total_invoice) &&
           ex.status === 'paid' && exPaid === paidDate;
         if (!same) {
-          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, updated_at = NOW() WHERE id = $6',
+          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, updated_at = NOW() WHERE id = $6',
             [b.company_name, b.lives_count, b.total_invoice, 'paid', paidDate, ex.id]);
           updated++;
         }
@@ -1371,7 +1373,7 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
     }
     let deleted = 0;
     for (const key of Object.keys(exMap)) {
-      if (!seen[key]) {
+      if (!seen[key] && !exMap[key].is_estimate) {
         await db.query('DELETE FROM invoices WHERE id = $1', [exMap[key].id]);
         deleted++;
       }
@@ -1379,6 +1381,165 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
     ftjPreviewCache.delete(token);
     res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
   } catch (error) { console.error('FTJ import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// ---------------------------------------------------------------- v5.9: estimate unpaid F bills
+const FTJ_MODE_NAMES = { '1': 'Weekly', '2': 'Bi-weekly', '3': 'Semi-monthly', '4': 'Monthly', 'M': 'Monthly' };
+
+function ftjAddDaysISO(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function ftjAddMonthsISO(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  const day = d.getUTCDate();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + n);
+  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, lastDay));
+  return d.toISOString().slice(0, 10);
+}
+function ftjPad2(n) { return (n < 10 ? '0' : '') + n; }
+
+// Most common two month-days in the paid history (semi-monthly pattern).
+function ftjSemiMonthlyDays(history) {
+  const counts = {};
+  history.forEach(function (iso) {
+    const day = parseInt(iso.slice(8, 10), 10);
+    counts[day] = (counts[day] || 0) + 1;
+  });
+  const days = Object.keys(counts).map(Number).sort(function (a, b) { return counts[b] - counts[a]; });
+  if (days.length >= 2) return [days[0], days[1]].sort(function (a, b) { return a - b; });
+  return [1, 15];
+}
+
+// Expected payroll dates after lastISO (exclusive) through todayISO (inclusive),
+// following the account's bill-mode pattern.
+function ftjProjectDates(mode, lastISO, history, todayISO) {
+  const out = [];
+  if (mode === '1' || mode === '2') {
+    const step = mode === '1' ? 7 : 14;
+    let d = ftjAddDaysISO(lastISO, step);
+    while (d <= todayISO) { out.push(d); d = ftjAddDaysISO(d, step); }
+  } else if (mode === '4' || mode === 'M') {
+    let n = 1;
+    let d = ftjAddMonthsISO(lastISO, n);
+    while (d <= todayISO) { out.push(d); n++; d = ftjAddMonthsISO(lastISO, n); }
+  } else if (mode === '3') {
+    const pair = ftjSemiMonthlyDays(history);
+    let y = parseInt(lastISO.slice(0, 4), 10);
+    let m = parseInt(lastISO.slice(5, 7), 10);
+    for (let i = 0; i < 120; i++) {
+      const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      pair.forEach(function (day) {
+        if (day > lastDay) return;
+        const iso = y + '-' + ftjPad2(m) + '-' + ftjPad2(day);
+        if (iso > lastISO && iso <= todayISO) out.push(iso);
+      });
+      if (y + '-' + ftjPad2(m) + '-01' > todayISO) break;
+      m++; if (m > 12) { m = 1; y++; }
+    }
+    out.sort();
+  }
+  return out;
+}
+
+// Derive unpaid-bill estimates: for each F account, project expected payroll
+// dates after its last paid bill through today; copy lives/total from the
+// last paid bill. Skips dates that already have any F bill.
+async function estimateUnpaidBills(db) {
+  const paid = await db.query(
+    "SELECT company_code, company_name, payroll_date, bill_mode, lives_count, total_invoice " +
+    "FROM invoices WHERE bill_type = 'F' AND status = 'paid' AND payroll_date IS NOT NULL " +
+    "ORDER BY company_code, payroll_date");
+  const all = await db.query("SELECT company_code, payroll_date FROM invoices WHERE bill_type = 'F' AND payroll_date IS NOT NULL");
+  const have = {};
+  all.rows.forEach(function (r) {
+    have[r.company_code + '|' + new Date(r.payroll_date).toISOString().slice(0, 10)] = true;
+  });
+  const byAcct = {};
+  paid.rows.forEach(function (row) {
+    const code = row.company_code;
+    if (!byAcct[code]) byAcct[code] = [];
+    byAcct[code].push(row);
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  const accounts = [];
+  Object.keys(byAcct).sort().forEach(function (code) {
+    const rows = byAcct[code];
+    const last = rows[rows.length - 1];
+    const lastISO = new Date(last.payroll_date).toISOString().slice(0, 10);
+    const mc = {};
+    rows.forEach(function (x) { const mm = String(x.bill_mode || '').toUpperCase(); mc[mm] = (mc[mm] || 0) + 1; });
+    const mode = Object.keys(mc).sort(function (a, b) { return mc[b] - mc[a]; })[0] || '';
+    const history = rows.map(function (x) { return new Date(x.payroll_date).toISOString().slice(0, 10); });
+    const dates = ftjProjectDates(mode, lastISO, history, today).filter(function (d) {
+      return !have[code + '|' + d];
+    });
+    if (dates.length === 0) return;
+    accounts.push({
+      company_code: code,
+      company_name: last.company_name,
+      frequency: FTJ_MODE_NAMES[mode] || mode || 'unknown',
+      bill_mode: mode,
+      last_paid: lastISO,
+      lives_count: last.lives_count,
+      total_invoice: last.total_invoice === null ? null : Number(last.total_invoice),
+      estimates: dates
+    });
+  });
+  return accounts;
+}
+
+app.post('/api/admin/jobs/ftj-estimate-preview', requireAdmin, async (req, res) => {
+  try {
+    const accounts = await estimateUnpaidBills(getPool());
+    let total = 0;
+    accounts.forEach(function (a) { total += a.estimates.length; });
+    res.json({ ok: true, total_estimates: total, accounts: accounts });
+  } catch (error) { console.error('FTJ estimate preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+app.post('/api/admin/jobs/ftj-estimate-create', requireAdmin, async (req, res) => {
+  try {
+    const db = getPool();
+    const accounts = await estimateUnpaidBills(db);
+    let created = 0, skipped = 0;
+    for (const a of accounts) {
+      for (const d of a.estimates) {
+        const chk = await db.query(
+          "SELECT id FROM invoices WHERE company_code = $1 AND payroll_date = $2 AND bill_type = 'F'",
+          [a.company_code, d]);
+        if (chk.rows.length > 0) { skipped++; continue; }
+        await db.query(
+          "INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, is_estimate) " +
+          "VALUES ($1, $2, $3, $4, $5, 'open', NULL, 'F', TRUE)",
+          [a.company_code, a.company_name, d, a.lives_count, a.total_invoice]);
+        created++;
+      }
+    }
+    res.json({ ok: true, created: created, skipped: skipped });
+  } catch (error) { console.error('FTJ estimate create error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// ---------------------------------------------------------------- v5.9: delete bills (admin)
+// Any combination of statuses (open/paid), bill types (F/S), and accounts.
+app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const accounts = Array.isArray(body.accounts) ? body.accounts.map(function (a) { return String(a); }) : [];
+    const statuses = Array.isArray(body.statuses) ? body.statuses.filter(function (x) { return x === 'open' || x === 'paid'; }) : [];
+    const types = Array.isArray(body.types) ? body.types.filter(function (x) { return x === 'F' || x === 'S'; }) : [];
+    if (statuses.length === 0 || types.length === 0) {
+      return res.status(400).json({ error: 'Pick at least one status (paid/unpaid) and one bill type (F/S).' });
+    }
+    const params = [statuses, types];
+    let where = 'status = ANY($1) AND bill_type = ANY($2)';
+    if (accounts.length > 0) { params.push(accounts); where += ' AND company_code = ANY($3)'; }
+    const del = await getPool().query('DELETE FROM invoices WHERE ' + where, params);
+    res.json({ ok: true, deleted: del.rowCount });
+  } catch (error) { console.error('Delete bills error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)

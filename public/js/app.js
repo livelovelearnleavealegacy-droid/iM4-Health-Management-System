@@ -429,15 +429,19 @@ function viewDashboard() {
 function viewBilling() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
-    var codeFilter = '';
+    var isAdmin = state.user && state.user.role === 'admin';
+    var acctFilter = [];
     var typeFilter = '';
     function load() {
-      var tq = typeFilter ? '&type=' + encodeURIComponent(typeFilter) : '';
-      api.get('/api/billing?status=open' + tq).then(function (openRows) {
-        api.get('/api/billing?status=paid' + tq).then(function (paidRows) {
+      api.get('/api/billing?status=open').then(function (openRows) {
+        api.get('/api/billing?status=paid').then(function (paidRows) {
+          var codeMap = {};
+          openRows.concat(paidRows).forEach(function (r) { codeMap[String(r.company_code)] = r.company_name; });
+          var codes = Object.keys(codeMap).sort();
           function matches(r) {
-            if (!codeFilter) return true;
-            return String(r.company_code || '').toLowerCase().indexOf(codeFilter.toLowerCase()) !== -1;
+            if (typeFilter && String(r.bill_type || 'F') !== typeFilter) return false;
+            if (acctFilter.length > 0 && acctFilter.indexOf(String(r.company_code)) === -1) return false;
+            return true;
           }
           var openF = openRows.filter(matches);
           var paidF = paidRows.filter(matches);
@@ -447,6 +451,7 @@ function viewBilling() {
               (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
             var body = rows.map(function (r) {
               var bt = r.bill_type === 'S' ? 'S' : (r.bill_type === 'F' ? 'F' : '&mdash;');
+              if (r.is_estimate) bt += ' <span class="badge">est</span>';
               return '<tr><td><b>' + bt + '</b></td><td><b>' + esc(r.company_code) + '</b></td>' +
                 cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
                 '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
@@ -458,9 +463,26 @@ function viewBilling() {
                 : '<div class="table-scroll billing-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>') +
               '</div>';
           }
+          var acctOpts = codes.map(function (c) {
+            return '<option value="' + esc(c) + '"' + (acctFilter.indexOf(c) !== -1 ? ' selected' : '') + '>' +
+              esc(c) + (codeMap[c] && codeMap[c] !== c ? ' — ' + esc(codeMap[c]) : '') + '</option>';
+          }).join('');
+          var delCard = '';
+          if (isAdmin) {
+            delCard = '<div class="card" style="margin-top:16px;"><div class="card-title">Delete bills</div>' +
+              '<p class="muted">Delete any combination of paid/unpaid and F/S bills. Deletions cannot be undone.</p>' +
+              '<div class="form-inline">' +
+              '<label>Accounts:<br><select id="delacct" multiple size="5" style="min-width:180px;">' + acctOpts + '</select></label> ' +
+              '<label><input type="checkbox" id="delopen" checked> Unpaid</label> ' +
+              '<label><input type="checkbox" id="delpaid" checked> Paid</label> ' +
+              '<label><input type="checkbox" id="delf" checked> F - FTJ</label> ' +
+              '<label><input type="checkbox" id="dels" checked> S - Soluta</label> ' +
+              '<button class="btn btn-danger" id="dodelbills">Delete bills</button></div>' +
+              '<p id="delbillcount" class="muted"></p><div id="delbillout"></div></div>';
+          }
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
-            '<div class="form-inline"><label>Filter by company code: <input id="bcode" placeholder="e.g. 9001" value="' + esc(codeFilter) + '"></label> ' +
+            '<div class="form-inline"><label>Accounts:<br><select id="bacct" multiple size="5" style="min-width:180px;">' + acctOpts + '</select></label> ' +
             '<label>Bill type: <select id="btype">' +
             '<option value="">All types</option>' +
             '<option value="F"' + (typeFilter === 'F' ? ' selected' : '') + '>F - FTJ</option>' +
@@ -468,14 +490,62 @@ function viewBilling() {
             '</select></label> ' +
             '<button class="btn btn-small" id="bcodeclear">Clear</button></div>' +
             '<div class="billing-panels">' +
-            panel('Open Invoices', openF, false) +
+            panel('Pending Invoices', openF, false) +
             panel('Paid Invoices', paidF, true) +
-            '</div>',
+            '</div>' + delCard,
             '#/billing'));
-          var bi = document.getElementById('bcode');
-          bi.oninput = function () { codeFilter = bi.value; load(); };
+          var sel = document.getElementById('bacct');
+          sel.onchange = function () {
+            acctFilter = Array.prototype.map.call(sel.selectedOptions, function (o) { return o.value; });
+            load();
+          };
           document.getElementById('btype').onchange = function () { typeFilter = this.value; load(); };
-          document.getElementById('bcodeclear').onclick = function () { codeFilter = ''; typeFilter = ''; load(); };
+          document.getElementById('bcodeclear').onclick = function () { acctFilter = []; typeFilter = ''; load(); };
+          if (isAdmin) {
+            var allRows = openRows.concat(paidRows);
+            var dsel = document.getElementById('delacct');
+            function delCount() {
+              var accts = Array.prototype.map.call(dsel.selectedOptions, function (o) { return o.value; });
+              var wantOpen = document.getElementById('delopen').checked;
+              var wantPaid = document.getElementById('delpaid').checked;
+              var wantF = document.getElementById('delf').checked;
+              var wantS = document.getElementById('dels').checked;
+              var n = allRows.filter(function (r) {
+                if (accts.length > 0 && accts.indexOf(String(r.company_code)) === -1) return false;
+                if (r.status === 'paid' && !wantPaid) return false;
+                if (r.status !== 'paid' && !wantOpen) return false;
+                var t = r.bill_type === 'S' ? 'S' : 'F';
+                if (t === 'F' && !wantF) return false;
+                if (t === 'S' && !wantS) return false;
+                return true;
+              }).length;
+              document.getElementById('delbillcount').innerHTML =
+                'Current selection matches <b>' + n + '</b> bill' + (n === 1 ? '' : 's') + '.';
+              return { accounts: accts, n: n,
+                statuses: (wantOpen ? ['open'] : []).concat(wantPaid ? ['paid'] : []),
+                types: (wantF ? ['F'] : []).concat(wantS ? ['S'] : []) };
+            }
+            ['delacct', 'delopen', 'delpaid', 'delf', 'dels'].forEach(function (id) {
+              document.getElementById(id).onchange = delCount;
+            });
+            delCount();
+            document.getElementById('dodelbills').onclick = function () {
+              var dc = delCount();
+              if (dc.n === 0) { document.getElementById('delbillout').innerHTML = errorHtml('Nothing matches the current selection.'); return; }
+              if (dc.statuses.length === 0 || dc.types.length === 0) {
+                document.getElementById('delbillout').innerHTML = errorHtml('Pick at least one status and one bill type.');
+                return;
+              }
+              if (!window.confirm('Delete ' + dc.n + ' bill' + (dc.n === 1 ? '' : 's') + '? This cannot be undone.')) return;
+              document.getElementById('delbillout').innerHTML = '<p class="muted">Deleting...</p>';
+              api.post('/api/admin/billing/delete-bills', {
+                accounts: dc.accounts, statuses: dc.statuses, types: dc.types
+              }).then(function (r) {
+                document.getElementById('delbillout').innerHTML = okHtml('Deleted ' + r.deleted + ' bills.');
+                load();
+              }).catch(function (err) { document.getElementById('delbillout').innerHTML = errorHtml(err.message); });
+            };
+          }
         }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
     }
@@ -1151,6 +1221,9 @@ function viewAdminJobs() {
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div></div>' +
+      '<div class="card"><div class="card-title">F billing: estimate unpaid bills</div>' +
+      '<p class="muted">Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d, using the last bill\u2019s lives and total. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
+      '<button class="btn btn-primary" id="ftjest">Preview estimates</button><div id="ftjestout"></div></div>' +
       '</div>' +
       '<h3>Delete data</h3>' +
       '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
@@ -1247,6 +1320,30 @@ function viewAdminJobs() {
           api.post('/api/admin/jobs/ftj-import', { token: r.token }).then(function (imp) {
             iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
+        };
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
+    document.getElementById('ftjest').onclick = function () {
+      var out = document.getElementById('ftjestout');
+      out.innerHTML = '<p class="muted">Projecting unpaid bills...</p>';
+      api.post('/api/admin/jobs/ftj-estimate-preview', {}).then(function (r) {
+        if (!r.accounts.length) { out.innerHTML = okHtml('No unpaid bills to estimate — every account is current.'); return; }
+        var html = '<p><b>' + r.total_estimates + '</b> estimated unpaid bills across <b>' + r.accounts.length + '</b> accounts.</p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>Frequency</th><th>Last Paid</th><th>Est. Bills</th><th>Est. Dates</th><th>Lives</th><th>Total Each</th></tr></thead><tbody>' +
+          r.accounts.map(function (x) {
+            return '<tr><td><b>' + esc(x.company_code) + '</b></td><td>' + esc(x.company_name) + '</td><td>' +
+              esc(x.frequency) + '</td><td>' + esc(x.last_paid) + '</td><td>' + x.estimates.length + '</td><td>' +
+              esc(x.estimates.join(', ')) + '</td><td>' + esc(x.lives_count) + '</td><td>' + fmtMoney(x.total_invoice) + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+        html += '<p><button class="btn btn-primary" id="ftjestcreate">Create ' + r.total_estimates + ' unpaid bills</button></p><div id="ftjestcreateout"></div>';
+        out.innerHTML = html;
+        document.getElementById('ftjestcreate').onclick = function () {
+          if (!window.confirm('Create ' + r.total_estimates + ' estimated unpaid F bills?')) return;
+          var cout = document.getElementById('ftjestcreateout');
+          cout.innerHTML = '<p class="muted">Creating...</p>';
+          api.post('/api/admin/jobs/ftj-estimate-create', {}).then(function (c) {
+            cout.innerHTML = okHtml('Done: ' + c.created + ' created' + (c.skipped ? ', ' + c.skipped + ' skipped (already exist)' : '') + '.');
+          }).catch(function (err) { cout.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
