@@ -189,10 +189,12 @@ async function migrate() {
     'paid_date DATE, ' +
     "bill_type TEXT NOT NULL DEFAULT 'F', " +
     'is_estimate BOOLEAN NOT NULL DEFAULT FALSE, ' +
+    'bill_mode TEXT, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_type TEXT NOT NULL DEFAULT 'F'");
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_estimate BOOLEAN NOT NULL DEFAULT FALSE');
+  await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_mode TEXT');
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -1127,7 +1129,8 @@ app.get('/api/billing', requireAuth, async (req, res) => {
 
 // v5: billing CSV import (admin only). Accepts { csv } text or { rows } array.
 // Columns: company_code, company_name, payroll_date, lives_count,
-// total_invoice, status, paid_date, bill_type ('F' or 'S', default 'F').
+// total_invoice, status, paid_date, bill_type ('F' or 'S', default 'F'),
+// bill_mode (1, 2, 3, 4, M; optional).
 // Upserts on (company_code, payroll_date, bill_type).
 app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
   try {
@@ -1162,17 +1165,20 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
         let bill_type = row.bill_type !== undefined && row.bill_type !== null && String(row.bill_type).trim() !== ''
           ? String(row.bill_type).trim().toUpperCase() : 'F';
         if (bill_type !== 'F' && bill_type !== 'S') throw new Error("bill_type must be 'F' or 'S'");
+        let bill_mode_csv = row.bill_mode !== undefined && row.bill_mode !== null && String(row.bill_mode).trim() !== ''
+          ? String(row.bill_mode).trim().toUpperCase() : null;
+        if (bill_mode_csv && ['1', '2', '3', '4', 'M'].indexOf(bill_mode_csv) === -1) throw new Error("bill_mode must be 1, 2, 3, 4, or M");
         const up = await db.query(
-          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, updated_at = NOW() ' +
-          "WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL)) AND bill_type = $8",
-          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_type]);
+          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = COALESCE($8, bill_mode), updated_at = NOW() ' +
+          "WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL)) AND bill_type = $9",
+          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_mode_csv, bill_type]);
         if (up.rowCount > 0) {
           updated++;
         } else {
           await db.query(
-            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type) ' +
-            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type]);
+            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode) ' +
+            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode_csv]);
           imported++;
         }
       } catch (e) {
@@ -1361,13 +1367,13 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
           Number(ex.total_invoice) === Number(b.total_invoice) &&
           ex.status === 'paid' && exPaid === paidDate;
         if (!same) {
-          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, updated_at = NOW() WHERE id = $6',
-            [b.company_name, b.lives_count, b.total_invoice, 'paid', paidDate, ex.id]);
+          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = $6, updated_at = NOW() WHERE id = $7',
+            [b.company_name, b.lives_count, b.total_invoice, 'paid', paidDate, b.bill_mode || null, ex.id]);
           updated++;
         }
       } else {
-        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type) VALUES ($1, $2, $3, $4, $5, 'paid', $6, 'F')",
-          [b.company_code, b.company_name, b.payroll_date, b.lives_count, b.total_invoice, paidDate]);
+        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode) VALUES ($1, $2, $3, $4, $5, 'paid', $6, 'F', $7)",
+          [b.company_code, b.company_name, b.payroll_date, b.lives_count, b.total_invoice, paidDate, b.bill_mode || null]);
         added++;
       }
     }
@@ -1445,6 +1451,29 @@ function ftjProjectDates(mode, lastISO, history, todayISO) {
   return out;
 }
 
+// Infer bill mode from the median gap between paid payroll dates (fallback when
+// bill_mode was never recorded, e.g. older manual CSV rows).
+function ftjInferMode(history) {
+  if (history.length < 2) return '';
+  const gaps = [];
+  for (let i = 1; i < history.length; i++) {
+    gaps.push((new Date(history[i] + 'T00:00:00Z') - new Date(history[i - 1] + 'T00:00:00Z')) / 86400000);
+  }
+  gaps.sort(function (a, b) { return a - b; });
+  const med = gaps[Math.floor(gaps.length / 2)];
+  if (med >= 5 && med <= 9) return '1';
+  if (med >= 12 && med <= 16) {
+    // Ambiguous: bi-weekly (strict 14-day steps, drifting month-days) vs
+    // semi-monthly (fixed month-days). Count distinct month-days.
+    const mdays = {};
+    history.forEach(function (iso) { mdays[parseInt(iso.slice(8, 10), 10)] = true; });
+    return Object.keys(mdays).length <= 2 ? '3' : '2';
+  }
+  if (med >= 17 && med <= 23) return '3';
+  if (med >= 26 && med <= 33) return '4';
+  return '';
+}
+
 // Derive unpaid-bill estimates: for each F account, project expected payroll
 // dates after its last paid bill through today; copy lives/total from the
 // last paid bill. Skips dates that already have any F bill.
@@ -1470,10 +1499,11 @@ async function estimateUnpaidBills(db) {
     const rows = byAcct[code];
     const last = rows[rows.length - 1];
     const lastISO = new Date(last.payroll_date).toISOString().slice(0, 10);
-    const mc = {};
-    rows.forEach(function (x) { const mm = String(x.bill_mode || '').toUpperCase(); mc[mm] = (mc[mm] || 0) + 1; });
-    const mode = Object.keys(mc).sort(function (a, b) { return mc[b] - mc[a]; })[0] || '';
     const history = rows.map(function (x) { return new Date(x.payroll_date).toISOString().slice(0, 10); });
+    const mc = {};
+    rows.forEach(function (x) { const mm = String(x.bill_mode || '').toUpperCase(); if (mm) mc[mm] = (mc[mm] || 0) + 1; });
+    let mode = Object.keys(mc).sort(function (a, b) { return mc[b] - mc[a]; })[0] || '';
+    if (!mode) mode = ftjInferMode(history);
     const dates = ftjProjectDates(mode, lastISO, history, today).filter(function (d) {
       return !have[code + '|' + d];
     });
@@ -1660,7 +1690,18 @@ app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
 app.get('/api/admin/companies', requireAdmin, async (req, res) => {
   try {
     const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort('c'));
-    res.json(r.rows);
+    const inv = await getPool().query(
+      "SELECT company_code, COUNT(*) AS n, COALESCE(SUM(total_invoice), 0) AS total " +
+      "FROM invoices WHERE status = 'open' GROUP BY company_code");
+    const invMap = {};
+    inv.rows.forEach(function (x) { invMap[x.company_code] = x; });
+    const rows = r.rows.map(function (c) {
+      const iv = invMap[c.company_code] || { n: 0, total: 0 };
+      c.open_invoice_count = parseInt(iv.n, 10);
+      c.open_invoice_total = parseFloat(iv.total);
+      return c;
+    });
+    res.json(rows);
   } catch (error) {
     console.error('Admin companies error:', error);
     res.status(500).json({ error: 'Internal server error' });

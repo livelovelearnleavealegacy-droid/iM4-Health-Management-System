@@ -174,7 +174,6 @@ function navLinks() {
     links.push(['#/admin/stewards', 'Stewards']);
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
-    links.push(['#/admin/import', 'Import']);
   }
   return links;
 }
@@ -1059,23 +1058,22 @@ function viewAdminCompanies() {
     if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-      function eeCode(c) { return c.ee_company_code || c.parent_company_code; }
-      function eeName(c) { return c.ee_company_name || c.parent_company_name; }
+      function parentCode(c) { return c.ee_company_code || c.parent_company_code; }
+      function parentName(c) { return c.ee_company_name || c.parent_company_name; }
       var rows = list.map(function (c) {
-        var elig = (c.payroll_qualified !== null && c.payroll_qualified !== undefined) ? c.payroll_qualified
-          : (c.payroll_total !== null && c.payroll_total !== undefined ? (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0) : null);
-        return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
-          cell(eeCode(c)) + cell(eeName(c)) +
-          cell(c.payroll_total) + cell(c.payroll_ineligible) + cell(c.payroll_opted_out) +
-          cell(elig) + cell(c.payroll_new_qualified) + cell(c.payroll_enrolled) + cell(c.payroll_not_enrolled) + '</tr>';
+        return '<tr>' + cell(parentCode(c)) + cell(parentName(c)) +
+          '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
+          cell(c.payroll_ineligible) + cell(c.payroll_enrolled) +
+          '<td>' + (c.open_invoice_count || 0) + '</td><td><b>' + fmtMoney(c.open_invoice_total || 0) + '</b></td></tr>';
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
         '<p class="muted">Companies are updated by CSV import only.</p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
-        '<tr><th>Company Code</th><th>Company Name</th><th>EE Code</th><th>EE Name</th>' +
-        '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th><th></th><th></th>' +
-        '<th>Total Employees</th><th>Ineligible</th><th>Opt Out</th><th>Eligible</th><th>New Qualified</th><th>Enrolled</th><th>Not Enrolled</th></tr></thead>' +
+        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>Company Name</th>' +
+        '<th colspan="2">Last Payroll</th><th colspan="2">Invoices outstanding</th></tr>' +
+        '<tr><th></th><th></th><th></th><th></th>' +
+        '<th>Ineligible</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>',
         '#/admin/companies'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/companies')); });
@@ -1140,58 +1138,6 @@ var IMPORT_FORMATS = {
   billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)'
 };
 
-function viewAdminImport() {
-  requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
-    render(shell(
-      '<h2>Import</h2><div id="msg"></div>' +
-      '<p class="muted">Step 1: choose a type and paste CSV (first row = headers). Step 2: review validation, then confirm. ' +
-      'This is the only way Stewards, Companies, Assignments, and Billing are updated.</p>' +
-      '<div class="form-inline"><select id="itype">' +
-      '<option value="stewards">Stewards</option>' +
-      '<option value="companies">Companies</option>' +
-      '<option value="assignments">Assignments</option>' +
-      '<option value="billing">Billing</option>' +
-      '</select> <button class="btn btn-primary" id="validate">Validate</button></div>' +
-      '<p class="muted" id="fmt"></p>' +
-      '<textarea id="csv" rows="10" class="csvbox" placeholder="paste CSV here"></textarea>' +
-      '<div id="preview"></div>',
-      '#/admin/import'));
-    var typeSel = document.getElementById('itype');
-    function showFmt() { document.getElementById('fmt').textContent = 'Columns: ' + IMPORT_FORMATS[typeSel.value]; }
-    typeSel.onchange = showFmt;
-    showFmt();
-    document.getElementById('validate').onclick = function () {
-      var type = typeSel.value;
-      var csvText = document.getElementById('csv').value;
-      var rows = parseCSV(csvText);
-      if (rows.length === 0) { document.getElementById('msg').innerHTML = errorHtml('No data rows found.'); return; }
-      if (type === 'billing') {
-        document.getElementById('preview').innerHTML = '<p class="muted">Importing billing...</p>';
-        api.post('/api/admin/import-billing', { rows: rows }).then(function (r) {
-          document.getElementById('preview').innerHTML = '<h3>Done</h3>' +
-            okHtml('Imported ' + r.imported + ' new, updated ' + r.updated + '.') +
-            (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
-        }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
-        return;
-      }
-      api.post('/api/admin/import', { type: type, rows: rows, dry_run: true }).then(function (d) {
-        var html = '<h3>Validation</h3>' + okHtml(d.valid_count + ' valid rows.') +
-          (d.errors.length ? '<div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' : '') +
-          (d.errors.length === 0 ? '<button class="btn btn-primary" id="confirm">Confirm import of ' + d.valid_count + ' rows</button>' : '<p class="muted">Fix the errors above and validate again.</p>');
-        document.getElementById('preview').innerHTML = html;
-        var cb = document.getElementById('confirm');
-        if (cb) cb.onclick = function () {
-          api.post('/api/admin/import', { type: type, rows: rows, dry_run: false }).then(function (r) {
-            document.getElementById('preview').innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' rows.') +
-              (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
-          }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
-        };
-      }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
-    };
-  });
-}
-
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
 function viewAdminJobs() {
   requireUser(function () {
@@ -1224,6 +1170,26 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">F billing: estimate unpaid bills</div>' +
       '<p class="muted">Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d, using the last bill\u2019s lives and total. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
       '<button class="btn btn-primary" id="ftjest">Preview estimates</button><div id="ftjestout"></div></div>' +
+      '</div>' +
+      '<h3>Imports</h3>' +
+      '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, and Billing are updated.</p>' +
+      '<div class="card-grid">' +
+      '<div class="card"><div class="card-title">Import stewards</div>' +
+      '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.stewards) + '</p>' +
+      '<textarea id="imp-stewards-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<button class="btn btn-primary" id="imp-stewards-go">Validate</button><div id="imp-stewards-out"></div></div>' +
+      '<div class="card"><div class="card-title">Import companies</div>' +
+      '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.companies) + '</p>' +
+      '<textarea id="imp-companies-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<button class="btn btn-primary" id="imp-companies-go">Validate</button><div id="imp-companies-out"></div></div>' +
+      '<div class="card"><div class="card-title">Import assignments</div>' +
+      '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.assignments) + '</p>' +
+      '<textarea id="imp-assignments-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<button class="btn btn-primary" id="imp-assignments-go">Validate</button><div id="imp-assignments-out"></div></div>' +
+      '<div class="card"><div class="card-title">Import billing</div>' +
+      '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.billing) + '</p>' +
+      '<textarea id="imp-billing-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<button class="btn btn-primary" id="imp-billing-go">Validate</button><div id="imp-billing-out"></div></div>' +
       '</div>' +
       '<h3>Delete data</h3>' +
       '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
@@ -1347,6 +1313,41 @@ function viewAdminJobs() {
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
+    function wireImportCard(prefix, type) {
+      document.getElementById('imp-' + prefix + '-go').onclick = function () {
+        var out = document.getElementById('imp-' + prefix + '-out');
+        var rows = parseCSV(document.getElementById('imp-' + prefix + '-csv').value);
+        if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
+        if (type === 'billing') {
+          out.innerHTML = '<p class="muted">Importing billing...</p>';
+          api.post('/api/admin/import-billing', { rows: rows }).then(function (r) {
+            out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' new, updated ' + r.updated + '.') +
+              (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
+          }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+          return;
+        }
+        out.innerHTML = '<p class="muted">Validating...</p>';
+        api.post('/api/admin/import', { type: type, rows: rows, dry_run: true }).then(function (d) {
+          var html = '<h3>Validation</h3>' + okHtml(d.valid_count + ' valid rows.') +
+            (d.errors.length ? '<div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' : '') +
+            (d.errors.length === 0
+              ? '<button class="btn btn-primary" id="imp-' + prefix + '-confirm">Confirm import of ' + d.valid_count + ' rows</button>'
+              : '<p class="muted">Fix the errors above and validate again.</p>');
+          out.innerHTML = html;
+          var cb = document.getElementById('imp-' + prefix + '-confirm');
+          if (cb) cb.onclick = function () {
+            api.post('/api/admin/import', { type: type, rows: rows, dry_run: false }).then(function (r) {
+              out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' rows.') +
+                (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
+            }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+          };
+        }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+      };
+    }
+    wireImportCard('stewards', 'stewards');
+    wireImportCard('companies', 'companies');
+    wireImportCard('assignments', 'assignments');
+    wireImportCard('billing', 'billing');
     function del(target, mode, key, key2, confirmText) {
       var out = document.getElementById('delout');
       if (!window.confirm(confirmText)) return;
@@ -1789,7 +1790,6 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'stewards') return viewAdminStewards();
   if (pathParts[0] === 'admin' && pathParts[1] === 'companies') return viewAdminCompanies();
   if (pathParts[0] === 'admin' && pathParts[1] === 'assignments') return viewAdminAssignments();
-  if (pathParts[0] === 'admin' && pathParts[1] === 'import') return viewAdminImport();
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
   location.hash = '#/login';
 }
