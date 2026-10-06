@@ -630,12 +630,13 @@ function statusBadge(status) {
   return '<span class="' + cls + '">' + esc(status || '') + '</span>';
 }
 
-// The status shown on tiles and the project view is the summary's RAG judgment
+// The status shown on tiles and the project view is the latest update's RAG judgment
 // (RED/YELLOW/GREEN); the GitHub Priority badge is only a fallback when no
-// summary exists yet.
+// update exists yet.
 function statusHtml(i) {
-  var rag = parseRag(i.latest_summary);
-  if (rag) return ragBadge(i.latest_summary);
+  var src = i.latest_update || i.latest_summary;
+  var rag = parseRag(src);
+  if (rag) return ragBadge(src);
   return statusBadge(i.status);
 }
 
@@ -652,13 +653,17 @@ function miniPipeline(current) {
 }
 
 function implCard(i) {
+  var lvl = STAGES.indexOf(i.stage);
+  var lvlText = lvl === -1 ? 'Level —' : 'Level ' + (lvl + 1) + ' of ' + STAGES.length;
+  var lives = (i.lives === null || i.lives === undefined) ? '—' : Number(i.lives).toLocaleString('en-US');
   return '<a class="card" href="#/project/' + i.id + '">' +
     '<div class="card-code">' + esc(i.company_code) + '</div>' +
     '<div class="card-title">' + esc(i.company_name) + '</div>' +
     miniPipeline(i.stage) +
-    '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusHtml(i) +
-    (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">&middot; ' + i.days_in_stage + ' days in stage</span>' : '') + '</div>' +
-    (i.latest_summary ? '<div class="card-summary">' + esc(i.latest_summary.slice(0, 140)) + '&hellip;</div>' : '') +
+    '<div class="card-line">' + statusHtml(i) + '</div>' +
+    '<div class="card-line"><b>' + esc(i.stage || '') + '</b></div>' +
+    '<div class="card-line muted">' + lvlText + '</div>' +
+    '<div class="card-line">' + lives + ' lives</div>' +
     '</a>';
 }
 
@@ -782,46 +787,46 @@ function viewImplementations() {
   });
 }
 
-// ---------------------------------------------------------------- 14-week timeline
+// ---------------------------------------------------------------- 12-week plan timeline
 function timelineHtml(t) {
   if (!t || !t.started) return '<p class="muted">The timeline clock starts the first time this project enters Initiation.</p>';
-  var head = '<div class="tl-head"><b>Week ' + t.weekElapsed + ' of 14</b> &middot; started ' + fmtDate(t.startDate) +
-    ' &middot; expected go-live ' + fmtDate(t.goLiveDate) +
-    ' &middot; expected stage now: <b>' + esc(t.expectedStage) + '</b>' +
-    (t.daysBehind > 0
-      ? ' &middot; <span class="rag rag-red">' + t.daysBehind + ' days behind plan</span>'
-      : ' &middot; <span class="rag rag-green">On pace</span>') + '</div>';
   var blocks = t.blocks.map(function (b) {
     var cls = 'tl-block' + (b.current ? ' tl-current' : '') + (b.done ? ' tl-done' : '');
     return '<div class="' + cls + '">' +
-      '<div class="tl-title">Weeks ' + b.startWeek + '-' + b.endWeek + ': ' + esc(b.block) +
-      ' <span class="muted">(' + esc(b.stage) + ' &middot; ' + fmtDate(b.startDate) + ' &ndash; ' + fmtDate(b.endDate) + ')</span></div>' +
-      '<ul class="tl-duties">' + b.duties.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join('') + '</ul></div>';
+      '<div class="tl-title">' + esc(b.block) + ' <span class="muted">(' + esc(b.stage) + ')</span></div>' +
+      '<ul class="tl-duties">' + b.duties.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join('') + '</ul>' +
+      '<div class="tl-dates muted">Weeks ' + b.startWeek + '-' + b.endWeek + ' &middot; ' + fmtDate(b.startDate) + ' &ndash; ' + fmtDate(b.endDate) + '</div></div>';
   }).join('');
-  return head + '<div class="timeline">' + blocks + '</div>';
+  return '<div class="timeline">' + blocks + '</div>';
 }
 
-// ---------------------------------------------------------------- project view: lifecycle visual + summary | messages
-function lifecycleVisual(current, daysInStage, stageEnteredAt) {
+// ---------------------------------------------------------------- project view: lifecycle visual + updates | messaging
+function lifecycleVisual(current, daysInStage, stageEnteredAt, rag) {
   var idx = STAGES.indexOf(current);
+  var ringCls = '';
+  var rl = String(rag || '').toUpperCase();
+  if (rl === 'RED') ringCls = ' rag-ring-red';
+  else if (rl === 'YELLOW') ringCls = ' rag-ring-yellow';
+  else if (rl === 'GREEN') ringCls = ' rag-ring-green';
   var html = '<div class="lifecycle">';
   STAGES.forEach(function (s, i) {
     var cls = 'lc-step';
     if (i < idx) cls += ' done';
     if (i === idx) cls += ' current';
+    var nodeCls = 'lc-node' + (i === idx ? ringCls : '');
     var daysLabel = '';
     if (i === idx) {
+      var d = null;
       if (stageEnteredAt) {
         var enteredMs = new Date(stageEnteredAt).getTime();
-        var trueDays = isNaN(enteredMs) ? null : Math.max(0, Math.floor((Date.now() - enteredMs) / 86400000));
-        daysLabel = '<div class="lc-days">in stage since ' + fmtDate(stageEnteredAt) +
-          (trueDays === null ? '' : ' (' + trueDays + ' days)') + '</div>';
+        if (!isNaN(enteredMs)) d = Math.max(0, Math.floor((Date.now() - enteredMs) / 86400000));
       } else if (daysInStage !== null && daysInStage !== undefined) {
-        daysLabel = '<div class="lc-days">' + daysInStage + ' days in stage</div>';
+        d = daysInStage;
       }
+      if (d !== null && d !== undefined) daysLabel = '<div class="lc-days">In Stage ' + d + ' Days</div>';
     }
     html += '<div class="' + cls + '">' +
-      '<div class="lc-node">' + (i < idx ? '&#10003;' : (i + 1)) + '</div>' +
+      '<div class="' + nodeCls + '">' + (i < idx ? '&#10003;' : (i + 1)) + '</div>' +
       '<div class="lc-label">' + esc(s) + '</div>' +
       daysLabel +
       '</div>';
@@ -861,12 +866,13 @@ function ragBadge(body) {
   return '<span class="rag ' + cls + '">' + s + '</span>';
 }
 
-function summaryHtml(s) {
-  if (!s) return '<p class="muted">No summaries yet. Summaries are generated nightly.</p>';
-  var body = stripStatusLine(esc(s.body));
-  return '<div class="summary">' + ragBadge(s.body) +
-    '<div class="muted">Summary &middot; ' + fmtDate(s.summary_date) + '</div>' +
-    '<div class="summary-body">' + body + '</div></div>';
+function updatesHtml(list) {
+  if (!list || list.length === 0) return '<p class="muted">No updates yet. Updates are generated nightly when the day\u2019s messages contain something worth noting.</p>';
+  return list.map(function (u) {
+    return '<div class="summary">' + ragBadge(u.body) +
+      '<div class="muted">Update &middot; ' + fmtDate(u.update_date) + '</div>' +
+      '<div class="summary-body">' + stripStatusLine(esc(u.body)) + '</div></div>';
+  }).join('');
 }
 
 function viewProject(id) {
@@ -881,24 +887,18 @@ function viewProject(id) {
           ' <span class="muted">' + fmtDateTime(m.github_created_at || m.created_at) + '</span></div>' +
           '<div class="msg-body">' + esc(m.body) + '</div></div>';
       }).join('');
-      var latest = d.summaries.length > 0 ? d.summaries[0] : null;
-      var older = d.summaries.slice(1).map(function (s) {
-        return '<div class="summary summary-old">' + ragBadge(s.body) +
-          '<div class="muted">Summary &middot; ' + fmtDate(s.summary_date) + '</div>' +
-          '<div class="summary-body">' + stripStatusLine(esc(s.body)) + '</div></div>';
-      }).join('');
+      var latest = d.updates && d.updates.length > 0 ? d.updates[0] : null;
+      var rag = latest ? parseRag(latest.body) : null;
       render(shell(
         '<p><a href="#/implementations">&larr; Implementation</a></p>' +
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
-        '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage, i.stage_entered_at) +
-        '<h3>14-week timeline</h3>' + timelineHtml(d.timeline) +
-        '<p>' + statusHtml(i) + '</p>' +
-        (i.card_title ? '<p class="muted">' + esc(i.card_title) + '</p>' : '') +
-        '<h3>Project summary</h3>' + summaryHtml(latest) + older +
+        '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage, i.stage_entered_at, rag) +
+        '<h3>Plan</h3>' + timelineHtml(d.timeline) +
+        '<h3>Updates</h3>' + updatesHtml(d.updates) +
         '</div><div>' +
-        '<h3>Messages <span class="muted">(' + d.messages.length + ')</span></h3>' +
+        '<h3>Messaging <span class="muted">(' + d.messages.length + ')</span></h3>' +
         '<form id="mform"><label>Post a message (goes to the GitHub card too)<textarea id="mbody" rows="3" required></textarea></label>' +
         '<button class="btn btn-primary" type="submit">Send message</button></form>' +
         '<div id="merr"></div><div id="msglist">' +
@@ -1137,7 +1137,7 @@ function viewAdminJobs() {
     if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
     render(shell(
       '<h2>Jobs</h2><div id="msg"></div>' +
-      '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; summaries run Sunday through Thursday at 9:00 PM.</p>' +
+      '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; updates run Sunday through Thursday at 9:00 PM.</p>' +
       '<div class="card-grid">' +
       '<div class="card"><div class="card-title">GitHub kanban sync</div>' +
       '<p class="muted">Pulls board cards, links implementations, pulls comments, removes app copies of comments deleted on GitHub.</p>' +
@@ -1145,9 +1145,9 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">Message sync</div>' +
       '<p class="muted">Pulls GitHub comments and removes app copies of deleted comments. Lighter than the full sync.</p>' +
       '<button class="btn btn-primary" id="runmsg">Sync messages now</button><div id="msgout"></div></div>' +
-      '<div class="card"><div class="card-title">Claude project summaries</div>' +
-      '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
-      '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
+      '<div class="card"><div class="card-title">Nightly project updates</div>' +
+      '<p class="muted">Looks at each day\u2019s messages and records only meaningful milestones and progress. Quiet days record nothing.</p>' +
+      '<button class="btn btn-primary" id="runsum">Run updates now</button><div id="sumout"></div></div>' +
       '<div class="card"><div class="card-title">Reopen onboarding card</div>' +
       '<p class="muted">Reopens an initiated (Complete) onboarding card so its documents can be added, changed, or deleted, then sent to GitHub again. Sending again creates a brand new GitHub card — have someone delete the old GitHub issue.</p>' +
       '<select id="reopencard" style="max-width: 100%;"><option value="">Loading...</option></select> ' +
@@ -1156,6 +1156,12 @@ function viewAdminJobs() {
       '<p class="muted">Claude writes a personalized Friday summary for each steward, top dog, and admin — week in review, their to-dos, company updates. Sends via Resend.</p>' +
       '<label>Days back: <input id="emaildays" type="number" value="7" min="1" max="30" style="width: 60px;"></label> ' +
       '<button class="btn btn-primary" id="runemail">Send weekly email now</button><div id="emailout"></div></div>' +
+      '<div class="card"><div class="card-title">Private message filters</div>' +
+      '<p class="muted">Anyone on this list can be @mentioned privately: any message containing @their-github-username is hidden from the app, the nightly updates, and the weekly email.</p>' +
+      '<div id="pmflist"><p class="muted">Loading...</p></div>' +
+      '<form id="pmfform" class="form-inline"><input id="pmfname" placeholder="Name" required> ' +
+      '<input id="pmfuser" placeholder="GitHub username" required> ' +
+      '<button class="btn btn-primary" type="submit">Add</button></form><div id="pmfmsg"></div></div>' +
       '<div class="card"><div class="card-title">FTJ billing: Premium Applied Report</div>' +
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
@@ -1246,8 +1252,8 @@ function viewAdminJobs() {
     document.getElementById('runsum').onclick = function () {
       var out = document.getElementById('sumout');
       out.innerHTML = '<p class="muted">Running... this can take a minute.</p>';
-      api.post('/api/admin/run-summaries-now', {}).then(function (d) {
-        out.innerHTML = okHtml('Summaries finished.') + pretty(d);
+      api.post('/api/admin/run-updates-now', {}).then(function (d) {
+        out.innerHTML = okHtml('Updates finished.') + pretty(d);
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });
@@ -1261,6 +1267,74 @@ function viewAdminJobs() {
         out.innerHTML = okHtml('Sent ' + d.sent + ' of ' + d.total + ' emails.') + pretty(d);
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
+      });
+    };
+    function loadPmf() {
+      var box = document.getElementById('pmflist');
+      api.get('/api/admin/private-filters').then(function (list) {
+        if (!list.length) { box.innerHTML = '<p class="muted">Nobody on the list — every message is shown.</p>'; return; }
+        var rows = list.map(function (f) {
+          return '<tr><td>' + esc(f.name) + '</td><td>@' + esc(f.github_username) + '</td>' +
+            '<td class="row-actions"><button class="btn btn-small" data-pmfedit="' + f.id + '">Edit</button> ' +
+            '<button class="btn btn-small btn-danger" data-pmfdel="' + f.id + '">Delete</button></td></tr>';
+        }).join('');
+        box.innerHTML = '<table class="data-table"><thead><tr><th>Name</th><th>GitHub username</th><th></th></tr></thead><tbody>' +
+          rows + '</tbody></table><div id="pmfeditbox"></div>';
+        var delBtns = box.querySelectorAll('[data-pmfdel]');
+        for (var d = 0; d < delBtns.length; d++) {
+          (function (b) {
+            b.onclick = function () {
+              if (!window.confirm('Remove this person from the private list? Their @-mentioned messages will become visible again.')) return;
+              api.delete('/api/admin/private-filters/' + b.getAttribute('data-pmfdel')).then(loadPmf).catch(function (err) {
+                document.getElementById('pmfmsg').innerHTML = errorHtml(err.message);
+              });
+            };
+          })(delBtns[d]);
+        }
+        var editBtns = box.querySelectorAll('[data-pmfedit]');
+        for (var e = 0; e < editBtns.length; e++) {
+          (function (b) {
+            b.onclick = function () {
+              var id = b.getAttribute('data-pmfedit');
+              var cur = null;
+              for (var k = 0; k < list.length; k++) { if (String(list[k].id) === String(id)) cur = list[k]; }
+              document.getElementById('pmfeditbox').innerHTML =
+                '<h3>Edit filter</h3><form id="pmfeditf" class="form-inline">' +
+                '<input id="pmfe-name" value="' + esc(cur.name) + '" required> ' +
+                '<input id="pmfe-user" value="' + esc(cur.github_username) + '" required> ' +
+                '<button class="btn btn-primary" type="submit">Save</button></form>';
+              document.getElementById('pmfeditf').onsubmit = function (ev) {
+                ev.preventDefault();
+                api.put('/api/admin/private-filters/' + id, {
+                  name: document.getElementById('pmfe-name').value,
+                  github_username: document.getElementById('pmfe-user').value
+                }).then(function () {
+                  document.getElementById('pmfmsg').innerHTML = okHtml('Filter updated.');
+                  loadPmf();
+                }).catch(function (err) {
+                  document.getElementById('pmfmsg').innerHTML = errorHtml(err.message);
+                });
+              };
+            };
+          })(editBtns[e]);
+        }
+      }).catch(function (err) {
+        box.innerHTML = errorHtml(err.message);
+      });
+    }
+    loadPmf();
+    document.getElementById('pmfform').onsubmit = function (e) {
+      e.preventDefault();
+      api.post('/api/admin/private-filters', {
+        name: document.getElementById('pmfname').value,
+        github_username: document.getElementById('pmfuser').value
+      }).then(function () {
+        document.getElementById('pmfname').value = '';
+        document.getElementById('pmfuser').value = '';
+        document.getElementById('pmfmsg').innerHTML = okHtml('Added to the private list.');
+        loadPmf();
+      }).catch(function (err) {
+        document.getElementById('pmfmsg').innerHTML = errorHtml(err.message);
       });
     };
     document.getElementById('ftjpreview').onclick = function () {
@@ -1424,12 +1498,12 @@ function viewAdminJobs() {
       del('stewards', 'one', k, '', 'Delete steward "' + k + '" and their assignments? This cannot be undone.');
     };
     document.getElementById('delcompanies').onclick = function () {
-      del('companies', 'all', '', '', 'Delete ALL companies, implementations, messages and summaries? This cannot be undone.');
+      del('companies', 'all', '', '', 'Delete ALL companies, implementations, messages and updates? This cannot be undone.');
     };
     document.getElementById('delcompanyone').onclick = function () {
       var k = document.getElementById('delcompanykey').value.trim();
       if (!k) { document.getElementById('delout').innerHTML = errorHtml('Enter a Company Code.'); return; }
-      del('companies', 'one', k, '', 'Delete company "' + k + '" with its implementations, messages and summaries? This cannot be undone.');
+      del('companies', 'one', k, '', 'Delete company "' + k + '" with its implementations, messages and updates? This cannot be undone.');
     };
     document.getElementById('delassignments').onclick = function () {
       del('assignments', 'all', '', '', 'Delete ALL steward to company assignments? This cannot be undone.');

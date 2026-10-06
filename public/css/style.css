@@ -282,11 +282,16 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 
 .lc-step.done .lc-node { background: var(--primary); border-color: var(--primary); color: #fff; }
 .lc-step.current .lc-node {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--ink);
-  box-shadow: 0 0 0 5px rgba(255,204,102,0.35);
+  background: #8B5CF6;
+  border-color: #8B5CF6;
+  color: #fff;
+  box-shadow: 0 0 0 5px rgba(139,92,246,0.30);
 }
+
+/* Thick status ring on the current stage node: red / yellow / green. */
+.lc-node.rag-ring-red { border: 5px solid var(--secondary); }
+.lc-node.rag-ring-yellow { border: 5px solid #d99a00; }
+.lc-node.rag-ring-green { border: 5px solid var(--ok); }
 
 .lc-label { margin-top: 6px; font-weight: 600; }
 .lc-step.current .lc-label { color: var(--ink); }
@@ -381,13 +386,16 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .billing-panel h3 { margin: 0 0 8px 0; font-size: 14px; }
 .billing-scroll { max-height: 560px; overflow-y: auto; }
 
-/* 14-week implementation timeline */
+/* 12-week implementation plan */
 .timeline { display: grid; gap: 10px; margin-top: 10px; }
-.tl-head { margin: 8px 0; font-size: 14px; }
 .tl-block { border: 1px solid #003366; border-radius: 8px; padding: 10px 12px; }
 .tl-block.tl-current { border-left: 6px solid #0099FF; background: #f2f9ff; }
 .tl-block.tl-done { opacity: 0.65; }
 .tl-title { font-weight: 700; margin-bottom: 6px; }
+.tl-dates { margin-top: 8px; font-size: 12px; }
+
+/* implementation card: one fact per line */
+.card-line { margin: 3px 0; }
 .tl-duties { margin: 0; padding-left: 20px; font-size: 12px; }
 
 /* Onboarding workflow (v5.6) */

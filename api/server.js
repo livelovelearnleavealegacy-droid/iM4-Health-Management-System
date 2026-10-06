@@ -44,10 +44,10 @@ const DEFAULT_STAGE_DAYS = {
   'Complete': 0
 };
 
-// The 14-week implementation plan. The clock starts the first time a project
+// The 12-week implementation plan. The clock starts the first time a project
 // enters the Initiation stage. Weeks are counted from that start date.
 const TIMELINE = [
-  { stage: 'Initiation', block: 'Kickoff', startWeek: 0, endWeek: 2, duties: [
+  { stage: 'Initiation', block: 'Kickoff', startWeek: 0, endWeek: 1, duties: [
     'Receive information from IHIA',
     'Receive intro from IHIA',
     'Send intro with availability to client',
@@ -55,13 +55,13 @@ const TIMELINE = [
     'Set up codes for express/2.0 if possible',
     'Complete introduction meeting and send recap, requirements, and generic education'
   ] },
-  { stage: 'Data Gathering', block: 'Census and setup', startWeek: 2, endWeek: 6, duties: [
+  { stage: 'Data Gathering', block: 'Census and setup', startWeek: 1, endWeek: 5, duties: [
     'Receive census from client',
     'Review census from client and unhide reports',
     'Set up codes',
     'Unit test'
   ] },
-  { stage: 'Implementation', block: 'Development and testing', startWeek: 6, endWeek: 8, duties: [
+  { stage: 'Implementation', block: 'Development and testing', startWeek: 5, endWeek: 6, duties: [
     'Developers create what is needed for process',
     'Test run(s)'
   ] },
@@ -78,13 +78,13 @@ const TIMELINE = [
     'Confirm expected go live and provide availability',
     'Set go live meeting'
   ] },
-  { stage: 'Go Live', block: 'Go live', startWeek: 12, endWeek: 14, duties: [
+  { stage: 'Go Live', block: 'Go live', startWeek: 10, endWeek: 12, duties: [
     'Complete go live - training',
     'Send recap and documentation',
     'Provide follow-up support as needed'
   ] }
 ];
-const TOTAL_TIMELINE_WEEKS = 14;
+const TOTAL_TIMELINE_WEEKS = 12;
 
 // ---------------------------------------------------------------- database
 let pool = null;
@@ -143,6 +143,24 @@ async function migrate() {
     'body TEXT NOT NULL, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'UNIQUE(implementation_id, summary_date))');
+  // Nightly key updates: one row per implementation per day, only when that
+  // day's messages contained something worth noting. Replaces the old
+  // full-project summaries (that table is kept for history but no longer written).
+  await db.query('CREATE TABLE IF NOT EXISTS implementation_updates (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'implementation_id INT REFERENCES implementations(id) ON DELETE CASCADE, ' +
+    'update_date DATE NOT NULL, ' +
+    'body TEXT NOT NULL, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'UNIQUE(implementation_id, update_date))');
+  // Private message filters: any message containing @github_username is hidden
+  // from the app, the nightly updates, and the weekly email. Managed by admins
+  // on the Jobs page (name + GitHub username, both editable).
+  await db.query('CREATE TABLE IF NOT EXISTS private_message_filters (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'name TEXT NOT NULL, ' +
+    'github_username TEXT NOT NULL UNIQUE, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
@@ -920,7 +938,7 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
     const impls = await getPool().query(
       'SELECT i.*, c.company_code, c.company_name, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
-      '(SELECT body FROM implementation_summaries s WHERE s.implementation_id = i.id ORDER BY s.summary_date DESC LIMIT 1) AS latest_summary ' +
+      '(SELECT body FROM implementation_updates u WHERE u.implementation_id = i.id ORDER BY u.update_date DESC LIMIT 1) AS latest_update ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
       'WHERE i.company_id = ANY($1) ORDER BY i.updated_at DESC', [childIds]);
     const stewards = await getPool().query(
@@ -945,7 +963,7 @@ app.get('/api/clients/:id', requireAuth, async (req, res) => {
     const impls = await getPool().query(
       'SELECT i.*, EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
       '(SELECT COUNT(*)::int FROM messages m WHERE m.implementation_id = i.id) AS message_count, ' +
-      '(SELECT body FROM implementation_summaries s WHERE s.implementation_id = i.id ORDER BY s.summary_date DESC LIMIT 1) AS latest_summary ' +
+      '(SELECT body FROM implementation_updates u WHERE u.implementation_id = i.id ORDER BY u.update_date DESC LIMIT 1) AS latest_update ' +
       'FROM implementations i WHERE i.company_id = $1 ORDER BY i.updated_at DESC', [req.params.id]);
     const stewards = await getPool().query(
       'SELECT s.id, s.first_name, s.last_name, s.name, s.email FROM stewards s JOIN assignments a ON a.steward_id = s.id WHERE a.company_id = $1 ORDER BY s.id',
@@ -980,9 +998,9 @@ app.get('/api/implementations', requireAuth, async (req, res) => {
     }
     if (clauses.length > 0) where += (where ? ' AND ' : 'WHERE ') + clauses.join(' AND ');
     const r = await getPool().query(
-      'SELECT i.*, c.company_code, c.company_name, ' +
+      'SELECT i.*, c.company_code, c.company_name, c.payroll_enrolled AS lives, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
-      '(SELECT body FROM implementation_summaries s WHERE s.implementation_id = i.id ORDER BY s.summary_date DESC LIMIT 1) AS latest_summary ' +
+      '(SELECT body FROM implementation_updates u WHERE u.implementation_id = i.id ORDER BY u.update_date DESC LIMIT 1) AS latest_update ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
       where + ' ORDER BY i.status, c.company_name', params);
     res.json(r.rows);
@@ -1011,10 +1029,11 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
       'WHERE m.implementation_id = $1 ORDER BY COALESCE(m.github_created_at, m.created_at)',
       [req.params.id]);
     const sums = await getPool().query(
-      'SELECT summary_date, body, created_at FROM implementation_summaries WHERE implementation_id = $1 ORDER BY summary_date DESC LIMIT 5',
+      'SELECT update_date, body, created_at FROM implementation_updates WHERE implementation_id = $1 ORDER BY update_date DESC LIMIT 10',
       [req.params.id]);
     const timeline = await buildTimeline(getPool(), req.params.id);
-    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows, timeline: timeline });
+    const filters = await privateFilters(getPool());
+    res.json({ implementation: impl, messages: withoutPrivateMessages(msgs.rows, filters), updates: sums.rows, timeline: timeline });
   } catch (error) {
     console.error('Load project error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -2052,7 +2071,7 @@ function normalizeStage(raw) {
   return s;
 }
 
-// Build the 14-week timeline for one implementation. The clock starts the
+// Build the 12-week timeline for one implementation. The clock starts the
 // first time the project entered Initiation (falls back to the earliest
 // recorded stage entry for older projects).
 async function buildTimeline(db, implId) {
@@ -2131,6 +2150,28 @@ async function syncIssueComments(db, implId, repo, issueNumber) {
     'AND NOT (github_comment_id = ANY($2::bigint[]))',
     [implId, seenIds]);
   return { pulled: pulled, pruned: gone.rowCount };
+}
+
+// ---------------------------------------------------------------- private message filters
+// Any message whose body contains @github_username (case-insensitive) for a
+// name on the private filter list is hidden from the app: the project message
+// list, the nightly updates, and the weekly email. Messages stay stored (and
+// stay on GitHub) so removing someone from the list restores their messages.
+async function privateFilters(db) {
+  const r = await db.query('SELECT id, name, github_username FROM private_message_filters ORDER BY github_username');
+  return r.rows;
+}
+function isPrivateMessage(body, filters) {
+  const b = String(body || '').toLowerCase();
+  for (const f of (filters || [])) {
+    const u = String(f.github_username || '').trim().toLowerCase();
+    if (u && b.indexOf('@' + u) !== -1) return true;
+  }
+  return false;
+}
+function withoutPrivateMessages(rows, filters) {
+  if (!filters || filters.length === 0) return rows;
+  return rows.filter(function (m) { return !isPrivateMessage(m.body, filters); });
 }
 
 async function runGithubSync() {
@@ -2296,6 +2337,7 @@ app.post('/api/admin/delete-data', requireAdmin, async (req, res) => {
       if (ids.length > 0) {
         await db.query('DELETE FROM messages WHERE implementation_id = ANY($1)', [ids]);
         await db.query('DELETE FROM implementation_summaries WHERE implementation_id = ANY($1)', [ids]);
+        await db.query('DELETE FROM implementation_updates WHERE implementation_id = ANY($1)', [ids]);
         await db.query('DELETE FROM stage_history WHERE implementation_id = ANY($1)', [ids]);
         await db.query('DELETE FROM implementations WHERE id = ANY($1)', [ids]);
       }
@@ -2370,25 +2412,26 @@ async function runWeeklyEmail(daysBack) {
       const recipName = [recip.first_name, recip.last_name].filter(Boolean).join(' ') || recip.name || recip.email;
 
       // Activity in the window.
-      let summaries = [];
+      let updates = [];
       let messages = [];
       let stageChanges = [];
       let invoices = [];
+      const pfilters = await privateFilters(db);
       if (companyIds.length > 0) {
         const s = await db.query(
-          'SELECT s.summary_date, s.body, c.company_name, c.company_code FROM implementation_summaries s ' +
-          'JOIN implementations i ON i.id = s.implementation_id ' +
+          'SELECT u.update_date, u.body, c.company_name, c.company_code FROM implementation_updates u ' +
+          'JOIN implementations i ON i.id = u.implementation_id ' +
           'JOIN companies c ON c.id = i.company_id ' +
-          'WHERE i.company_id = ANY($1) AND s.summary_date >= $2 ORDER BY s.summary_date DESC LIMIT 30',
+          'WHERE i.company_id = ANY($1) AND u.update_date >= $2 ORDER BY u.update_date DESC LIMIT 40',
           [companyIds, since]);
-        summaries = s.rows;
+        updates = s.rows;
         const m = await db.query(
           'SELECT m.created_at, m.body, m.author_name, c.company_name, c.company_code FROM messages m ' +
           'JOIN implementations i ON i.id = m.implementation_id ' +
           'JOIN companies c ON c.id = i.company_id ' +
-          'WHERE i.company_id = ANY($1) AND m.created_at >= $2 ORDER BY m.created_at DESC LIMIT 40',
+          'WHERE i.company_id = ANY($1) AND m.created_at >= $2 ORDER BY m.created_at DESC LIMIT 60',
           [companyIds, since]);
-        messages = m.rows;
+        messages = withoutPrivateMessages(m.rows, pfilters);
         const sh = await db.query(
           'SELECT sh.entered_at, sh.stage, c.company_name, c.company_code FROM stage_history sh ' +
           'JOIN implementations i ON i.id = sh.implementation_id ' +
@@ -2418,13 +2461,13 @@ async function runWeeklyEmail(daysBack) {
         return arr.length === 0 ? '(none)' : arr.map(fn).join(nl);
       };
       const prompt =
-        'You are writing a Friday weekly summary email for ' + recipName +
-        ' (' + roles.join(', ') + ') at iM4 Health. Cover the last ' + days + ' days.' + nl + nl +
+        'You are writing a robust Friday weekly summary email for ' + recipName +
+        ' (' + roles.join(', ') + ') at iM4 Health. Cover the last ' + days + ' days thoroughly — this is their one weekly briefing and it should feel complete.' + nl + nl +
         'THEIR COMPANIES (' + companies.length + '):' + nl +
-        fmtList(companies.slice(0, 40), function (c) { return '- ' + c.company_name + ' (' + c.company_code + ')'; }) + nl + nl +
-        'NEW SUMMARIES THIS WEEK:' + nl +
-        fmtList(summaries, function (s) {
-          return '- ' + s.company_name + ' (' + s.company_code + '), ' + String(s.summary_date).slice(0, 10) + ': ' + String(s.body || '').slice(0, 500);
+        fmtList(companies.slice(0, 60), function (c) { return '- ' + c.company_name + ' (' + c.company_code + ')'; }) + nl + nl +
+        'DAILY KEY UPDATES THIS WEEK (milestones and progress only):' + nl +
+        fmtList(updates, function (u) {
+          return '- ' + u.company_name + ' (' + u.company_code + '), ' + String(u.update_date).slice(0, 10) + ': ' + String(u.body || '').slice(0, 600);
         }) + nl + nl +
         'STAGE CHANGES THIS WEEK:' + nl +
         fmtList(stageChanges, function (s) {
@@ -2445,11 +2488,17 @@ async function runWeeklyEmail(daysBack) {
         'Write the email in this format:' + nl +
         'Subject line: one line, e.g. "Your iM4 weekly summary: <date range>"' + nl + nl +
         'WEEK IN REVIEW:' + nl +
-        '- 3-5 bullets on what actually happened this week across their companies' + nl + nl +
+        '- 4-6 bullets on what actually happened this week across their companies — lead with the biggest wins and movement' + nl + nl +
+        'KEY MILESTONES:' + nl +
+        '- every meaningful milestone or completed key task this week, with the company name' + nl + nl +
+        'AT-RISK PROJECTS:' + nl +
+        '- any project that looks blocked, stalled, or behind plan, with WHY (one line each); say "(none)" if everything is on track' + nl + nl +
         'YOUR TO-DOS (emphasis here — things assigned to ' + recipName + ' or needing their attention):' + nl +
-        '- each bullet: WHAT, which COMPANY, and DUE DATE or TBD. Pull from summaries, messages, stage stalls, and open invoices.' + nl + nl +
+        '- each bullet: WHAT, which COMPANY, and DUE DATE or TBD. Pull from updates, messages, stage stalls, and open invoices.' + nl + nl +
         'COMPANY UPDATES:' + nl +
-        '- one short paragraph or 1-2 bullets per company that had activity; skip companies with nothing new' + nl + nl +
+        '- one short paragraph or 2-3 bullets per company that had activity; skip companies with nothing new' + nl + nl +
+        'OPEN MONEY ITEMS:' + nl +
+        '- open invoices that need attention, oldest first, with company and amount' + nl + nl +
         'Keep it plain-spoken and tight. No preamble, no sign-off. If there was genuinely no activity, say so in one line and list the standing open items.';
 
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2461,7 +2510,7 @@ async function runWeeklyEmail(daysBack) {
         },
         body: JSON.stringify({
           model: ANTHROPIC_MODEL,
-          max_tokens: 1500,
+          max_tokens: 2500,
           messages: [{ role: 'user', content: prompt }]
         })
       });
@@ -3541,44 +3590,33 @@ app.post('/api/onboarding/:id/generate-soluta', requireOnboarder, async (req, re
   } catch (error) { console.error('Soluta generate error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
-// ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
-async function claudeSummarize(db, impl, company, recentMessages, typical, timeline) {
+// ---------------------------------------------------------------- nightly key updates (Sun-Thu nights + on demand)
+// Nightly key update for one implementation: looks at the day's messages and
+// extracts ONLY meaningful milestones, completed key tasks, and newly
+// identified obstacles. Returns 'NONE' when nothing worth noting happened.
+async function claudeUpdate(db, impl, company, dayMessages, timeline) {
   const nl = String.fromCharCode(10);
-  const msgText = recentMessages.slice(-20).map(m => '- ' + (m.author_name || 'unknown') + ' (' + (m.when || '') + '): ' + String(m.body || '').slice(0, 400)).join(nl);
-  const durLines = STAGES.map(function (s) {
-    const t = typical[s];
-    const days = t ? t.days + ' (observed over ' + t.cases + ' real cases)' : DEFAULT_STAGE_DAYS[s] + ' (default estimate)';
-    return '- ' + s + ': ' + days + ' working days';
-  }).join(nl);
-  const stageEntered = impl.stage_entered_at ? new Date(impl.stage_entered_at).toLocaleDateString() : 'unknown';
+  const msgText = dayMessages.map(m => '- ' + (m.author_name || 'unknown') + ' (' + (m.when || '') + '): ' + String(m.body || '').slice(0, 500)).join(nl);
   let tlText = 'No timeline yet (the project has not entered Initiation).';
   if (timeline && timeline.started) {
-    tlText = timeline.blocks.map(function (b) {
-      return 'Weeks ' + b.startWeek + '-' + b.endWeek + ' (' + b.startDate + ' to ' + b.endDate + '): ' +
-        b.stage + ' - ' + b.block + '. Duties: ' + b.duties.join('; ') + '.';
-    }).join(nl) +
-    nl + 'Timeline started ' + timeline.startDate + ' (week ' + timeline.weekElapsed + ' of ' + TOTAL_TIMELINE_WEEKS + '). ' +
-    'Current stage: ' + timeline.currentStage + '. Expected stage now: ' + timeline.expectedStage + '. ' +
-    'Expected go-live: ' + timeline.goLiveDate + '. ' +
-    (timeline.daysBehind > 0
-      ? 'The project is ' + timeline.daysBehind + ' days behind the plan.'
-      : 'The project is on the planned pace.');
+    tlText = 'Week ' + timeline.weekElapsed + ' of ' + TOTAL_TIMELINE_WEEKS + '. Current stage: ' + timeline.currentStage +
+      '. Expected stage now: ' + timeline.expectedStage + '. Expected go-live: ' + timeline.goLiveDate + '. ' +
+      (timeline.daysBehind > 0
+        ? 'The project is ' + timeline.daysBehind + ' days behind the plan.'
+        : 'The project is on the planned pace.');
   }
-  const prompt = 'You are a project manager writing a brief nightly update for the project owner. ' +
+  const prompt = 'You are a project manager writing a brief daily progress note for the project owner. ' +
     'Project: ' + company.company_name + ' (company code ' + company.company_code + '). ' +
-    'Current stage: ' + (impl.stage || 'unknown') + ' (entered ' + stageEntered + ', ' + (impl.days_in_stage || 0) + ' days in stage). ' +
-    'Status: ' + (impl.status || 'unknown') + '. Card: ' + (impl.card_title || '') + '.' + nl +
-    'Typical working days per stage:' + nl + durLines + nl +
-    'The 14-week implementation plan (the clock starts the day the project first entered Initiation):' + nl + tlText + nl +
-    'Recent messages (newest last):' + nl + (msgText || '(none)') + nl + nl +
-    'Write the update in EXACTLY this format:' + nl +
+    'Current stage: ' + (impl.stage || 'unknown') + '. ' + tlText + nl +
+    "Today's messages (oldest first):" + nl + msgText + nl + nl +
+    'List ONLY meaningful milestones, progress, completed key tasks, or newly identified obstacles from these messages. ' +
+    'Do NOT recap the entire project and do NOT restate background. If a key task was completed, say what was done. ' +
+    'If a new obstacle was identified, say what it is. ' +
+    'If nothing meaningful happened, reply with exactly: NONE' + nl + nl +
+    'Otherwise write in EXACTLY this format:' + nl +
     'STATUS: RED, YELLOW, or GREEN (your judgment: RED = blocked or seriously off track, YELLOW = at risk or stalled, GREEN = on track)' + nl +
-    'KEY DATES:' + nl +
-    '- one bullet per important date: when the current stage started, expected completion of the current stage (use the 14-week plan above), expected go-live, and any due dates mentioned in the messages' + nl +
-    'SUMMARY:' + nl +
-    '- 1-2 sentences on the current status and what has been accomplished recently' + nl +
-    '- Outstanding to-dos, each with WHAT needs doing, WHO owns it, and the DUE DATE (use TBD where unknown; draw the to-dos from the current phase duties in the plan above)' + nl +
-    '- Obstacles or roadblocks and who is working on them' + nl +
+    'UPDATES:' + nl +
+    '- one bullet per meaningful milestone, completed task, or new obstacle (one line each)' + nl +
     'Keep it tight and plain-spoken. No preamble, no sign-off.';
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -3589,7 +3627,7 @@ async function claudeSummarize(db, impl, company, recentMessages, typical, timel
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
-      max_tokens: 800,
+      max_tokens: 500,
       messages: [{ role: 'user', content: prompt }]
     })
   });
@@ -3599,61 +3637,121 @@ async function claudeSummarize(db, impl, company, recentMessages, typical, timel
   return parts.join(nl).trim();
 }
 
-async function runSummaries() {
+// Nightly job (Sun-Thu): for each active implementation, look at messages
+// since the last recorded update. If there was activity (excluding private
+// @-mention messages), ask Claude for the day's meaningful milestones and
+// store one update row. Quiet days store nothing.
+async function runUpdates() {
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
   try {
     const db = getPool();
-    const typical = await typicalDurations(db);
+    const filters = await privateFilters(db);
     const impls = await db.query(
-      'SELECT i.*, c.company_name, c.company_code, ' +
-      'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
-      '(SELECT entered_at FROM stage_history h WHERE h.implementation_id = i.id AND h.exited_at IS NULL ' +
-      'ORDER BY h.entered_at DESC LIMIT 1) AS stage_entered_at ' +
+      'SELECT i.*, c.company_name, c.company_code ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
       "WHERE COALESCE(i.stage, '') <> 'Complete' ORDER BY i.id");
     const today = new Date().toISOString().slice(0, 10);
     let done = 0;
+    let quiet = 0;
     const errors = [];
     for (const impl of impls.rows) {
       try {
+        const last = await db.query(
+          'SELECT MAX(created_at) AS last_at FROM implementation_updates WHERE implementation_id = $1',
+          [impl.id]);
+        const since = (last.rows[0] && last.rows[0].last_at)
+          ? new Date(last.rows[0].last_at).toISOString()
+          : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
         const msgs = await db.query(
           'SELECT author_name, body, COALESCE(github_created_at, created_at) AS when FROM messages ' +
-          'WHERE implementation_id = $1 ORDER BY COALESCE(github_created_at, created_at) DESC LIMIT 20',
-          [impl.id]);
+          'WHERE implementation_id = $1 AND COALESCE(github_created_at, created_at) > $2 ' +
+          'ORDER BY COALESCE(github_created_at, created_at)',
+          [impl.id, since]);
+        const visible = withoutPrivateMessages(msgs.rows, filters);
+        if (visible.length === 0) { quiet++; continue; }
         const timeline = await buildTimeline(db, impl.id);
-        const body = await claudeSummarize(db, impl, impl, msgs.rows.reverse(), typical, timeline);
+        const body = await claudeUpdate(db, impl, impl, visible, timeline);
+        if (!body || /^none\b/i.test(body.trim())) { quiet++; continue; }
         await db.query(
-          'INSERT INTO implementation_summaries (implementation_id, summary_date, body) VALUES ($1, $2, $3) ' +
-          'ON CONFLICT (implementation_id, summary_date) DO UPDATE SET body = EXCLUDED.body',
+          'INSERT INTO implementation_updates (implementation_id, update_date, body) VALUES ($1, $2, $3) ' +
+          'ON CONFLICT (implementation_id, update_date) DO UPDATE SET body = EXCLUDED.body',
           [impl.id, today, body]);
         done++;
       } catch (e) {
         errors.push('impl ' + impl.id + ': ' + e.message);
       }
     }
-    return { success: true, summarized: done, of: impls.rows.length, errors: errors };
+    return { success: true, updated: done, quiet: quiet, of: impls.rows.length, errors: errors };
   } catch (error) {
-    console.error('Summaries error:', error);
+    console.error('Updates error:', error);
     throw error;
   }
 }
 
-app.post('/api/admin/run-summaries', async (req, res) => {
+app.post('/api/admin/run-updates', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
-    res.json(await runSummaries());
+    res.json(await runUpdates());
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Same summaries, triggered by a signed-in admin from the Jobs page (JWT, no secret needed).
-app.post('/api/admin/run-summaries-now', requireAdmin, async (req, res) => {
+// Same updates, triggered by a signed-in admin from the Jobs page (JWT, no secret needed).
+app.post('/api/admin/run-updates-now', requireAdmin, async (req, res) => {
   try {
-    res.json(await runSummaries());
+    res.json(await runUpdates());
   } catch (error) {
-    console.error('Summaries error:', error);
+    console.error('Updates error:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------- private message filters (admin)
+// GET all, POST new, PUT edit, DELETE remove. Any message containing
+// @github_username is hidden from the app, updates, and weekly emails.
+app.get('/api/admin/private-filters', requireAdmin, async (req, res) => {
+  try {
+    res.json(await privateFilters(getPool()));
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+app.post('/api/admin/private-filters', requireAdmin, async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim();
+    const username = String((req.body && req.body.github_username) || '').trim().replace(/^@/, '');
+    if (!name || !username) return res.status(400).json({ error: 'Name and GitHub username are required' });
+    const r = await getPool().query(
+      'INSERT INTO private_message_filters (name, github_username) VALUES ($1, $2) ' +
+      'ON CONFLICT (github_username) DO UPDATE SET name = EXCLUDED.name RETURNING *',
+      [name, username]);
+    res.status(201).json({ success: true, filter: r.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+app.put('/api/admin/private-filters/:id', requireAdmin, async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim();
+    const username = String((req.body && req.body.github_username) || '').trim().replace(/^@/, '');
+    if (!name || !username) return res.status(400).json({ error: 'Name and GitHub username are required' });
+    const r = await getPool().query(
+      'UPDATE private_message_filters SET name = $1, github_username = $2 WHERE id = $3 RETURNING *',
+      [name, username, req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true, filter: r.rows[0] });
+  } catch (error) {
+    if (error && error.code === '23505') return res.status(400).json({ error: 'That GitHub username is already on the list' });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+app.delete('/api/admin/private-filters/:id', requireAdmin, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM private_message_filters WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
