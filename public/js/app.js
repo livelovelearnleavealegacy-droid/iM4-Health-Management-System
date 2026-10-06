@@ -793,7 +793,7 @@ function timelineHtml(t) {
   var blocks = t.blocks.map(function (b) {
     var cls = 'tl-block' + (b.current ? ' tl-current' : '') + (b.done ? ' tl-done' : '');
     return '<div class="' + cls + '">' +
-      '<div class="tl-title">' + esc(b.block) + ' <span class="muted">(' + esc(b.stage) + ')</span></div>' +
+      '<div class="tl-title">' + esc(b.stage) + ' <span class="muted">(' + esc(b.block) + ')</span></div>' +
       '<ul class="tl-duties">' + b.duties.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join('') + '</ul>' +
       '<div class="tl-dates muted">Weeks ' + b.startWeek + '-' + b.endWeek + ' &middot; ' + fmtDate(b.startDate) + ' &ndash; ' + fmtDate(b.endDate) + '</div></div>';
   }).join('');
@@ -895,8 +895,8 @@ function viewProject(id) {
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
         '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage, i.stage_entered_at, rag) +
-        '<h3>Plan</h3>' + timelineHtml(d.timeline) +
         '<h3>Updates</h3>' + updatesHtml(d.updates) +
+        '<h3>Plan</h3>' + timelineHtml(d.timeline) +
         '</div><div>' +
         '<h3>Messaging <span class="muted">(' + d.messages.length + ')</span></h3>' +
         '<form id="mform"><label>Post a message (goes to the GitHub card too)<textarea id="mbody" rows="3" required></textarea></label>' +

@@ -389,8 +389,8 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 /* 12-week implementation plan */
 .timeline { display: grid; gap: 10px; margin-top: 10px; }
 .tl-block { border: 1px solid #003366; border-radius: 8px; padding: 10px 12px; }
-.tl-block.tl-current { border-left: 6px solid #0099FF; background: #f2f9ff; }
-.tl-block.tl-done { opacity: 0.65; }
+.tl-block.tl-done { border-left: 6px solid var(--primary); opacity: 0.65; }
+.tl-block.tl-current { border-left: 6px solid #8B5CF6; background: #f5f0ff; }
 .tl-title { font-weight: 700; margin-bottom: 6px; }
 .tl-dates { margin-top: 8px; font-size: 12px; }
 
