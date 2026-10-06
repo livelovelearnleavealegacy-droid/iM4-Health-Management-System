@@ -2228,6 +2228,7 @@ const PREIMPL_LABELS = [
   ['Payroll Provider Company', 'payrollProvider'],
   ['Payroll Frequency', 'payrollFreq'],
   ['Payroll Frequency #2 (if applicable)', 'payrollFreq2'],
+  ['Payroll Frequency #3 (if applicable)', 'payrollFreq3'],
   ['Multiple Payroll Batches', 'multiBatches']
 ];
 
@@ -2264,10 +2265,12 @@ function extractPreImplEins(buffer) {
     if (cellLab === want) return true;
     return cellLab.indexOf(want) === 0 && /[^a-z0-9]/.test(cellLab.slice(want.length, want.length + 1) || ' ');
   };
+  // Match longest labels first so 'Payroll Frequency #2' wins over 'Payroll Frequency'.
+  const sortedLabels = PREIMPL_LABELS.slice().sort(function (a, b) { return b[0].length - a[0].length; });
   for (const r of rows) {
     if (!r) continue;
     const lab = normLabel(cell(r, 1) || cell(r, 0));
-    for (const pair of PREIMPL_LABELS) {
+    for (const pair of sortedLabels) {
       if (labelHit(lab, normLabel(pair[0]))) {
         valCols.forEach(function (ci, bi) {
           const v = cell(r, ci);
@@ -2300,22 +2303,51 @@ function extractCommission(buffer) {
   const sheets = readWorkbook(buffer);
   const keys = Object.keys(sheets);
   const rows = keys.length ? sheets[keys[0]] : [];
-  const get = function (label) {
-    const key = String(label).toLowerCase();
-    for (const r of rows) {
-      if (r && r[0] && String(r[0]).trim().toLowerCase() === key) {
-        const v = r[1];
-        return (v === null || v === undefined) ? '' : String(v).trim();
+  const val = function (r, i) { const v = r && r[i]; return (v === null || v === undefined) ? '' : String(v).trim(); };
+  const num = function (v) { const n = parseFloat(String(v).replace(/[^0-9.\-]/g, '')); return isNaN(n) ? null : n; };
+  const out = { groupName: '', agencyName: '', agencyPct: null, totalCommission: null, agents: [], effectiveDate: '' };
+  let pending = null;
+  rows.forEach(function (r) {
+    if (!r) return;
+    const a = val(r, 0).toLowerCase();
+    for (let i = 0; i < r.length; i++) {
+      if (val(r, i).toLowerCase() === 'total commission') {
+        for (let j = i + 1; j < r.length; j++) { const n = num(val(r, j)); if (n !== null) { out.totalCommission = n; break; } }
       }
     }
-    return '';
-  };
-  return {
-    groupName: get('Group Name'),
-    agencyName: get('Agency Name'),
-    agents: [get('Agent 1 Name'), get('Agent 2 Name'), get('Agent 3 Name')].filter(function (a) { return !!a; }),
-    effectiveDate: get('Effective Date')
-  };
+    if (a === 'group name') out.groupName = val(r, 1);
+    else if (a === 'agency name') out.agencyName = val(r, 1);
+    else if (a === 'effective date') out.effectiveDate = val(r, 1);
+    else if (a === 'agency') { if (val(r, 1)) out.agencyName = val(r, 1); pending = { kind: 'agency' }; }
+    else if (/^agent \d+$/.test(a)) {
+      const nm = val(r, 1);
+      if (nm) { out.agents.push({ name: nm, pct: null }); pending = { kind: 'agent', idx: out.agents.length - 1 }; }
+      else pending = null;
+    }
+    else if (a === 'broker') pending = null;
+    else if (a === 'percentage' && pending) {
+      let p = num(val(r, 1));
+      if (p !== null && p > 1) p = p / 100;
+      if (pending.kind === 'agency') out.agencyPct = p;
+      else if (pending.idx !== undefined && out.agents[pending.idx]) out.agents[pending.idx].pct = p;
+    }
+  });
+  if (out.agents.length === 0) {
+    // fall back to the header-section agent names (no percentages available)
+    ['Agent 1 Name', 'Agent 2 Name', 'Agent 3 Name'].forEach(function (lab) {
+      const get = function (label) {
+        for (const r of rows) {
+          if (r && r[0] && String(r[0]).trim().toLowerCase() === String(label).toLowerCase()) {
+            const v = r[1]; return (v === null || v === undefined) ? '' : String(v).trim();
+          }
+        }
+        return '';
+      };
+      const nm = get(lab);
+      if (nm) out.agents.push({ name: nm, pct: null });
+    });
+  }
+  return out;
 }
 
 // Pull {name, taxId} from uploaded W-9 PDFs so agent rows can carry tax IDs.
@@ -2359,15 +2391,45 @@ function matchCompanyCode(companies, legalName) {
   return '';
 }
 
-function detectBillingMode(eins) {
-  const b = eins && eins[0] ? eins[0] : {};
-  const h = ((b.payrollFreq2 || '') + ' ' + (b.multiBatches || '') + ' ' + (b.payrollFreq || '')).toLowerCase();
-  if (/semi.monthly|semimonthly/.test(h)) return 'Semi-monthly';
-  if (/bi.weekly|biweekly/.test(h)) return 'Bi-weekly';
-  if (/(^|[^a-z])weekly/.test(h)) return 'Weekly';
-  if (/monthly/.test(h)) return 'Monthly';
-  return 'Semi-monthly';
+// Canonical payroll frequencies found in a free-text field.
+function modesIn(text) {
+  const h = ' ' + String(text || '').toLowerCase() + ' ';
+  const modes = [];
+  if (/semi[\s-]?monthly/.test(h)) modes.push('Semi-monthly');
+  if (/bi[\s-]?weekly/.test(h)) modes.push('Bi-weekly');
+  const t = h.replace(/semi[\s-]?monthly/g, ' ').replace(/bi[\s-]?weekly/g, ' ');
+  if (/weekly/.test(t)) modes.push('Weekly');
+  if (/monthly/.test(t)) modes.push('Monthly');
+  return modes;
 }
+
+// Payroll frequencies for one EIN block ('same' inherits EIN #1's value).
+function einModes(ein, first) {
+  const get = function (v, fb) { return /^same$/i.test(String(v || '').trim()) ? fb : v; };
+  const f = first || ein;
+  const modes = [];
+  [get(ein.payrollFreq, f.payrollFreq), get(ein.payrollFreq2, f.payrollFreq2), get(ein.payrollFreq3, f.payrollFreq3)]
+    .forEach(function (txt) {
+      modesIn(txt).forEach(function (m) { if (modes.indexOf(m) === -1) modes.push(m); });
+    });
+  return modes;
+}
+
+const SOLUTA_PERIODS = { 'Weekly': 52, 'Bi-weekly': 26, 'Semi-monthly': 24, 'Monthly': 12 };
+
+// Referral-fee-calculator math from the commission sheet:
+// per-period admin fee = totalCommission * 12 / periodsPerYear; each payee
+// gets that times their commission percentage.
+function solutaPepm(comm, mode) {
+  const periods = SOLUTA_PERIODS[mode] || 24;
+  const total = comm.totalCommission;
+  const money = function (pct) {
+    if (!(total > 0) || pct === null || pct === undefined) return '';
+    return '$' + (Math.round(total * 12 / periods * pct * 100) / 100).toFixed(2);
+  };
+  return { agencyAmt: money(comm.agencyPct), money: money };
+}
+
 
 function escXml(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -2403,16 +2465,33 @@ function fillSolutaDocx(blankBuffer, data) {
     while ((mm = re.exec(trXml)) !== null) cells.push(mm[0]);
     return cells;
   };
-  const setCellText = function (tcXml, text) {
-    const pr = tcXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/);
-    const tcPr = pr ? pr[0] : '';
+  const cellTextOf = function (tcXml) {
+    let out = '';
+    const re = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
+    let mm;
+    while ((mm = re.exec(tcXml)) !== null) out += mm[1];
+    return out.replace(/&(amp|lt|gt|quot);/g, function (e) { return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"' }[e]; });
+  };
+  const setCellText = function (tcXml, text, highlight) {
+    let tcPr = (tcXml.match(/<w:tcPr>[\s\S]*?<\/w:tcPr>/) || [''])[0];
+    if (highlight) {
+      const shd = '<w:shd w:val="clear" w:color="auto" w:fill="FFFF00"/>';
+      tcPr = tcPr ? tcPr.replace(/<\/w:tcPr>$/, shd + '</w:tcPr>') : '<w:tcPr>' + shd + '</w:tcPr>';
+    }
     const open = tcXml.match(/^<w:tc(\s[^>]*)?>/);
     return '<w:tc' + (open && open[1] ? open[1] : '') + '>' + tcPr +
       '<w:p><w:r><w:t xml:space="preserve">' + escXml(text) + '</w:t></w:r></w:p></w:tc>';
   };
+  // texts: array of strings or {t, hl}; cells without a spec are left as-is
   const setRowCells = function (trXml, texts) {
     const cells = cellsOf(trXml);
-    const out = cells.map(function (c, i) { return setCellText(c, texts[i] !== undefined ? texts[i] : ''); });
+    const out = cells.map(function (c, i) {
+      if (i >= texts.length) return c;
+      const spec = texts[i];
+      const t = (spec && typeof spec === 'object') ? spec.t : spec;
+      const hl = !!(spec && typeof spec === 'object' && spec.hl);
+      return setCellText(c, t === undefined || t === null ? '' : t, hl);
+    });
     return trXml.replace(/<w:tc[\s\S]*?<\/w:tc>/g, function () { return out.shift(); });
   };
   const buildTable = function (tblXml, newRows) {
@@ -2432,7 +2511,7 @@ function fillSolutaDocx(blankBuffer, data) {
   let tM;
   while ((tM = tRe.exec(labelTc)) !== null) labelText += tM[1];
   labelText = labelText.replace(/&(amp|lt|gt|quot);/g, function (e) { return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"' }[e]; });
-  r0[0] = setRowCells(r0[0], [labelText, data.groupName || '']);
+  r0[0] = setRowCells(r0[0], [labelText, { t: data.groupName || '', hl: !data.groupName }]);
   newTables[0] = buildTable(tables[0].xml, r0);
 
   // Table 1: locations (header + data rows; clone last row if more locations)
@@ -2441,19 +2520,25 @@ function fillSolutaDocx(blankBuffer, data) {
   const locRows = [r1[0]];
   data.locations.forEach(function (loc, i) {
     const src = r1[1 + i] || tmplRow;
-    locRows.push(setRowCells(src, [loc.name, loc.ein, loc.groupId, loc.notes]));
+    locRows.push(setRowCells(src, [
+      { t: loc.name, hl: !loc.name },
+      { t: loc.ein, hl: !loc.ein },
+      { t: loc.groupId, hl: !loc.groupId },
+      loc.notes || ''
+    ]));
   });
   newTables[1] = buildTable(tables[1].xml, locRows);
 
   // Table 2: contacts
   let r2 = rowsOf(tables[2].xml);
   const contactRows = [r2[0]];
-  const mkContact = function (srcRow, type, name, phone, email) {
-    return setRowCells(srcRow, [type, name || '', phone || '', email || '', mode]);
+  const mkContact = function (srcRow, type, name, phone, email, hl) {
+    hl = hl || {};
+    return setRowCells(srcRow, [type, { t: name || '', hl: !!hl.name }, phone || '', { t: email || '', hl: !!hl.email }, mode]);
   };
-  contactRows.push(mkContact(r2[1], 'Primary Contact', data.primary.name, '', data.primary.email));
-  contactRows.push(mkContact(r2[2], 'Billing Contact', data.billing.name, '', data.billing.email));
-  contactRows.push(mkContact(r2[3], 'Broker Producer', data.brokerProducer.name, '', ''));
+  contactRows.push(mkContact(r2[1], 'Primary Contact', data.primary.name, '', data.primary.email, { name: !data.primary.name, email: !data.primary.email }));
+  contactRows.push(mkContact(r2[2], 'Billing Contact', data.billing.name, '', data.billing.email, { name: !data.billing.name, email: !data.billing.email }));
+  contactRows.push(mkContact(r2[3], 'Broker Producer', data.brokerProducer.name, '', '', { name: !data.brokerProducer.name, email: true }));
   contactRows.push(r2[4]); // Broker Account Manager stays as-is (blank)
   const otherTmpl = r2[4];
   contactRows.push(setRowCells(otherTmpl, ['Other', '', '', '', '']));
@@ -2463,13 +2548,18 @@ function fillSolutaDocx(blankBuffer, data) {
   // Table 3: PEPM rows. Row 1 (agency starter row from the template) is kept as-is;
   // agent rows fill the blank rows below, cloning if there are more agents.
   let r3 = rowsOf(tables[3].xml);
-  const pepmRows = [r3[0], r3[1]];
+  const pepmRows = [r3[0]];
+  // Agency starter row from the template: keep its payee text, set the computed amount.
+  const agencyCells = cellsOf(r3[1]);
+  const tplSuffix = (cellTextOf(agencyCells[1]).split('/')[1] || '').trim();
+  const modeSuffix = (mode === 'Semi-monthly' && tplSuffix) ? tplSuffix : mode.toLowerCase();
+  const amtText = function (amt) { return (amt || ('$5.00/' + modeSuffix)) + (amt && amt.indexOf('/') === -1 ? '/' + modeSuffix : ''); };
+  pepmRows.push(setRowCells(r3[1], [{ t: cellTextOf(agencyCells[0]) }, { t: amtText(data.agencyAmt), hl: !data.agencyAmt }]));
   const pepmTmpl = r3[r3.length - 1];
-  const modeSuffix = mode.toLowerCase();
   data.agents.forEach(function (a, i) {
     const src = r3[2 + i] || pepmTmpl;
     const who = a.name + (a.taxId ? ' \u2013 ' + a.taxId : '');
-    pepmRows.push(setRowCells(src, [who, '$5.00/' + modeSuffix]));
+    pepmRows.push(setRowCells(src, [{ t: who, hl: !a.taxId }, { t: amtText(a.amount), hl: !a.amount }]));
   });
   newTables[3] = buildTable(tables[3].xml, pepmRows);
 
@@ -2914,10 +3004,16 @@ app.post('/api/onboarding/:id/generate-soluta', requireOnboarder, async (req, re
     const comm = extractCommission(byType.commission_sheet[0].file_data);
     const w9s = await extractW9TaxIds(byType.w9 || []);
     const coRes = await db.query('SELECT company_code, company_name FROM companies');
-    let mode = req.body && req.body.billingMode ? String(req.body.billingMode) : 'auto';
-    if (mode === 'auto' || ['Weekly', 'Bi-weekly', 'Semi-monthly', 'Monthly'].indexOf(mode) === -1) {
-      mode = detectBillingMode(eins);
-    }
+
+    // One form per payroll frequency: an EIN goes on every form whose
+    // frequency it pays. EINs with no detectable frequency go on all forms.
+    const firstEin = eins[0] || {};
+    const einModesList = eins.map(function (e) { return einModes(e, firstEin); });
+    let modes = [];
+    einModesList.forEach(function (ms) { ms.forEach(function (m) { if (modes.indexOf(m) === -1) modes.push(m); }); });
+    const only = req.body && req.body.billingMode ? String(req.body.billingMode) : 'auto';
+    if (only !== 'auto' && SOLUTA_PERIODS[only]) modes = [only];
+    if (modes.length === 0) modes = [(only !== 'auto' && SOLUTA_PERIODS[only]) ? only : 'Semi-monthly'];
 
     const w9ByName = function (agentName) {
       const an = normCoName(agentName);
@@ -2927,47 +3023,48 @@ app.post('/api/onboarding/:id/generate-soluta', requireOnboarder, async (req, re
       }
       return '';
     };
-
     const first = function (vals) {
       for (const v of vals) { if (v) return v; }
       return '';
     };
-    const data = {
-      groupName: comm.groupName || (eins[0] && eins[0].legalName) || c.rows[0].client_name || '',
-      locations: eins.map(function (e) {
-        return {
-          name: e.legalName || '', ein: e.taxId || '',
-          groupId: matchCompanyCode(coRes.rows, e.legalName), notes: e.address || ''
-        };
-      }),
-      primary: { name: first(eins.map(function (e) { return e.signerName; })), email: first(eins.map(function (e) { return e.signerEmail; })) },
-      billing: { name: first(eins.map(function (e) { return e.billingContact; })), email: first(eins.map(function (e) { return e.billingEmail; })) },
-      brokerProducer: { name: comm.agents[0] || '' },
-      agents: comm.agents.map(function (a) { return { name: a, taxId: w9ByName(a) }; }),
-      mode: mode
-    };
-
-    const filled = fillSolutaDocx(fr.rows[0].file_data, data);
-    const safeGroup = (data.groupName || 'Client').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'Client';
-    const now = new Date();
-    const fileName = safeGroup + '_' + mode.replace(/-/g, '') + '_Billing_Intake_Form_' + (now.getMonth() + 1) + '.' + now.getDate() + '.' + now.getFullYear() + '.docx';
+    const groupName = comm.groupName || (eins[0] && eins[0].legalName) || c.rows[0].client_name || '';
 
     await db.query("DELETE FROM onboarding_documents WHERE client_id = $1 AND doc_type = 'soluta_billing_intake'", [req.params.id]);
-    const ins = await db.query(
-      "INSERT INTO onboarding_documents (client_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, 'soluta_billing_intake', $2, $3, $4, $5) RETURNING id",
-      [req.params.id, fileName,
-       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-       filled, req.user.id]);
-    res.json({ ok: true, docId: ins.rows[0].id, fileName: fileName });
+    const files = [];
+    for (const mode of modes) {
+      const pepm = solutaPepm(comm, mode);
+      const locs = [];
+      eins.forEach(function (e, i) {
+        const ms = einModesList[i];
+        if (ms.length !== 0 && ms.indexOf(mode) === -1) return;
+        locs.push({
+          name: e.legalName || '', ein: e.taxId || '',
+          groupId: matchCompanyCode(coRes.rows, e.legalName), notes: e.address || ''
+        });
+      });
+      const data = {
+        groupName: groupName,
+        locations: locs,
+        primary: { name: first(eins.map(function (e) { return e.signerName; })), email: first(eins.map(function (e) { return e.signerEmail; })) },
+        billing: { name: first(eins.map(function (e) { return e.billingContact; })), email: first(eins.map(function (e) { return e.billingEmail; })) },
+        brokerProducer: { name: comm.agents[0] ? comm.agents[0].name : '' },
+        agencyAmt: pepm.agencyAmt,
+        agents: comm.agents.map(function (a) { return { name: a.name, taxId: w9ByName(a.name), amount: pepm.money(a.pct) }; }),
+        mode: mode
+      };
+      const filled = fillSolutaDocx(fr.rows[0].file_data, data);
+      const safeGroup = groupName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'Client';
+      const now = new Date();
+      const fileName = safeGroup + '_' + mode.replace(/-/g, '') + '_Billing_Intake_Form_' + (now.getMonth() + 1) + '.' + now.getDate() + '.' + now.getFullYear() + '.docx';
+      const ins = await db.query(
+        "INSERT INTO onboarding_documents (client_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, 'soluta_billing_intake', $2, $3, $4, $5) RETURNING id",
+        [req.params.id, fileName,
+         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+         filled, req.user.id]);
+      files.push({ docId: ins.rows[0].id, fileName: fileName, mode: mode, locations: locs.length });
+    }
+    res.json({ ok: true, files: files });
   } catch (error) { console.error('Soluta generate error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
-});
-
-// Delete a whole onboarding client card.
-app.delete('/api/onboarding/:id', requireOnboarder, async (req, res) => {
-  try {
-    await getPool().query('DELETE FROM onboarding_clients WHERE id = $1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (error) { console.error('Onboarding delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)

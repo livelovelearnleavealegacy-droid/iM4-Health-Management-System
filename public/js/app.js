@@ -1445,34 +1445,30 @@ function viewOnboardingDetail(id) {
     function load() {
       api.get('/api/onboarding/' + id).then(function (c) {
         var inProg = c.status === 'in_progress';
-        var solutaDoc = null;
-        for (var sdi = 0; sdi < c.documents.length; sdi++) {
-          if (c.documents[sdi].doc_type === 'soluta_billing_intake') { solutaDoc = c.documents[sdi]; break; }
-        }
+        var solutaDocs = c.documents.filter(function (d) { return d.doc_type === 'soluta_billing_intake'; });
         var hasPre = c.documents.some(function (d) { return d.doc_type === 'pre_implementation'; });
         var hasComm = c.documents.some(function (d) { return d.doc_type === 'commission_sheet'; });
         var solutaHtml = '';
+        var solutaList = solutaDocs.length ? solutaDocs.map(function (d) {
+          return '<div class="ob-doc"><span>' + esc(d.file_name) + '</span> ' +
+            '<span class="muted">' + fmtDate(d.uploaded_at) + '</span> ' +
+            '<button class="btn btn-link" data-solutadl="' + d.id + '" data-fn="' + esc(d.file_name) + '">Download</button></div>';
+        }).join('') : '<p class="muted">No Soluta forms generated yet.</p>';
         if (inProg) {
-          if (solutaDoc) {
-            solutaHtml += '<p><button class="btn btn-link" data-solutadl="' + solutaDoc.id + '" data-fn="' + esc(solutaDoc.file_name) + '">Download generated form</button> ' +
-              '<span class="muted">' + fmtDate(solutaDoc.uploaded_at) + '</span></p>';
-          } else {
-            solutaHtml += '<p class="muted">No Soluta form generated yet.</p>';
-          }
+          solutaHtml += solutaList;
           if (hasPre && hasComm) {
-            solutaHtml += '<p><label>Billing mode: <select id="solutamode">' +
-              '<option value="auto" selected>Auto-detect from payroll form</option>' +
-              ['Weekly', 'Bi-weekly', 'Semi-monthly', 'Monthly'].map(function (mo) { return '<option value="' + mo + '">' + mo + '</option>'; }).join('') +
+            solutaHtml += '<p><label>Payroll frequencies: <select id="solutamode">' +
+              '<option value="auto" selected>All detected payroll frequencies</option>' +
+              ['Weekly', 'Bi-weekly', 'Semi-monthly', 'Monthly'].map(function (mo) { return '<option value="' + mo + '">' + mo + ' only</option>'; }).join('') +
               '</select></label> ' +
-              '<button class="btn btn-primary" id="solutagen">' + (solutaDoc ? 'Regenerate' : 'Generate') + ' Soluta Billing Intake Form</button></p>' +
+              '<button class="btn btn-primary" id="solutagen">' + (solutaDocs.length ? 'Regenerate' : 'Generate') + ' Soluta Billing Intake Forms</button></p>' +
+              '<p class="muted">One form is generated per payroll frequency, each listing only the EINs paid on that frequency. Yellow cells need a human to fill them in.</p>' +
               '<div id="solutamsg"></div>';
           } else {
             solutaHtml += '<p class="muted">Upload the Pre-Implementation Form and the Commission Sheet to enable generation.</p>';
           }
         } else {
-          solutaHtml = solutaDoc
-            ? '<p><button class="btn btn-link" data-solutadl="' + solutaDoc.id + '" data-fn="' + esc(solutaDoc.file_name) + '">Download Soluta Billing Intake Form</button></p>'
-            : '<p class="muted">No Soluta form was generated.</p>';
+          solutaHtml = solutaList;
         }
         function docRow(d) {
           return '<div class="ob-doc"><span>' + esc(d.file_name) + '</span> ' +
@@ -1560,10 +1556,11 @@ function viewOnboardingDetail(id) {
         var sg = document.getElementById('solutagen');
         if (sg) sg.onclick = function () {
           var mode = document.getElementById('solutamode').value;
-          if (!confirm('Generate the Soluta Billing Intake Form from the uploaded documents?')) return;
+          if (!confirm('Generate the Soluta Billing Intake Form(s) from the uploaded documents? One form is created per payroll frequency.')) return;
           document.getElementById('solutamsg').innerHTML = '<p class="muted">Generating...</p>';
-          api.post('/api/onboarding/' + id + '/generate-soluta', { billingMode: mode }).then(function () {
-            window._solutaMsg = 'Generated and saved with the client documents.';
+          api.post('/api/onboarding/' + id + '/generate-soluta', { billingMode: mode }).then(function (r) {
+            var names = (r.files || []).map(function (f) { return f.fileName + ' (' + f.locations + ' EINs)'; }).join(', ');
+            window._solutaMsg = 'Generated ' + (r.files || []).length + ' form(s): ' + names;
             load();
           }).catch(function (err) { document.getElementById('solutamsg').innerHTML = errorHtml(err.message); });
         };
