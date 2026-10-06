@@ -220,6 +220,7 @@ async function migrate() {
     ['companies', 'payroll_not_enrolled', 'INT'],
     ['companies', 'payroll_new_qualified', 'INT'],
     ['companies', 'payroll_dataset_date', 'DATE'],
+    ['companies', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE'],
     ['implementations', 'github_item_id', 'TEXT UNIQUE'],
     ['implementations', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['implementations', 'updated_at', 'TIMESTAMPTZ DEFAULT NOW()'],
@@ -834,6 +835,8 @@ app.get('/api/clients', requireAuth, async (req, res) => {
         ' OR LOWER(COALESCE(c.parent_company_code, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
+    const activeWhere = 'c.active IS NOT FALSE';
+    where = where ? where + ' AND ' + activeWhere : 'WHERE ' + activeWhere;
     const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort('c'), params);
     const groups = groupParents(r.rows);
     // v5.3: attach open invoice count/total per company_code.
@@ -1035,22 +1038,24 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       coWhere = 'WHERE c.id = ANY($1)';
       coParams.push(ids);
     }
-    const tc = await db.query('SELECT COUNT(*)::int AS c FROM companies c ' + coWhere, coParams);
+    const coActive = coWhere ? coWhere + ' AND c.active IS NOT FALSE' : 'WHERE c.active IS NOT FALSE';
+    const tc = await db.query('SELECT COUNT(*)::int AS c FROM companies c ' + coActive, coParams);
     const tl = await db.query(
       'SELECT COALESCE(SUM(COALESCE(c.payroll_qualified, c.payroll_total - COALESCE(c.payroll_ineligible, 0) - COALESCE(c.payroll_opted_out, 0))), 0)::int AS t ' +
-      'FROM companies c ' + coWhere, coParams);
+      'FROM companies c ' + coActive, coParams);
     // v5.4: Total Enrolled = sum of payroll_enrolled across each company's latest payroll.
     const te = await db.query(
-      'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t FROM companies c ' + coWhere, coParams);
+      'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t FROM companies c ' + coActive, coParams);
     let stWhere = '';
     const stParams = [];
     if (ids) {
       stWhere = 'WHERE c.id = ANY($1)';
       stParams.push(ids);
     }
+    const stActive = stWhere ? stWhere + ' AND c.active IS NOT FALSE' : 'WHERE c.active IS NOT FALSE';
     const st = await db.query(
       'SELECT i.stage AS stage, COUNT(*)::int AS count FROM implementations i ' +
-      'JOIN companies c ON c.id = i.company_id ' + stWhere + ' GROUP BY i.stage ORDER BY i.stage', stParams);
+      'JOIN companies c ON c.id = i.company_id ' + stActive + ' GROUP BY i.stage ORDER BY i.stage', stParams);
     let billingOpen = { count: 0, total: 0 };
     let billingPaid = { count: 0, total: 0 };
     if (codes === null || codes.length > 0) {
@@ -1060,9 +1065,10 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         bWhere = 'WHERE company_code = ANY($1)';
         bParams.push(codes);
       }
+      const bActive = "NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.active = FALSE)";
       const b = await db.query(
         "SELECT status, COUNT(*)::int AS count, COALESCE(SUM(total_invoice), 0)::float AS total FROM invoices " +
-        bWhere + ' GROUP BY status', bParams);
+        (bWhere ? bWhere + ' AND ' + bActive : 'WHERE ' + bActive) + ' GROUP BY status', bParams);
       b.rows.forEach(function (x) {
         if (x.status === 'open') billingOpen = { count: x.count, total: x.total };
         if (x.status === 'paid') billingPaid = { count: x.count, total: x.total };
@@ -1071,7 +1077,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     // v5.3: total enrolled from the most recent payroll_dataset_date.
     let enrolledLast = { rows: [] };
     try {
-      let eWhere = 'WHERE c.payroll_dataset_date IS NOT NULL';
+      let eWhere = 'WHERE c.payroll_dataset_date IS NOT NULL AND c.active IS NOT FALSE';
       const eParams = [];
       if (ids) {
         eParams.push(ids);
@@ -1081,7 +1087,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t, MAX(c.payroll_dataset_date)::text AS d ' +
         'FROM companies c ' + eWhere + ' AND c.payroll_dataset_date = (' +
         'SELECT MAX(c2.payroll_dataset_date) FROM companies c2 ' +
-        (ids ? 'WHERE c2.id = ANY($1) AND c2.payroll_dataset_date IS NOT NULL' : 'WHERE c2.payroll_dataset_date IS NOT NULL') + ')',
+        (ids ? 'WHERE c2.id = ANY($1) AND c2.payroll_dataset_date IS NOT NULL AND c2.active IS NOT FALSE' : 'WHERE c2.payroll_dataset_date IS NOT NULL AND c2.active IS NOT FALSE') + ')',
         eParams);
     } catch (e) { console.error('Enrolled last payroll error:', e); }
     res.json({
@@ -1107,7 +1113,7 @@ app.get('/api/billing', requireAuth, async (req, res) => {
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
-    let where = 'WHERE status = $1';
+    let where = "WHERE status = $1 AND NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.active = FALSE)";
     const params = [status];
     const btype = req.query.type === 'F' || req.query.type === 'S' ? req.query.type : null;
     if (btype) {
@@ -1477,11 +1483,16 @@ function ftjInferMode(history) {
 // Derive unpaid-bill estimates: for each F account, project expected payroll
 // dates after its last paid bill through today; copy lives/total from the
 // last paid bill. Skips dates that already have any F bill.
-async function estimateUnpaidBills(db) {
+async function estimateUnpaidBills(db, maxStaleDays) {
+  maxStaleDays = parseInt(maxStaleDays, 10);
+  if (isNaN(maxStaleDays) || maxStaleDays < 0) maxStaleDays = 90;
   const paid = await db.query(
     "SELECT company_code, company_name, payroll_date, bill_mode, lives_count, total_invoice " +
     "FROM invoices WHERE bill_type = 'F' AND status = 'paid' AND payroll_date IS NOT NULL " +
     "ORDER BY company_code, payroll_date");
+  const inactive = await db.query("SELECT company_code FROM companies WHERE active = FALSE");
+  const inactiveSet = {};
+  inactive.rows.forEach(function (r) { inactiveSet[r.company_code] = true; });
   const all = await db.query("SELECT company_code, payroll_date FROM invoices WHERE bill_type = 'F' AND payroll_date IS NOT NULL");
   const have = {};
   all.rows.forEach(function (r) {
@@ -1495,10 +1506,15 @@ async function estimateUnpaidBills(db) {
   });
   const today = new Date().toISOString().slice(0, 10);
   const accounts = [];
+  let skippedStale = 0;
+  let skippedInactive = 0;
   Object.keys(byAcct).sort().forEach(function (code) {
     const rows = byAcct[code];
     const last = rows[rows.length - 1];
     const lastISO = new Date(last.payroll_date).toISOString().slice(0, 10);
+    if (inactiveSet[code]) { skippedInactive++; return; }
+    const staleDays = Math.round((new Date(today + 'T00:00:00Z') - new Date(lastISO + 'T00:00:00Z')) / 86400000);
+    if (staleDays > maxStaleDays) { skippedStale++; return; }
     const history = rows.map(function (x) { return new Date(x.payroll_date).toISOString().slice(0, 10); });
     const mc = {};
     rows.forEach(function (x) { const mm = String(x.bill_mode || '').toUpperCase(); if (mm) mc[mm] = (mc[mm] || 0) + 1; });
@@ -1509,6 +1525,7 @@ async function estimateUnpaidBills(db) {
     });
     if (dates.length === 0) return;
     accounts.push({
+      stale_days: staleDays,
       company_code: code,
       company_name: last.company_name,
       frequency: FTJ_MODE_NAMES[mode] || mode || 'unknown',
@@ -1519,22 +1536,25 @@ async function estimateUnpaidBills(db) {
       estimates: dates
     });
   });
-  return accounts;
+  return { accounts: accounts, skipped_stale: skippedStale, skipped_inactive: skippedInactive, max_stale_days: maxStaleDays };
 }
 
 app.post('/api/admin/jobs/ftj-estimate-preview', requireAdmin, async (req, res) => {
   try {
-    const accounts = await estimateUnpaidBills(getPool());
+    const maxStale = req.body && req.body.max_stale_days;
+    const r = await estimateUnpaidBills(getPool(), maxStale);
     let total = 0;
-    accounts.forEach(function (a) { total += a.estimates.length; });
-    res.json({ ok: true, total_estimates: total, accounts: accounts });
+    r.accounts.forEach(function (a) { total += a.estimates.length; });
+    res.json({ ok: true, total_estimates: total, accounts: r.accounts,
+      skipped_stale: r.skipped_stale, skipped_inactive: r.skipped_inactive, max_stale_days: r.max_stale_days });
   } catch (error) { console.error('FTJ estimate preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 app.post('/api/admin/jobs/ftj-estimate-create', requireAdmin, async (req, res) => {
   try {
     const db = getPool();
-    const accounts = await estimateUnpaidBills(db);
+    const r = await estimateUnpaidBills(db, req.body && req.body.max_stale_days);
+    const accounts = r.accounts;
     let created = 0, skipped = 0;
     for (const a of accounts) {
       for (const d of a.estimates) {
@@ -1551,6 +1571,14 @@ app.post('/api/admin/jobs/ftj-estimate-create', requireAdmin, async (req, res) =
     }
     res.json({ ok: true, created: created, skipped: skipped });
   } catch (error) { console.error('FTJ estimate create error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// Delete all open estimated bills (is_estimate). Real paid bills are never touched.
+app.post('/api/admin/jobs/ftj-estimate-clear', requireAdmin, async (req, res) => {
+  try {
+    const del = await getPool().query("DELETE FROM invoices WHERE is_estimate = TRUE AND status = 'open'");
+    res.json({ ok: true, deleted: del.rowCount });
+  } catch (error) { console.error('FTJ estimate clear error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- v5.9: delete bills (admin)
@@ -1807,8 +1835,16 @@ function validateImport(type, rows) {
       seen[key] = true;
       const eeCode = row.ee_company_code || row.parent_company_code;
       const eeName = row.ee_company_name || row.parent_company_name;
+      let active = true;
+      if (row.active !== undefined && row.active !== null && String(row.active).trim() !== '') {
+        const av = String(row.active).trim().toUpperCase();
+        if (['Y', 'YES', 'TRUE', '1'].indexOf(av) !== -1) active = true;
+        else if (['N', 'NO', 'FALSE', '0'].indexOf(av) !== -1) active = false;
+        else { e('active must be Y or N'); return; }
+      }
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
+        active: active,
         ee_company_code: eeCode ? String(eeCode).trim() : null,
         ee_company_name: eeName ? String(eeName).trim() : null,
         payroll_total: num(row.payroll_total), payroll_ineligible: num(row.payroll_ineligible),
@@ -1902,17 +1938,17 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
       for (const c of v.valid) {
         try {
           await db.query(
-            'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, ' +
+            'INSERT INTO companies (company_code, company_name, active, ee_company_code, ee_company_name, ' +
             'payroll_total, payroll_ineligible, payroll_opted_out, ' +
             'payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
-            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ' +
-            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ' +
+            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, active = EXCLUDED.active, ' +
             'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
             'payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, ' +
             'payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_qualified = EXCLUDED.payroll_qualified, ' +
             'payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, ' +
             'payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
-            [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name,
+            [c.company_code, c.company_name, c.active, c.ee_company_code, c.ee_company_name,
               c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
               c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
           imported++;
