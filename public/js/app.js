@@ -1659,6 +1659,9 @@ function viewAdminJobs() {
           }
           out.innerHTML = '<h3>Validation</h3>' +
             okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
+            (d.skipped_companies && d.skipped_companies.length
+              ? '<p class="muted">Skipped ' + d.skipped_companies.length + ' companies not on the company list: ' + d.skipped_companies.map(esc).join(', ') + '</p>'
+              : '') +
             '<button class="btn btn-primary" id="imp-commissions-fileconfirm">Confirm import of ' + d.valid_count + ' rows</button>';
           document.getElementById('imp-commissions-fileconfirm').onclick = function () {
             out.innerHTML = '<p class="muted">Importing...</p>';
@@ -1697,6 +1700,9 @@ function viewAdminJobs() {
             }
             out.innerHTML = '<h3>Validation</h3><p class="muted">' + fmtMsg + '</p>' +
               okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
+              (d.skipped_companies && d.skipped_companies.length
+                ? '<p class="muted">Skipped ' + d.skipped_companies.length + ' companies not on the company list: ' + d.skipped_companies.map(esc).join(', ') + '</p>'
+                : '') +
               '<button class="btn btn-primary" id="imp-commissions-confirm">Confirm import of ' + d.valid_count + ' rows</button>';
             document.getElementById('imp-commissions-confirm').onclick = function () {
               out.innerHTML = '<p class="muted">Importing...</p>';

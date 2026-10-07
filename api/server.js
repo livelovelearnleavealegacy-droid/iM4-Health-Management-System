@@ -2559,13 +2559,15 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
     const valid = [];
     const seen = {};
     const perCompany = {};
+    const skippedCompanies = {};
     rows.map(normalizeRow).forEach(function (row, idx) {
       const line = idx + 2;
       const e = function (msg) { errors.push('Row ' + line + ': ' + msg); };
       const code = row.company_code ? String(row.company_code).trim() : '';
       const scRaw = row.steward_code ? String(row.steward_code).trim() : '';
       if (!code) { e('company_code is required'); return; }
-      if (!coMap[code]) { e('company ' + code + ' is not on the company list'); return; }
+      // Skip companies not on the company list — don't fail the whole import.
+      if (!coMap[code]) { skippedCompanies[code] = true; return; }
       if (!scRaw) { e('steward_code is required'); return; }
       const scId = parseInt(scRaw, 10);
       if (isNaN(scId) || scId <= 0) { e('steward_code "' + scRaw + '" must be a Steward ID number'); return; }
@@ -2598,8 +2600,9 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
       return res.json({ success: false, errors: errors });
     }
     const companyCount = Object.keys(perCompany).length;
+    const skipped = Object.keys(skippedCompanies).sort();
     if (dry_run !== false) {
-      return res.json({ success: true, dry_run: true, valid_count: valid.length, companies: companyCount, errors: [] });
+      return res.json({ success: true, dry_run: true, valid_count: valid.length, companies: companyCount, errors: [], skipped_companies: skipped });
     }
     for (const code of Object.keys(perCompany)) {
       await db.query('DELETE FROM commissions WHERE company_code = $1', [code]);
@@ -2612,7 +2615,7 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
         [v.company_code, v.steward_code, v.pct]);
       imported++;
     }
-    res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [] });
+    res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [], skipped_companies: skipped });
   } catch (error) {
     console.error('Commission import error:', error);
     res.status(500).json({ error: 'Internal server error' });
