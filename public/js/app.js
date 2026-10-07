@@ -243,8 +243,8 @@ function shell(inner, active) {
       '<a class="btn btn-link" href="#/security">Security</a>' +
       '<button class="btn btn-link" id="signout">Sign out</button>'
     : '';
-  return '<header class="topbar">' + menu +
-    '<a class="brand" href="#" id="brandlink">' + logoHtml(34) + '<span class="brand-text">Management System</span></a>' +
+  return '<header class="topbar"><div class="topbar-left">' + menu + '</div>' +
+    '<a class="brand" href="#" id="brandlink">' + logoHtml(34) + '<span class="brand-text">Success Management System</span></a>' +
     '<div class="userbox">' + userBox + '</div></header>' +
     '<main class="main">' + inner + '</main>';
 }

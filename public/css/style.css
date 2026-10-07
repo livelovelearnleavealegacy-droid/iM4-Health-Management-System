@@ -94,6 +94,13 @@ a:hover { text-decoration: underline; }
   align-items: center;
   gap: 10px;
   color: #fff;
+  flex: 0 0 auto;
+}
+
+.topbar-left {
+  flex: 1;
+  display: flex;
+  align-items: center;
 }
 
 .brand:hover { text-decoration: none; }
@@ -107,7 +114,7 @@ a:hover { text-decoration: underline; }
   letter-spacing: 0.2px;
 }
 
-.userbox { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.userbox { flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .userbox .user-email { color: #fff; }
 .userbox .user-email em { font-style: normal; opacity: 0.75; }
 
