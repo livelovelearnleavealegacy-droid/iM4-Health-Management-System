@@ -1368,10 +1368,11 @@ function viewAdminJobs() {
         var html = '<p><b>' + s.bills + '</b> paid F bills across <b>' + s.accounts + '</b> accounts, ' +
           'modals ' + esc(s.modal_from) + ' to ' + esc(s.modal_to) + ', total <b>' + fmtMoney(s.total_invoice) + '</b> ' +
           '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
-        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th></tr></thead><tbody>' +
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>EIN</th><th>Pay Frequency</th><th>Payroll Start</th><th>Payroll End</th><th>Check Date</th><th>Lives</th><th>Total Invoice</th></tr></thead><tbody>' +
           r.sample.map(function (b) {
             return '<tr><td><b>' + esc(b.company_code) + '</b></td><td>' + esc(b.company_name) + '</td><td>' +
-              esc(b.payroll_date) + '</td><td>' + esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
+              esc(b.ein) + '</td><td>' + esc(b.bill_mode) + '</td><td>' + esc(b.payroll_date) + '</td><td>' +
+              esc(b.payroll_end_date) + '</td><td>' + esc(b.paid_date) + '</td><td>' + esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
           }).join('') + '</tbody></table></div>';
         html += '<p><button class="btn btn-primary" id="ftjimport">Import ' + s.bills + ' bills</button> ' +
           '<span class="muted">Adds new, updates changed, deletes F bills missing from the report.</span></p><div id="ftjimportout"></div>';
@@ -1444,10 +1445,12 @@ function viewAdminJobs() {
         var html = '<p><b>' + s.bills + '</b> S bills across <b>' + s.accounts + '</b> accounts ' +
           '(<b>' + s.paid + '</b> paid, <b>' + s.open + '</b> pending), total <b>' + fmtMoney(s.total_invoice) + '</b> ' +
           '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
-        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>Payroll Start</th><th>Status</th><th>Lives</th><th>Total</th></tr></thead><tbody>' +
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>EIN</th><th>Pay Frequency</th><th>Payroll Start</th><th>Payroll End</th><th>Check Date</th><th>Status</th><th>Lives</th><th>Total</th></tr></thead><tbody>' +
           r.sample.map(function (b) {
             return '<tr><td><b>' + esc(b.company_code) + '</b></td><td>' + esc(b.company_name) + '</td><td>' +
-              esc(b.payroll_date) + '</td><td>' + esc(b.status) + '</td><td>' + esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
+              esc(b.ein) + '</td><td>' + esc(b.bill_mode) + '</td><td>' + esc(b.payroll_date) + '</td><td>' +
+              esc(b.payroll_end_date) + '</td><td>' + esc(b.paid_date) + '</td><td>' + esc(b.status) + '</td><td>' +
+              esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
           }).join('') + '</tbody></table></div>';
         html += '<p><button class="btn btn-primary" id="solimport">Import ' + s.bills + ' bills</button> ' +
           '<span class="muted">Adds new, updates changed, deletes S bills missing from the report.</span></p><div id="solimportout"></div>';

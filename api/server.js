@@ -1387,11 +1387,13 @@ function parsePremiumApplied(buffer) {
       company_code: g.company_code,
       company_name: '',
       payroll_date: g.payroll_date,
+      payroll_end_date: null,
       bill_mode: g.bill_mode,
       total_invoice: Math.round(g.total_invoice * 100) / 100,
       admin_fees: Math.round(g.admin_fees * 100) / 100,
       lives_count: lives,
       paid_date: g.paid_date,
+      ein: null,
       bill_type: 'F'
     });
   }
