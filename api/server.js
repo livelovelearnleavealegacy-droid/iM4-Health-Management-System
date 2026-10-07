@@ -1292,6 +1292,7 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
 // Bill types: 'F' = FTJ (from the Premium Applied Report), 'S' = Soluta (later).
 const FTJ_PERIODS = { '1': 52, '2': 26, '3': 24, '4': 12, 'M': 12 };
 const ftjPreviewCache = new Map();
+const solPreviewCache = new Map();
 
 function ftjISODate(v) {
   if (v === null || v === undefined || v === '') return null;
@@ -1396,6 +1397,98 @@ function parsePremiumApplied(buffer) {
   return bills;
 }
 
+// Parse a Soluta iM4H Invoice Report workbook into S bills.
+// One row = one bill. Columns: IM4H_ID (company code), EIN, GroupName
+// (company name), PayrollStart, PayrollEnd, BillingMode, Status
+// (Paid/Due), GrandTotal, Enrolled (lives), RemitDate (paid date).
+// No estimating: the report carries both paid and pending bills.
+function parseSolutaReport(buffer) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  let headerIdx = -1;
+  let colIdx = null;
+  let dataRows = null;
+  for (const sn of wb.SheetNames) {
+    const ws = wb.Sheets[sn];
+    const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+    for (let i = 0; i < Math.min(arr.length, 25); i++) {
+      const r = arr[i] || [];
+      const up = r.map(function (c) { return String(c === null || c === undefined ? '' : c).toUpperCase().trim().replace(/\s+/g, ''); });
+      const idI = up.findIndex(function (c) { return c === 'IM4H_ID' || c === 'IM4HID'; });
+      const nameI = up.findIndex(function (c) { return c === 'GROUPNAME' || c === 'GROUP_NAME'; });
+      const psI = up.findIndex(function (c) { return c === 'PAYROLLSTART' || c === 'PAYROLL_START'; });
+      const stI = up.findIndex(function (c) { return c === 'STATUS'; });
+      const totI = up.findIndex(function (c) { return c === 'GRANDTOTAL' || c === 'GRAND_TOTAL'; });
+      if (idI !== -1 && psI !== -1 && stI !== -1 && totI !== -1) {
+        headerIdx = i;
+        colIdx = {
+          id: idI, name: nameI,
+          payrollStart: psI, payrollEnd: up.findIndex(function (c) { return c === 'PAYROLLEND' || c === 'PAYROLL_END'; }),
+          status: stI, total: totI,
+          billingMode: up.findIndex(function (c) { return c === 'BILLINGMODE' || c === 'BILLING_MODE'; }),
+          enrolled: up.findIndex(function (c) { return c === 'ENROLLED'; }),
+          remitDate: up.findIndex(function (c) { return c === 'REMITDATE' || c === 'REMIT_DATE'; }),
+          ein: up.findIndex(function (c) { return c === 'EIN'; })
+        };
+        dataRows = arr.slice(i + 1);
+        break;
+      }
+    }
+    if (dataRows) break;
+  }
+  if (!dataRows) throw new Error('Could not find the Soluta report columns (IM4H_ID / PayrollStart / Status / GrandTotal).');
+  const bills = [];
+  for (const r of dataRows) {
+    if (!r) continue;
+    const codeRaw = r[colIdx.id];
+    if (codeRaw === null || codeRaw === undefined || String(codeRaw).trim() === '') continue;
+    const company_code = String(codeRaw).trim();
+    const payroll_date = ftjISODate(r[colIdx.payrollStart]);
+    if (!payroll_date) continue;
+    const statusRaw = String(r[colIdx.status] || '').trim().toLowerCase();
+    let status;
+    if (statusRaw === 'paid') status = 'paid';
+    else if (statusRaw === 'due') status = 'open';
+    else continue;
+    let total = 0;
+    const tv = r[colIdx.total];
+    if (typeof tv === 'number' && isFinite(tv)) total = tv;
+    else if (tv !== null && tv !== undefined && String(tv).trim() !== '') {
+      const p = parseFloat(String(tv).replace(/[^0-9.\-]/g, ''));
+      if (!isNaN(p)) total = p;
+    }
+    let lives = null;
+    if (colIdx.enrolled !== -1) {
+      const ev = r[colIdx.enrolled];
+      if (typeof ev === 'number' && isFinite(ev)) lives = Math.round(ev);
+      else if (ev !== null && ev !== undefined && String(ev).trim() !== '') {
+        const p = parseInt(String(ev).replace(/[^0-9]/g, ''), 10);
+        if (!isNaN(p)) lives = p;
+      }
+    }
+    const company_name = colIdx.name !== -1 && r[colIdx.name] ? String(r[colIdx.name]).trim() : company_code;
+    const bill_mode = colIdx.billingMode !== -1 && r[colIdx.billingMode] ? String(r[colIdx.billingMode]).trim() : null;
+    const paid_date = status === 'paid' && colIdx.remitDate !== -1 ? ftjISODate(r[colIdx.remitDate]) : null;
+    bills.push({
+      company_code: company_code,
+      company_name: company_name,
+      payroll_date: payroll_date,
+      bill_mode: bill_mode,
+      total_invoice: Math.round(total * 100) / 100,
+      lives_count: lives,
+      status: status,
+      paid_date: paid_date,
+      bill_type: 'S',
+      is_estimate: false
+    });
+  }
+  bills.sort(function (a, b) {
+    return a.company_code < b.company_code ? -1 : a.company_code > b.company_code ? 1 :
+      (a.payroll_date < b.payroll_date ? -1 : 1);
+  });
+  return bills;
+}
+
 // Preview: upload the report, parse it, cache the bills, show stats + sample.
 app.post('/api/admin/jobs/ftj-preview', requireAdmin, handleUpload('file'), async (req, res) => {
   try {
@@ -1408,16 +1501,16 @@ app.post('/api/admin/jobs/ftj-preview', requireAdmin, handleUpload('file'), asyn
     coRes.rows.forEach(function (r) { coMap[String(r.company_code)] = r.company_name; });
     bills.forEach(function (b) { b.company_name = coMap[b.company_code] || b.company_code; });
     const crypto = require('crypto');
-    const token = crypto.randomBytes(16).toString('hex');
+    const previewToken = crypto.randomBytes(16).toString('hex');
     const now = Date.now();
     for (const [tk, v] of ftjPreviewCache) { if (v.expires < now) ftjPreviewCache.delete(tk); }
-    ftjPreviewCache.set(token, { bills: bills, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
+    ftjPreviewCache.set(previewToken, { bills: bills, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
     let total = 0;
     const accounts = {};
     bills.forEach(function (b) { total += b.total_invoice; accounts[b.company_code] = true; });
     res.json({
       ok: true,
-      token: token,
+      preview_token: previewToken,
       stats: {
         bills: bills.length,
         accounts: Object.keys(accounts).length,
@@ -1435,10 +1528,10 @@ app.post('/api/admin/jobs/ftj-preview', requireAdmin, handleUpload('file'), asyn
 // Adds new, updates changed, deletes F bills missing from the report.
 app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
   try {
-    const token = req.body && req.body.token;
-    const cached = token ? ftjPreviewCache.get(token) : null;
+    const previewToken = req.body && req.body.preview_token;
+    const cached = previewToken ? ftjPreviewCache.get(previewToken) : null;
     if (!cached || cached.expires < Date.now()) {
-      if (token) ftjPreviewCache.delete(token);
+      if (previewToken) ftjPreviewCache.delete(previewToken);
       return res.status(400).json({ error: 'Preview expired. Upload the report again.' });
     }
     const bills = cached.bills;
@@ -1480,7 +1573,7 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
         deleted++;
       }
     }
-    ftjPreviewCache.delete(token);
+    ftjPreviewCache.delete(previewToken);
     res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
   } catch (error) { console.error('FTJ import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
@@ -1671,34 +1764,129 @@ app.post('/api/admin/jobs/ftj-estimate-clear', requireAdmin, async (req, res) =>
   } catch (error) { console.error('FTJ estimate clear error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
-// ---------------------------------------------------------------- Soluta billing (S): report inspector
-// Parses an uploaded Soluta report and returns its structure (sheets, headers,
-// sample rows) so the column mapping can be confirmed before building the import.
+// ---------------------------------------------------------------- Soluta billing (S): report import
+// The Soluta report carries both paid and pending bills — no estimating.
+// Preview parses and caches; import adds new, updates changed, and deletes
+// S bills missing from the report.
 app.post('/api/admin/jobs/sol-preview', requireAdmin, handleUpload('file'), async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
-    const name = (req.file.originalname || '').toLowerCase();
-    let sheets = [];
-    if (name.endsWith('.csv')) {
-      const text = req.file.buffer.toString('utf-8');
-      const lines = text.split('\n').filter(function (l) { return l.trim(); }).slice(0, 6);
-      const rows = lines.map(function (l) { return l.split(',').map(function (c) { return c.trim().replace(/^"|"$/g, ''); }); });
-      sheets = [{ name: 'csv', headers: rows[0] || [], sample: rows.slice(1) }];
-    } else {
-      const XLSX = require('xlsx');
-      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-      sheets = wb.SheetNames.slice(0, 5).map(function (sn) {
-        const ws = wb.Sheets[sn];
-        const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
-        const headers = (arr[0] || []).map(function (h) { return h === null ? '' : String(h); });
-        const sample = arr.slice(1, 6).map(function (r) {
-          return r.map(function (c) { return c === null ? '' : String(c); });
-        });
-        return { name: sn, headers: headers, sample: sample, total_rows: arr.length };
-      });
-    }
-    res.json({ ok: true, file_name: req.file.originalname, sheets: sheets });
+    const bills = parseSolutaReport(req.file.buffer);
+    if (bills.length === 0) return res.status(400).json({ error: 'No bills found in this file' });
+    const db = getPool();
+    const coRes = await db.query('SELECT company_code, company_name FROM companies');
+    const coMap = {};
+    coRes.rows.forEach(function (r) { coMap[String(r.company_code)] = r.company_name; });
+    bills.forEach(function (b) { if (coMap[b.company_code]) b.company_name = coMap[b.company_code]; });
+    const crypto = require('crypto');
+    const previewToken = crypto.randomBytes(16).toString('hex');
+    const now = Date.now();
+    for (const [tk, v] of solPreviewCache) { if (v.expires < now) solPreviewCache.delete(tk); }
+        solPreviewCache.set(previewToken, { bills: bills, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
+    let total = 0, paid = 0, open = 0;
+    const accounts = {};
+    bills.forEach(function (b) {
+      total += b.total_invoice;
+      accounts[b.company_code] = true;
+      if (b.status === 'paid') paid++; else open++;
+    });
+    res.json({
+      ok: true,
+      preview_token: previewToken,
+      stats: {
+        bills: bills.length, accounts: Object.keys(accounts).length,
+        paid: paid, open: open, total_invoice: Math.round(total * 100) / 100,
+        file_name: req.file.originalname
+      },
+      sample: bills.slice(0, 10)
+    });
   } catch (error) { console.error('Soluta preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+app.post('/api/admin/jobs/sol-import', requireAdmin, async (req, res) => {
+  try {
+    const previewToken = req.body && req.body.preview_token;
+    const cached = previewToken ? solPreviewCache.get(previewToken) : null;
+    if (!cached || cached.expires < Date.now()) {
+      if (previewToken) solPreviewCache.delete(previewToken);
+      return res.status(400).json({ error: 'Preview expired. Upload the report again.' });
+    }
+    const bills = cached.bills;
+    const db = getPool();
+    const exRes = await db.query("SELECT * FROM invoices WHERE bill_type = 'S'");
+    const exMap = {};
+    exRes.rows.forEach(function (r) {
+      const pd = r.payroll_date ? new Date(r.payroll_date).toISOString().slice(0, 10) : '';
+      exMap[r.company_code + '|' + pd] = r;
+    });
+    let added = 0, updated = 0;
+    const seen = {};
+    for (const b of bills) {
+      const key = b.company_code + '|' + b.payroll_date;
+      seen[key] = true;
+      const ex = exMap[key];
+      const paidDate = b.paid_date || null;
+      if (ex) {
+        const exPaid = ex.paid_date ? new Date(ex.paid_date).toISOString().slice(0, 10) : null;
+        const same = !ex.is_estimate && String(ex.company_name) === String(b.company_name) &&
+          Number(ex.lives_count) === Number(b.lives_count) &&
+          Number(ex.total_invoice) === Number(b.total_invoice) &&
+          ex.status === b.status && exPaid === paidDate &&
+          String(ex.bill_mode || '') === String(b.bill_mode || '');
+        if (!same) {
+          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = $6, updated_at = NOW() WHERE id = $7',
+            [b.company_name, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null, ex.id]);
+          updated++;
+        }
+      } else {
+        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'S', $8)",
+          [b.company_code, b.company_name, b.payroll_date, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null]);
+        added++;
+      }
+    }
+    let deleted = 0;
+    for (const key of Object.keys(exMap)) {
+      if (!seen[key] && !exMap[key].is_estimate) {
+        await db.query('DELETE FROM invoices WHERE id = $1', [exMap[key].id]);
+        deleted++;
+      }
+    }
+    solPreviewCache.delete(previewToken);
+    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
+  } catch (error) { console.error('Soluta import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// Soluta template + export: same columns the import reads.
+app.get('/api/admin/jobs/sol-template', requireAdmin, async (req, res) => {
+  try {
+    const headers = ['IM4H_ID', 'EIN', 'GroupName', 'PayrollStart', 'PayrollEnd', 'BillingMode', 'Status', 'GrandTotal', 'Enrolled', 'RemitDate'];
+    res.set('Content-Type', 'text/csv');
+    res.set('Content-Disposition', 'attachment; filename="soluta-report-template.csv"');
+    res.send(headers.join(',') + '\n');
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/admin/jobs/sol-export', requireAdmin, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      "SELECT company_code AS \"IM4H_ID\", company_name AS \"GroupName\", " +
+      "TO_CHAR(payroll_date, 'YYYY-MM-DD') AS \"PayrollStart\", " +
+      "CASE WHEN status = 'paid' THEN 'Paid' ELSE 'Due' END AS \"Status\", " +
+      "total_invoice AS \"GrandTotal\", lives_count AS \"Enrolled\", bill_mode AS \"BillingMode\", " +
+      "TO_CHAR(paid_date, 'YYYY-MM-DD') AS \"RemitDate\" " +
+      "FROM invoices WHERE bill_type = 'S' ORDER BY company_code, payroll_date");
+    const headers = ['IM4H_ID', 'EIN', 'GroupName', 'PayrollStart', 'PayrollEnd', 'BillingMode', 'Status', 'GrandTotal', 'Enrolled', 'RemitDate'];
+    const lines = [headers.join(',')];
+    r.rows.forEach(function (row) {
+      lines.push(headers.map(function (h) {
+        const v = row[h] === null || row[h] === undefined ? '' : String(row[h]);
+        return v.indexOf(',') !== -1 || v.indexOf('"') !== -1 ? '"' + v.replace(/"/g, '""') + '"' : v;
+      }).join(','));
+    });
+    res.set('Content-Type', 'text/csv');
+    res.set('Content-Disposition', 'attachment; filename="soluta-bills-export.csv"');
+    res.send(lines.join('\n'));
+  } catch (error) { console.error('Soluta export error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- v5.9: delete bills (admin)

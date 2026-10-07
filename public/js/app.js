@@ -1112,15 +1112,17 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">FTJ billing (F): Premium Applied Report</div>' +
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
-      '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div></div>' +
+      '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div>' +
       '<hr><p class="muted"><b>Unpaid estimates.</b> Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
       '<label>Only accounts paid within the last <input id="ftjestdays" type="number" value="90" min="1" max="3650" style="width: 70px;"> days</label> ' +
       '<button class="btn btn-primary" id="ftjest">Preview estimates</button> ' +
       '<button class="btn btn-small" id="ftjestclear">Delete all estimates</button><div id="ftjestout"></div></div>' +
       '<div class="card"><div class="card-title">Soluta billing (S): Soluta report</div>' +
-      '<p class="muted">Upload the Soluta report spreadsheet. It contains both paid and pending S bills \u2014 no estimating. Preview the bills first, then import.</p>' +
+      '<p class="muted">Upload the Soluta iM4H Invoice Report spreadsheet. It contains both paid and pending S bills \u2014 no estimating. Preview the bills first, then import to add new, update changed, and delete S bills missing from the report.</p>' +
       '<input type="file" id="solfile" accept=".xlsx,.xls,.csv"> ' +
-      '<button class="btn btn-primary" id="solpreview">Upload &amp; preview</button><div id="solout"></div></div>' +
+      '<button class="btn btn-primary" id="solpreview">Upload &amp; preview</button> ' +
+      '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
+      '<button class="btn btn-small" id="soldelexport">Export current S bills</button><div id="solout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
       '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
@@ -1362,7 +1364,7 @@ function viewAdminJobs() {
           if (!window.confirm('Import ' + s.bills + ' F bills? This adds new bills, updates changed ones, and deletes F bills not in the report.')) return;
           var iout = document.getElementById('ftjimportout');
           iout.innerHTML = '<p class="muted">Importing...</p>';
-          api.post('/api/admin/jobs/ftj-import', { token: r.token }).then(function (imp) {
+          api.post('/api/admin/jobs/ftj-import', { preview_token: r.preview_token }).then(function (imp) {
             iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
         };
@@ -1420,20 +1422,59 @@ function viewAdminJobs() {
       if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
       var fd = new FormData();
       fd.append('file', fi.files[0]);
-      out.innerHTML = '<p class="muted">Reading the report...</p>';
+      out.innerHTML = '<p class="muted">Parsing the Soluta report...</p>';
       uploadFile('/api/admin/jobs/sol-preview', fd).then(function (r) {
-        var html = '<p><b>' + esc(r.file_name) + '</b> <span class="muted">— confirm the column mapping below, then tell me and I will build the S import.</span></p>';
-        r.sheets.forEach(function (sh) {
-          html += '<h4>Sheet: ' + esc(sh.name) + (sh.total_rows ? ' <span class="muted">(' + sh.total_rows + ' rows)</span>' : '') + '</h4>';
-          html += '<div class="table-scroll"><table class="data-table"><thead><tr>' +
-            sh.headers.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') +
-            '</tr></thead><tbody>' +
-            sh.sample.map(function (row) {
-              return '<tr>' + row.map(function (c) { return '<td>' + esc(c) + '</td>'; }).join('') + '</tr>';
-            }).join('') + '</tbody></table></div>';
-        });
+        var s = r.stats;
+        var html = '<p><b>' + s.bills + '</b> S bills across <b>' + s.accounts + '</b> accounts ' +
+          '(<b>' + s.paid + '</b> paid, <b>' + s.open + '</b> pending), total <b>' + fmtMoney(s.total_invoice) + '</b> ' +
+          '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Code</th><th>Name</th><th>Payroll Start</th><th>Status</th><th>Lives</th><th>Total</th></tr></thead><tbody>' +
+          r.sample.map(function (b) {
+            return '<tr><td><b>' + esc(b.company_code) + '</b></td><td>' + esc(b.company_name) + '</td><td>' +
+              esc(b.payroll_date) + '</td><td>' + esc(b.status) + '</td><td>' + esc(b.lives_count) + '</td><td><b>' + fmtMoney(b.total_invoice) + '</b></td></tr>';
+          }).join('') + '</tbody></table></div>';
+        html += '<p><button class="btn btn-primary" id="solimport">Import ' + s.bills + ' bills</button> ' +
+          '<span class="muted">Adds new, updates changed, deletes S bills missing from the report.</span></p><div id="solimportout"></div>';
         out.innerHTML = html;
+        document.getElementById('solimport').onclick = function () {
+          if (!window.confirm('Import ' + s.bills + ' S bills? This adds new bills, updates changed ones, and deletes S bills not in the report.')) return;
+          var iout = document.getElementById('solimportout');
+          iout.innerHTML = '<p class="muted">Importing...</p>';
+          api.post('/api/admin/jobs/sol-import', { preview_token: r.preview_token }).then(function (imp) {
+            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
+          }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
+        };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
+    document.getElementById('soldltemplate').onclick = function () {
+      var headers = {};
+      if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+      fetch('/api/admin/jobs/sol-template', { headers: headers }).then(function (resp) {
+        if (!resp.ok) throw new Error('Download failed');
+        return resp.blob();
+      }).then(function (blob) {
+        var el = document.createElement('a');
+        el.href = URL.createObjectURL(blob);
+        el.download = 'soluta-report-template.csv';
+        document.body.appendChild(el);
+        el.click();
+        setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+      }).catch(function (err) { alert(err.message); });
+    };
+    document.getElementById('soldelexport').onclick = function () {
+      var headers = {};
+      if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+      fetch('/api/admin/jobs/sol-export', { headers: headers }).then(function (resp) {
+        if (!resp.ok) throw new Error('Download failed');
+        return resp.blob();
+      }).then(function (blob) {
+        var el = document.createElement('a');
+        el.href = URL.createObjectURL(blob);
+        el.download = 'soluta-bills-export.csv';
+        document.body.appendChild(el);
+        el.click();
+        setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+      }).catch(function (err) { alert(err.message); });
     };
     function wireImportCard(prefix, type) {
       document.getElementById('imp-' + prefix + '-go').onclick = function () {
