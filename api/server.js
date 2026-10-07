@@ -192,16 +192,21 @@ async function migrate() {
     await db.query('ALTER TABLE commissions ALTER COLUMN steward_code TYPE INTEGER USING steward_code::integer');
   }
   // One-time 2026-10-07: Leroy asked for two specific steward ID changes
-  // (Leroy McCarty -> 1000, Daylynne Ward -> 1010). Idempotent: matches by
-  // exact first+last name, requires exactly one match, and skips when the
-  // target ID is taken or already set. Runs inside migrate() because there
-  // is no other write path to the database from here.
+  // (Leroy McCarty -> 100000, Daylynne Ward -> 100100). Idempotent: matches
+  // by first+last name or the full name column (trimmed, case-insensitive),
+  // requires exactly one match, and skips when the target ID is taken or
+  // already set. Runs inside migrate() because there is no other write path
+  // to the database from here.
   async function renumberStewardOnce(firstName, lastName, newId) {
+    const fullName = firstName + ' ' + lastName;
     const found = await db.query(
-      'SELECT id FROM stewards WHERE LOWER(first_name) = LOWER($1) AND LOWER(last_name) = LOWER($2)',
-      [firstName, lastName]);
+      'SELECT id, first_name, last_name, name, email FROM stewards ' +
+      "WHERE (LOWER(TRIM(first_name)) = LOWER($1) AND LOWER(TRIM(last_name)) = LOWER($2)) " +
+      "OR LOWER(TRIM(name)) = LOWER($3)",
+      [firstName, lastName, fullName]);
     if (found.rows.length !== 1) {
-      console.log('Renumber skipped for ' + firstName + ' ' + lastName + ': found ' + found.rows.length + ' matching stewards');
+      console.log('Renumber skipped for ' + firstName + ' ' + lastName + ': found ' + found.rows.length + ' matching stewards ' +
+        JSON.stringify(found.rows.map(function (r) { return { id: r.id, email: r.email }; })));
       return;
     }
     const oldId = found.rows[0].id;
@@ -222,14 +227,14 @@ async function migrate() {
       await db.query('UPDATE stewards SET id = $1 WHERE id = $2', [newId, oldId]);
       await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
       await db.query('COMMIT');
-      console.log('Renumbered steward ' + firstName + ' ' + lastName + ': ' + oldId + ' -> ' + newId);
+      console.log('Renumbered steward ' + firstName + ' ' + lastName + ' (' + found.rows[0].email + '): ' + oldId + ' -> ' + newId);
     } catch (e) {
       await db.query('ROLLBACK');
       throw e;
     }
   }
-  await renumberStewardOnce('Leroy', 'McCarty', 1000);
-  await renumberStewardOnce('Daylynne', 'Ward', 1010);
+  await renumberStewardOnce('Leroy', 'McCarty', 100000);
+  await renumberStewardOnce('Daylynne', 'Ward', 100100);
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
