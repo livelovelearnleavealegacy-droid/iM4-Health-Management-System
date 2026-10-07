@@ -1074,16 +1074,19 @@ function viewAdminCompanies() {
       function parentCode(c) { return c.ee_company_code || c.parent_company_code; }
       function parentName(c) { return c.ee_company_name || c.parent_company_name; }
       var rows = list.map(function (c) {
-        var act = (c.active === false) ? '<b>No</b>' : 'Yes';
+        var isActive = c.active !== false;
+        var act = isActive ? 'Yes' : '<b>No</b>';
+        var toggleLabel = isActive ? 'Term' : 'Reinstate';
         return '<tr>' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
-          '<td>' + act + '</td>' +
+          '<td>' + act + ' <button class="btn btn-small" data-toggle-active="' + esc(c.company_code) + '" data-active-now="' + (isActive ? '1' : '0') + '">' + toggleLabel + '</button></td>' +
           cell(c.payroll_ineligible) + cell(c.payroll_enrolled) +
           '<td>' + (c.open_invoice_count || 0) + '</td><td><b>' + fmtMoney(c.open_invoice_total || 0) + '</b></td></tr>';
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
-        '<p class="muted">Companies are updated by CSV import only.</p>' +
+        '<p class="muted">Companies are updated by CSV import only. ' +
+        'Use "Term" / "Reinstate" to change the Active flag; termed companies keep their data but are hidden from steward views and billing.</p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>Company Name</th><th>Active</th>' +
         '<th colspan="2">Last Payroll</th><th colspan="2">Invoices outstanding</th></tr>' +
@@ -1091,6 +1094,25 @@ function viewAdminCompanies() {
         '<th>Ineligible</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>',
         '#/admin/companies'));
+      var tbtns = document.querySelectorAll('[data-toggle-active]');
+      for (var t = 0; t < tbtns.length; t++) {
+        (function (b) {
+          b.onclick = function () {
+            var code = b.getAttribute('data-toggle-active');
+            var nowActive = b.getAttribute('data-active-now') === '1';
+            var newActive = !nowActive;
+            var verb = newActive ? 'reinstate' : 'term';
+            if (!confirm((newActive ? 'Reinstate' : 'Term') + ' company ' + code + '? ' +
+              (newActive ? 'It will show up in steward views and billing again.'
+                         : 'Its data stays, but it will be hidden from steward views and billing.'))) return;
+            api.post('/api/admin/companies/' + encodeURIComponent(code) + '/active', { active: newActive }).then(function () {
+              viewAdminCompanies();
+            }).catch(function (err) {
+              alert('Could not ' + verb + ' company: ' + err.message);
+            });
+          };
+        })(tbtns[t]);
+      }
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/companies')); });
   });
 }
@@ -1149,7 +1171,7 @@ function parseCSV(text) {
 
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
-  companies: 'parent_code, parent_name, company_code, company_name. Headers are case-insensitive.',
+  companies: 'parent_code, parent_name, company_code, company_name, active (optional: Yes/No; blank leaves the current flag unchanged). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)',
   commissions: 'One line per company: company_code, then repeating steward_code, pct pairs (e.g. company_code,steward_code,pct,steward_code,pct). steward_code is the Steward ID from the stewards list. Up to 10 stewards per company; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'

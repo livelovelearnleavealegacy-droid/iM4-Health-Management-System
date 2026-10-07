@@ -1907,6 +1907,25 @@ app.get('/api/admin/companies', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
+// Set a company's active flag (admin/top dog). Termed companies keep all
+// their data but are hidden from steward views and billing.
+app.post('/api/admin/companies/:code/active', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const active = req.body && req.body.active;
+    if (!code) return res.status(400).json({ error: 'Company code is required' });
+    if (active !== true && active !== false) return res.status(400).json({ error: 'active must be true or false' });
+    const r = await getPool().query(
+      'UPDATE companies SET active = $1 WHERE company_code = $2 RETURNING company_code, active',
+      [active, code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Company not found' });
+    res.json({ success: true, company_code: r.rows[0].company_code, active: r.rows[0].active });
+  } catch (error) {
+    console.error('Admin set company active error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ---------------------------------------------------------------- admin: assignments (read-only list; import only)
 app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   try {
@@ -2004,10 +2023,18 @@ function validateImport(type, rows) {
       seen[key] = true;
       const parentCode = row.parent_code || row.ee_company_code || row.parent_company_code;
       const parentName = row.parent_name || row.ee_company_name || row.parent_company_name;
+      let active = null;
+      if (row.active !== undefined && row.active !== null && String(row.active).trim() !== '') {
+        const av = String(row.active).trim().toLowerCase();
+        if (['yes', 'y', 'true', '1', 'active'].indexOf(av) !== -1) active = true;
+        else if (['no', 'n', 'false', '0', 'inactive', 'termed', 'terminated'].indexOf(av) !== -1) active = false;
+        else { e('active must be Yes/No (got "' + row.active + '")'); return; }
+      }
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
         ee_company_code: parentCode ? String(parentCode).trim() : null,
-        ee_company_name: parentName ? String(parentName).trim() : null
+        ee_company_name: parentName ? String(parentName).trim() : null,
+        active: active
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
@@ -2093,12 +2120,22 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     } else if (type === 'companies') {
       for (const c of v.valid) {
         try {
-          await db.query(
-            'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name) ' +
-            'VALUES ($1,$2,$3,$4) ' +
-            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
-            'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name',
-            [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name]);
+          if (c.active === null || c.active === undefined) {
+            await db.query(
+              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name) ' +
+              'VALUES ($1,$2,$3,$4) ' +
+              'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name',
+              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name]);
+          } else {
+            await db.query(
+              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, active) ' +
+              'VALUES ($1,$2,$3,$4,$5) ' +
+              'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
+              'active = EXCLUDED.active',
+              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.active]);
+          }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
       }
@@ -2146,9 +2183,10 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       headers = ['steward_id', 'email', 'first_name', 'last_name', 'phone'];
       rows = (await db.query('SELECT id AS steward_id, email, first_name, last_name, phone FROM stewards ORDER BY id')).rows;
     } else if (type === 'companies') {
-      headers = ['parent_code', 'parent_name', 'company_code', 'company_name'];
+      headers = ['parent_code', 'parent_name', 'company_code', 'company_name', 'active'];
       rows = (await db.query(
-        'SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, company_name ' +
+        "SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, company_name, " +
+        "CASE WHEN active = FALSE THEN 'No' ELSE 'Yes' END AS active " +
         'FROM companies ORDER BY company_code')).rows;
     } else if (type === 'assignments') {
       headers = ['steward_id', 'company_code'];
