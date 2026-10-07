@@ -191,55 +191,8 @@ async function migrate() {
     await db.query("DELETE FROM commissions WHERE steward_code !~ '^[0-9]+$'");
     await db.query('ALTER TABLE commissions ALTER COLUMN steward_code TYPE INTEGER USING steward_code::integer');
   }
-  // One-time 2026-10-07: Leroy asked for two specific steward ID changes
-  // (hello@evolvedadministration.com -> 100000, daylynne@innovativehia.com
-  // -> 100100). Idempotent: matches by email (UNIQUE, so exactly one match
-  // or none). Uses a dedicated client so the copy/repoint/delete runs as
-  // one atomic transaction (pool.query would scatter statements across
-  // connections). Copy uses a temp email since email is UNIQUE; the real
-  // email is restored after the old row is deleted.
-  async function renumberStewardOnce(email, newId) {
-    const found = await db.query('SELECT id, email FROM stewards WHERE LOWER(email) = LOWER($1)', [email]);
-    if (found.rows.length !== 1) {
-      console.log('Renumber skipped for ' + email + ': found ' + found.rows.length + ' matching stewards');
-      return;
-    }
-    const oldId = found.rows[0].id;
-    if (oldId === newId) { console.log('Renumber: ' + email + ' already ID ' + newId); return; }
-    const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
-    if (taken.rows.length > 0) { console.log('Renumber skipped: ID ' + newId + ' already in use'); return; }
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
-        'reset_token, reset_expires, two_factor_enabled) ' +
-        "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
-        'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
-        [newId, oldId]);
-      await client.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
-      await client.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await client.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await client.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
-      await client.query('DELETE FROM stewards WHERE id = $1', [oldId]);
-      await client.query('UPDATE stewards SET email = $1 WHERE id = $2', [email, newId]);
-      await client.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
-      await client.query('COMMIT');
-      console.log('Renumbered steward ' + email + ': ' + oldId + ' -> ' + newId);
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
-  await renumberStewardOnce('hello@evolvedadministration.com', 100000);
-  await renumberStewardOnce('daylynne@innovativehia.com', 100100);
+  // One-time 2026-10-07: superseded by the manual Renumber button
+  // (POST /api/admin/stewards/:id/renumber). Kept as a no-op note.
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
@@ -1783,6 +1736,59 @@ app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   } catch (error) {
     console.error('Admin edit steward error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Renumber a steward's ID from the Stewards page. Copies the steward row to
+// the new ID (plain PK UPDATEs are impossible: FKs are not deferrable),
+// repoints all 8 referencing tables + commissions.steward_code, deletes the
+// old row, restores the email — one atomic transaction on a dedicated
+// client. If you renumber your own account, sign out and back in afterwards.
+app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const db = getPool();
+    const oldId = parseInt(req.params.id, 10);
+    const newId = parseInt(req.body && req.body.new_id, 10);
+    if (isNaN(oldId) || oldId <= 0) return res.status(400).json({ error: 'Invalid steward id' });
+    if (isNaN(newId) || newId <= 0) return res.status(400).json({ error: 'New ID must be a positive number' });
+    if (newId === oldId) return res.status(400).json({ error: 'New ID is the same as the current ID' });
+    const target = await db.query('SELECT id, email FROM stewards WHERE id = $1', [oldId]);
+    if (target.rows.length === 0) return res.status(404).json({ error: 'Steward not found' });
+    const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
+    if (taken.rows.length > 0) return res.status(400).json({ error: 'ID ' + newId + ' is already in use' });
+    const origEmail = target.rows[0].email;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
+        'reset_token, reset_expires, two_factor_enabled) ' +
+        "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
+        'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
+        [newId, oldId]);
+      await client.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
+      await client.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await client.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await client.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
+      await client.query('DELETE FROM stewards WHERE id = $1', [oldId]);
+      await client.query('UPDATE stewards SET email = $1 WHERE id = $2', [origEmail, newId]);
+      await client.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, old_id: oldId, new_id: newId });
+  } catch (error) {
+    console.error('Admin renumber steward error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
