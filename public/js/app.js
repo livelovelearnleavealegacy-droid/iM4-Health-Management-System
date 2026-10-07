@@ -467,40 +467,49 @@ function viewDashboard() {
 function viewBilling() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
-    var acctFilter = null; // null = all (first load checks every box)
+    var acctFilter = null;
     var typeFilter = '';
+    var statusFilter = '';
     function load() {
       api.get('/api/billing?status=open').then(function (openRows) {
         api.get('/api/billing?status=paid').then(function (paidRows) {
+          var allRows = openRows.concat(paidRows);
           var codeMap = {};
-          openRows.concat(paidRows).forEach(function (r) { codeMap[String(r.company_code)] = r.company_name; });
+          allRows.forEach(function (r) { codeMap[String(r.company_code)] = r.company_name; });
           var codes = Object.keys(codeMap).sort();
           if (acctFilter === null) acctFilter = codes.slice();
           function matches(r) {
             if (typeFilter && String(r.bill_type || 'F') !== typeFilter) return false;
+            if (statusFilter) {
+              var st = r.is_estimate ? 'estimated' : r.status;
+              if (st !== statusFilter) return false;
+            }
             if (acctFilter.indexOf(String(r.company_code)) === -1) return false;
             return true;
           }
-          var openF = openRows.filter(matches);
-          var paidF = paidRows.filter(matches);
+          var rows = allRows.filter(matches);
+          rows.sort(function (a, b) {
+            var ad = a.payroll_date || '', bd = b.payroll_date || '';
+            if (ad !== bd) return ad < bd ? 1 : -1;
+            return String(a.company_code) < String(b.company_code) ? -1 : 1;
+          });
           function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-          function panel(title, rows, showPaid) {
-            var head = '<tr><th>Type</th><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Lives</th><th>Total Invoice</th>' +
-              (showPaid ? '<th>Day Paid</th>' : '') + '</tr>';
-            var body = rows.map(function (r) {
-              var bt = r.bill_type === 'S' ? 'S' : (r.bill_type === 'F' ? 'F' : '&mdash;');
-              if (r.is_estimate) bt += ' <span class="badge">est</span>';
-              return '<tr><td><b>' + bt + '</b></td><td><b>' + esc(r.company_code) + '</b></td>' +
-                cell(r.company_name) + cell(fmtDate(r.payroll_date)) + cell(r.lives_count) +
-                '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-                (showPaid ? cell(fmtDate(r.paid_date)) : '') + '</tr>';
-            }).join('');
-            return '<div class="billing-panel"><h3>' + title + ' (' + rows.length + ')</h3>' +
-              (rows.length === 0
-                ? '<p class="muted">' + (showPaid ? 'No paid invoices yet.' : 'No pending bills.') + '</p>'
-                : '<div class="table-scroll billing-scroll"><table class="data-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>') +
-              '</div>';
+          function statusLabel(r) {
+            if (r.is_estimate) return '<span class="badge">Estimated</span>';
+            return r.status === 'paid' ? 'Paid' : 'Open';
           }
+          var body = rows.map(function (r) {
+            return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+              cell(r.company_name) +
+              cell(r.ein) +
+              cell(r.bill_mode) +
+              cell(fmtDate(r.payroll_date)) +
+              cell(fmtDate(r.payroll_end_date)) +
+              cell(fmtDate(r.paid_date)) +
+              cell(r.lives_count) +
+              '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
+              '<td>' + statusLabel(r) + '</td></tr>';
+          }).join('');
           var boxes = codes.map(function (c) {
             var lbl = esc(c) + (codeMap[c] && codeMap[c] !== c ? ' — ' + esc(codeMap[c]) : '');
             return '<label style="display:block;white-space:nowrap;"><input type="checkbox" class="bacctbox" value="' + esc(c) + '"' +
@@ -508,21 +517,31 @@ function viewBilling() {
           }).join('');
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
-            '<div class="billing-panels">' +
-            panel('Pending Invoices', openF, false) +
-            panel('Paid Invoices', paidF, true) +
-            '</div>' +
-            '<div class="card" style="margin-top:16px;"><div class="card-title">Filters</div>' +
+            '<div class="card"><div class="card-title">Filters</div>' +
             '<div class="form-inline" style="align-items:flex-start;">' +
-            '<div><b>Accounts</b> <span class="muted">(applies to both panels)</span><br>' +
+            '<div><b>Accounts</b><br>' +
             '<div id="bacctboxes" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);padding:6px 10px;min-width:220px;">' + boxes + '</div></div> ' +
             '<div><label>Bill type:<br><select id="btype">' +
             '<option value="">All types</option>' +
             '<option value="F"' + (typeFilter === 'F' ? ' selected' : '') + '>F - FTJ</option>' +
             '<option value="S"' + (typeFilter === 'S' ? ' selected' : '') + '>S - Soluta</option>' +
-            '</select></label><br><br>' +
-            '<button class="btn btn-small" id="bcodeclear">Reset filters</button></div>' +
-            '</div></div>',
+            '</select></label></div> ' +
+            '<div><label>Status:<br><select id="bstatus">' +
+            '<option value="">All statuses</option>' +
+            '<option value="paid"' + (statusFilter === 'paid' ? ' selected' : '') + '>Paid</option>' +
+            '<option value="open"' + (statusFilter === 'open' ? ' selected' : '') + '>Open</option>' +
+            '<option value="estimated"' + (statusFilter === 'estimated' ? ' selected' : '') + '>Estimated</option>' +
+            '</select></label></div> ' +
+            '<div><br><button class="btn btn-small" id="bcodeclear">Reset filters</button></div>' +
+            '</div></div>' +
+            '<h3>All Bills (' + rows.length + ')</h3>' +
+            (rows.length === 0
+              ? '<p class="muted">No bills match the filters.</p>'
+              : '<div class="table-scroll" style="max-height:600px;overflow-y:auto;"><table class="data-table"><thead>' +
+                '<tr><th>Company Code</th><th>Company Name</th><th>EIN</th><th>Pay Frequency</th>' +
+                '<th>Payroll Begin Date</th><th>Payroll End Date</th><th>Check Date</th>' +
+                '<th>Lives</th><th>Total $</th><th>Status</th></tr>' +
+                '</thead><tbody>' + body + '</tbody></table></div>'),
             '#/billing'));
           var boxEls = document.querySelectorAll('.bacctbox');
           Array.prototype.forEach.call(boxEls, function (cb) {
@@ -533,7 +552,8 @@ function viewBilling() {
             };
           });
           document.getElementById('btype').onchange = function () { typeFilter = this.value; load(); };
-          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; typeFilter = ''; load(); };
+          document.getElementById('bstatus').onchange = function () { statusFilter = this.value; load(); };
+          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; typeFilter = ''; statusFilter = ''; load(); };
         }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
     }
@@ -1063,7 +1083,7 @@ var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
   companies: 'parent_code, parent_name, company_code, company_name, active (optional: Yes/No; blank leaves the current flag unchanged). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
-  billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)',
+  billing: 'company_code (required), company_name, ein, payroll_date (YYYY-MM-DD), payroll_end_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD), bill_type (F or S), bill_mode',
   commissions: 'One line per company: company_code, then repeating steward_code, pct pairs (e.g. company_code,steward_code,pct,steward_code,pct). steward_code is the Steward ID from the stewards list. Up to 10 stewards per company; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
 };
 

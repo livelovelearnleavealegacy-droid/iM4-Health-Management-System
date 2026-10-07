@@ -240,11 +240,15 @@ async function migrate() {
     "bill_type TEXT NOT NULL DEFAULT 'F', " +
     'is_estimate BOOLEAN NOT NULL DEFAULT FALSE, ' +
     'bill_mode TEXT, ' +
+    'ein TEXT, ' +
+    'payroll_end_date DATE, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_type TEXT NOT NULL DEFAULT 'F'");
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_estimate BOOLEAN NOT NULL DEFAULT FALSE');
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bill_mode TEXT');
+  await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ein TEXT');
+  await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payroll_end_date DATE');
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -1224,9 +1228,9 @@ app.get('/api/billing', requireAuth, async (req, res) => {
 });
 
 // v5: billing CSV import (admin only). Accepts { csv } text or { rows } array.
-// Columns: company_code, company_name, payroll_date, lives_count,
-// total_invoice, status, paid_date, bill_type ('F' or 'S', default 'F'),
-// bill_mode (1, 2, 3, 4, M; optional).
+// Columns: company_code (required), company_name, payroll_date, payroll_end_date,
+// lives_count, total_invoice, status, paid_date, bill_type ('F' or 'S', default 'F'),
+// bill_mode, ein.
 // Upserts on (company_code, payroll_date, bill_type).
 app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
   try {
@@ -1244,10 +1248,10 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
       const line = idx + 2;
       try {
         const company_code = row.company_code !== undefined && row.company_code !== null ? String(row.company_code).trim() : '';
-        const company_name = row.company_name !== undefined && row.company_name !== null ? String(row.company_name).trim() : '';
         if (!company_code) throw new Error('company_code is required');
-        if (!company_name) throw new Error('company_name is required');
+        const company_name = row.company_name !== undefined && row.company_name !== null ? String(row.company_name).trim() : company_code;
         const payroll_date = toISODate(row.payroll_date);
+        const payroll_end_date = toISODate(row.payroll_end_date);
         const lives_count = num(row.lives_count);
         let total_invoice = null;
         if (row.total_invoice !== undefined && row.total_invoice !== null && String(row.total_invoice).trim() !== '') {
@@ -1262,19 +1266,20 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
           ? String(row.bill_type).trim().toUpperCase() : 'F';
         if (bill_type !== 'F' && bill_type !== 'S') throw new Error("bill_type must be 'F' or 'S'");
         let bill_mode_csv = row.bill_mode !== undefined && row.bill_mode !== null && String(row.bill_mode).trim() !== ''
-          ? String(row.bill_mode).trim().toUpperCase() : null;
-        if (bill_mode_csv && ['1', '2', '3', '4', 'M'].indexOf(bill_mode_csv) === -1) throw new Error("bill_mode must be 1, 2, 3, 4, or M");
+          ? String(row.bill_mode).trim() : null;
+        const ein = row.ein !== undefined && row.ein !== null && String(row.ein).trim() !== ''
+          ? String(row.ein).trim().replace(/\D/g, '') : null;
         const up = await db.query(
-          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = COALESCE($8, bill_mode), updated_at = NOW() ' +
+          'UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = COALESCE($8, bill_mode), ein = COALESCE($10, ein), payroll_end_date = COALESCE($11, payroll_end_date), updated_at = NOW() ' +
           "WHERE company_code = $6 AND ((payroll_date = $7) OR (payroll_date IS NULL AND $7 IS NULL)) AND bill_type = $9",
-          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_mode_csv, bill_type]);
+          [company_name, lives_count, total_invoice, status, paid_date, company_code, payroll_date, bill_mode_csv, bill_type, ein, payroll_end_date]);
         if (up.rowCount > 0) {
           updated++;
         } else {
           await db.query(
-            'INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode) ' +
-            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-            [company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode_csv]);
+            'INSERT INTO invoices (company_code, company_name, payroll_date, payroll_end_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode, ein) ' +
+            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
+            [company_code, company_name, payroll_date, payroll_end_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode_csv, ein]);
           imported++;
         }
       } catch (e) {
@@ -1444,11 +1449,11 @@ function parseSolutaReport(buffer) {
     if (codeRaw === null || codeRaw === undefined || String(codeRaw).trim() === '') continue;
     const company_code = String(codeRaw).trim();
     const payroll_date = ftjISODate(r[colIdx.payrollStart]);
-    if (!payroll_date) continue;
     const statusRaw = String(r[colIdx.status] || '').trim().toLowerCase();
     let status;
     if (statusRaw === 'paid') status = 'paid';
-    else if (statusRaw === 'due') status = 'open';
+    else if (statusRaw === 'due' || statusRaw === 'open' || statusRaw === 'pending') status = 'open';
+    else if (statusRaw === '') status = 'open';
     else continue;
     let total = 0;
     const tv = r[colIdx.total];
@@ -1469,15 +1474,19 @@ function parseSolutaReport(buffer) {
     const company_name = colIdx.name !== -1 && r[colIdx.name] ? String(r[colIdx.name]).trim() : company_code;
     const bill_mode = colIdx.billingMode !== -1 && r[colIdx.billingMode] ? String(r[colIdx.billingMode]).trim() : null;
     const paid_date = status === 'paid' && colIdx.remitDate !== -1 ? ftjISODate(r[colIdx.remitDate]) : null;
+    const ein = colIdx.ein !== -1 && r[colIdx.ein] ? String(r[colIdx.ein]).trim().replace(/\D/g, '') : null;
+    const payroll_end_date = colIdx.payrollEnd !== -1 ? ftjISODate(r[colIdx.payrollEnd]) : null;
     bills.push({
       company_code: company_code,
       company_name: company_name,
       payroll_date: payroll_date,
+      payroll_end_date: payroll_end_date,
       bill_mode: bill_mode,
       total_invoice: Math.round(total * 100) / 100,
       lives_count: lives,
       status: status,
       paid_date: paid_date,
+      ein: ein || null,
       bill_type: 'S',
       is_estimate: false
     });
@@ -1826,21 +1835,24 @@ app.post('/api/admin/jobs/sol-import', requireAdmin, async (req, res) => {
       seen[key] = true;
       const ex = exMap[key];
       const paidDate = b.paid_date || null;
+      const exEnd = ex && ex.payroll_end_date ? new Date(ex.payroll_end_date).toISOString().slice(0, 10) : null;
       if (ex) {
         const exPaid = ex.paid_date ? new Date(ex.paid_date).toISOString().slice(0, 10) : null;
         const same = !ex.is_estimate && String(ex.company_name) === String(b.company_name) &&
           Number(ex.lives_count) === Number(b.lives_count) &&
           Number(ex.total_invoice) === Number(b.total_invoice) &&
           ex.status === b.status && exPaid === paidDate &&
-          String(ex.bill_mode || '') === String(b.bill_mode || '');
+          String(ex.bill_mode || '') === String(b.bill_mode || '') &&
+          String(ex.ein || '') === String(b.ein || '') &&
+          exEnd === (b.payroll_end_date || null);
         if (!same) {
-          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = $6, updated_at = NOW() WHERE id = $7',
-            [b.company_name, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null, ex.id]);
+          await db.query('UPDATE invoices SET company_name = $1, lives_count = $2, total_invoice = $3, status = $4, paid_date = $5, is_estimate = FALSE, bill_mode = $6, ein = $7, payroll_end_date = $8, updated_at = NOW() WHERE id = $9',
+            [b.company_name, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null, b.ein || null, b.payroll_end_date || null, ex.id]);
           updated++;
         }
       } else {
-        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'S', $8)",
-          [b.company_code, b.company_name, b.payroll_date, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null]);
+        await db.query("INSERT INTO invoices (company_code, company_name, payroll_date, payroll_end_date, lives_count, total_invoice, status, paid_date, bill_type, bill_mode, ein) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'S', $9, $10)",
+          [b.company_code, b.company_name, b.payroll_date, b.payroll_end_date || null, b.lives_count, b.total_invoice, b.status, paidDate, b.bill_mode || null, b.ein || null]);
         added++;
       }
     }
@@ -1869,8 +1881,9 @@ app.get('/api/admin/jobs/sol-template', requireAdmin, async (req, res) => {
 app.get('/api/admin/jobs/sol-export', requireAdmin, async (req, res) => {
   try {
     const r = await getPool().query(
-      "SELECT company_code AS \"IM4H_ID\", company_name AS \"GroupName\", " +
+      "SELECT company_code AS \"IM4H_ID\", ein AS \"EIN\", company_name AS \"GroupName\", " +
       "TO_CHAR(payroll_date, 'YYYY-MM-DD') AS \"PayrollStart\", " +
+      "TO_CHAR(payroll_end_date, 'YYYY-MM-DD') AS \"PayrollEnd\", " +
       "CASE WHEN status = 'paid' THEN 'Paid' ELSE 'Due' END AS \"Status\", " +
       "total_invoice AS \"GrandTotal\", lives_count AS \"Enrolled\", bill_mode AS \"BillingMode\", " +
       "TO_CHAR(paid_date, 'YYYY-MM-DD') AS \"RemitDate\" " +
@@ -2414,10 +2427,11 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
         'SELECT a.steward_id, c.company_code FROM assignments a JOIN companies c ON c.id = a.company_id ' +
         'ORDER BY a.steward_id, c.company_code')).rows;
     } else if (type === 'billing') {
-      headers = ['company_code', 'company_name', 'payroll_date', 'lives_count', 'total_invoice', 'status', 'paid_date'];
+      headers = ['company_code', 'company_name', 'ein', 'payroll_date', 'payroll_end_date', 'lives_count', 'total_invoice', 'status', 'paid_date', 'bill_type', 'bill_mode'];
       rows = (await db.query(
-        "SELECT company_code, company_name, TO_CHAR(payroll_date, 'YYYY-MM-DD') AS payroll_date, lives_count, " +
-        "total_invoice, status, TO_CHAR(paid_date, 'YYYY-MM-DD') AS paid_date FROM invoices " +
+        "SELECT company_code, company_name, ein, TO_CHAR(payroll_date, 'YYYY-MM-DD') AS payroll_date, " +
+        "TO_CHAR(payroll_end_date, 'YYYY-MM-DD') AS payroll_end_date, lives_count, " +
+        "total_invoice, status, TO_CHAR(paid_date, 'YYYY-MM-DD') AS paid_date, bill_type, bill_mode FROM invoices " +
         'ORDER BY company_code, payroll_date')).rows;
     } else if (type === 'commissions') {
       // Wide format matching the import: one row per company, repeating steward_code,pct pairs.
