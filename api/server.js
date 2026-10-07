@@ -161,6 +161,14 @@ async function migrate() {
     'name TEXT NOT NULL, ' +
     'github_username TEXT NOT NULL UNIQUE, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW())');
+  // Site header logo: single row (id = 1) holding the uploaded image bytes.
+  // Served at GET /api/logo; when empty the app falls back to logo.webp.
+  await db.query('CREATE TABLE IF NOT EXISTS site_logo (' +
+    'id INT PRIMARY KEY, ' +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT NOT NULL, ' +
+    'data BYTEA NOT NULL, ' +
+    'uploaded_at TIMESTAMPTZ DEFAULT NOW())');
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
@@ -3749,6 +3757,53 @@ app.put('/api/admin/private-filters/:id', requireAdmin, async (req, res) => {
 app.delete('/api/admin/private-filters/:id', requireAdmin, async (req, res) => {
   try {
     await getPool().query('DELETE FROM private_message_filters WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- site header logo (admin)
+// Single uploaded image served at GET /api/logo (public; the header <img>
+// falls back to the built-in logo.webp when nothing is uploaded).
+const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+app.get('/api/logo', async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT mime_type, data FROM site_logo WHERE id = 1');
+    if (r.rows.length === 0) return res.status(404).end();
+    res.set('Content-Type', r.rows[0].mime_type);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(r.rows[0].data);
+  } catch (error) {
+    res.status(500).end();
+  }
+});
+app.post('/api/admin/logo', requireAdmin, function (req, res, next) {
+  logoUpload.single('logo')(req, res, function (err) {
+    if (err) return res.status(400).json({ error: 'Upload failed: ' + err.message });
+    next();
+  });
+}, async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Choose an image file first' });
+    const okTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml'];
+    if (okTypes.indexOf(req.file.mimetype) === -1) {
+      return res.status(400).json({ error: 'Only PNG, JPG, GIF, WebP, or SVG images' });
+    }
+    await getPool().query(
+      'INSERT INTO site_logo (id, file_name, mime_type, data) VALUES (1, $1, $2, $3) ' +
+      'ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, mime_type = EXCLUDED.mime_type, ' +
+      'data = EXCLUDED.data, uploaded_at = NOW()',
+      [req.file.originalname, req.file.mimetype, req.file.buffer]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Logo upload error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+app.delete('/api/admin/logo', requireAdmin, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM site_logo WHERE id = 1');
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });

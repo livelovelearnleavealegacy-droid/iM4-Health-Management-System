@@ -178,8 +178,9 @@ var state = { user: null };
 // ---------------------------------------------------------------- header (same on every page)
 function logoHtml(size) {
   size = size || 34;
-  var w = Math.round(size * 1.31);
-  return '<img src="logo.webp" class="brand-logo" width="' + w + '" height="' + size + '" alt="iM4 Health">';
+  // Uploaded logo first (/api/logo 404s when none is uploaded -> fall back to the built-in logo).
+  return '<img src="/api/logo" onerror="this.onerror=null;this.src=\'logo.webp\'" class="brand-logo" ' +
+    'style="max-height:' + size + 'px;width:auto;" alt="iM4 Health">';
 }
 
 function activeRole() {
@@ -1162,6 +1163,13 @@ function viewAdminJobs() {
       '<form id="pmfform" class="form-inline"><input id="pmfname" placeholder="Name" required> ' +
       '<input id="pmfuser" placeholder="GitHub username" required> ' +
       '<button class="btn btn-primary" type="submit">Add</button></form><div id="pmfmsg"></div></div>' +
+      '<div class="card"><div class="card-title">Site header logo</div>' +
+      '<p class="muted">Upload the logo shown in the site header. Takes effect immediately for everyone. PNG, JPG, GIF, WebP, or SVG.</p>' +
+      '<div id="logopreview" style="margin-bottom:8px;"><img id="logopreviewimg" src="/api/logo" ' +
+      'onerror="this.onerror=null;this.src=\'logo.webp\'" style="max-height:60px;width:auto;" alt="Current logo"></div>' +
+      '<input type="file" id="logofile" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"> ' +
+      '<button class="btn btn-primary" id="logoupload">Upload logo</button> ' +
+      '<button class="btn btn-small btn-danger" id="logodelete">Remove logo</button><div id="logoout"></div></div>' +
       '<div class="card"><div class="card-title">FTJ billing: Premium Applied Report</div>' +
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
@@ -1335,6 +1343,47 @@ function viewAdminJobs() {
         loadPmf();
       }).catch(function (err) {
         document.getElementById('pmfmsg').innerHTML = errorHtml(err.message);
+      });
+    };
+    function refreshBrandLogo() {
+      var ts = Date.now();
+      var imgs = document.querySelectorAll('.brand-logo');
+      for (var k = 0; k < imgs.length; k++) {
+        imgs[k].onerror = function () { this.onerror = null; this.src = 'logo.webp'; };
+        imgs[k].src = '/api/logo?t=' + ts;
+      }
+      var prev = document.getElementById('logopreviewimg');
+      if (prev) {
+        prev.onerror = function () { this.onerror = null; this.src = 'logo.webp'; };
+        prev.src = '/api/logo?t=' + ts;
+      }
+    }
+    document.getElementById('logoupload').onclick = function () {
+      var out = document.getElementById('logoout');
+      var fi = document.getElementById('logofile');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose an image file first.'); return; }
+      var fd = new FormData();
+      fd.append('logo', fi.files[0]);
+      out.innerHTML = '<p class="muted">Uploading...</p>';
+      uploadFile('/api/admin/logo', fd).then(function () {
+        out.innerHTML = okHtml('Logo updated — it is live in the header now.');
+        document.getElementById('logofile').value = '';
+        refreshBrandLogo();
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
+    document.getElementById('logodelete').onclick = function () {
+      var out = document.getElementById('logoout');
+      if (!window.confirm('Remove the custom logo and go back to the default?')) return;
+      api.delete('/api/admin/logo').then(function () {
+        out.innerHTML = okHtml('Logo removed — back to the default.');
+        var imgs = document.querySelectorAll('.brand-logo');
+        for (var k = 0; k < imgs.length; k++) { imgs[k].src = 'logo.webp'; }
+        var prev = document.getElementById('logopreviewimg');
+        if (prev) prev.src = 'logo.webp';
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
       });
     };
     document.getElementById('ftjpreview').onclick = function () {
