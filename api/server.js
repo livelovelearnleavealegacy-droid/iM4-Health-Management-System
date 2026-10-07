@@ -2622,6 +2622,42 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
   }
 });
 
+// Commissions page data: one entry per company with its stewards and percentages.
+app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT c.company_code, co.company_name, c.steward_code, c.pct, ' +
+      's.first_name, s.last_name, s.email ' +
+      'FROM commissions c ' +
+      'LEFT JOIN companies co ON co.company_code = c.company_code ' +
+      'LEFT JOIN stewards s ON s.id = c.steward_code ' +
+      'ORDER BY c.company_code, c.pct DESC');
+    const byCompany = {};
+    const order = [];
+    r.rows.forEach(function (row) {
+      const code = row.company_code;
+      if (!byCompany[code]) {
+        byCompany[code] = {
+          company_code: code,
+          company_name: row.company_name || code,
+          stewards: []
+        };
+        order.push(code);
+      }
+      var name = ((row.first_name || '') + ' ' + (row.last_name || '')).trim() || row.email || ('ID ' + row.steward_code);
+      byCompany[code].stewards.push({
+        steward_code: row.steward_code,
+        name: name,
+        pct: row.pct
+      });
+    });
+    res.json(order.map(function (code) { return byCompany[code]; }));
+  } catch (error) {
+    console.error('Commissions by company error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Current commission table, for the admin view on the Jobs page.
 app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
   try {

@@ -210,6 +210,7 @@ function navLinks() {
     links.push(['#/admin/stewards', 'Stewards']);
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
+    links.push(['#/admin/commissions', 'Commissions']);
   }
   if (role === 'admin') {
     links.push(['#/admin/jobs', 'Jobs']);
@@ -944,6 +945,50 @@ function viewAdminStewards() {
         '<tbody>' + rows + '</tbody></table>',
         '#/admin/stewards'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
+  });
+}
+
+// ---------------------------------------------------------------- admin: commissions (cards per company)
+function viewAdminCommissions() {
+  requireUser(function () {
+    var ar = activeRole();
+    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
+    var q = '';
+    function load() {
+      api.get('/api/admin/commissions-by-company').then(function (list) {
+        var ql = q.toLowerCase();
+        var filtered = list.filter(function (c) {
+          if (!ql) return true;
+          if (String(c.company_code).toLowerCase().indexOf(ql) !== -1) return true;
+          if (String(c.company_name || '').toLowerCase().indexOf(ql) !== -1) return true;
+          for (var i = 0; i < c.stewards.length; i++) {
+            if (String(c.stewards[i].name).toLowerCase().indexOf(ql) !== -1) return true;
+          }
+          return false;
+        });
+        var cards = filtered.map(function (c) {
+          var lines = c.stewards.map(function (s) {
+            return '<div class="card-line">' + esc(s.name) + ' <span class="muted">— ' + esc(s.pct) + '%</span></div>';
+          }).join('');
+          return '<div class="card">' +
+            '<div class="card-code">' + esc(c.company_code) + '</div>' +
+            '<div class="card-title">' + esc(c.company_name) + '</div>' +
+            lines + '</div>';
+        }).join('');
+        var body = filtered.length === 0
+          ? '<p class="muted">No commissions found.</p>'
+          : '<div class="card-grid">' + cards + '</div>';
+        render(shell(
+          '<h2>Commissions</h2>' + filterBar(q, '') +
+          '<div id="err"></div>' + body,
+          '#/admin/commissions'));
+        var fq = document.getElementById('fq');
+        fq.onchange = function () { q = fq.value; load(); };
+        fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
+        fq.oninput = function () { q = fq.value; load(); };
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/commissions')); });
+    }
+    load();
   });
 }
 
@@ -2339,6 +2384,7 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'stewards') return viewAdminStewards();
   if (pathParts[0] === 'admin' && pathParts[1] === 'companies') return viewAdminCompanies();
   if (pathParts[0] === 'admin' && pathParts[1] === 'assignments') return viewAdminAssignments();
+  if (pathParts[0] === 'admin' && pathParts[1] === 'commissions') return viewAdminCommissions();
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
   location.hash = '#/login';
 }
