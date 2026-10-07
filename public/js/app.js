@@ -1080,7 +1080,7 @@ var IMPORT_FORMATS = {
   companies: 'parent_code, parent_name, company_code, company_name, active (optional: Yes/No; blank leaves the current flag unchanged). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code (required), company_name, ein, payroll_date (YYYY-MM-DD), payroll_end_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD), bill_type (F or S), bill_mode',
-  commissions: 'One line per company: company_code, then repeating steward_code, pct pairs (e.g. company_code,steward_code,pct,steward_code,pct). steward_code is the Steward ID from the stewards list. Up to 10 stewards per company; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
+  commissions: 'One line per steward OR one line per company (auto-detected): steward_id then repeating company_code,pct pairs - or company_code then repeating steward_id,pct pairs (e.g. 1001,155026,37.5,153909,25). Percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
 };
 
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
@@ -1569,7 +1569,7 @@ function viewAdminJobs() {
     loadCommissionsNow();
     // Wide commission format: one line per company — company_code, then
     // repeating steward_code,pct pairs. Expands to one row per pair.
-    function parseCommissionWide(text) {
+    function parseCommissionWide(text, stewardIds, companyCodes) {
       var lines = String(text).split(String.fromCharCode(10));
       var rows = [];
       var errors = [];
@@ -1587,54 +1587,81 @@ function viewAdminJobs() {
         return cells;
       }
       var headerSeen = false;
+      var format = null; // 'company-first' or 'steward-first', auto-detected
       lines.forEach(function (line, li) {
         if (!line.trim()) return;
         var cells = splitCells(line);
         if (!headerSeen) { headerSeen = true; return; }
-        var code = (cells[0] || '').trim();
+        var first = (cells[0] || '').trim();
         var rest = cells.slice(1);
         while (rest.length && rest[rest.length - 1] === '') rest.pop();
-        if (rest.length === 0) { errors.push('Line ' + (li + 1) + ': no steward_code/pct pairs found'); return; }
+        if (rest.length === 0) { errors.push('Line ' + (li + 1) + ': no pairs found'); return; }
         if (rest.length % 2 !== 0) {
-          errors.push('Line ' + (li + 1) + ': uneven steward_code/pct pairs for company ' + (code || '(blank)') + ' — each steward needs a code and a percent');
+          errors.push('Line ' + (li + 1) + ': uneven pairs for ' + (first || '(blank)') + ' — each entry needs a code and a percent');
           return;
         }
+        // Auto-detect format from the first data line.
+        if (!format && stewardIds && companyCodes) {
+          var firstIsSteward = stewardIds.indexOf(first) !== -1;
+          var firstIsCompany = companyCodes.indexOf(first) !== -1;
+          var pairKey = (rest[0] || '').trim();
+          var pairIsSteward = stewardIds.indexOf(pairKey) !== -1;
+          var pairIsCompany = companyCodes.indexOf(pairKey) !== -1;
+          if (firstIsSteward && pairIsCompany) format = 'steward-first';
+          else if (firstIsCompany && pairIsSteward) format = 'company-first';
+          else format = 'company-first';
+        }
+        if (!format) format = 'company-first';
         for (var p = 0; p < rest.length; p += 2) {
-          var sc = (rest[p] || '').trim();
+          var a = (rest[p] || '').trim();
           var pct = (rest[p + 1] || '').trim();
-          if (!sc && !pct) continue;
-          rows.push({ company_code: code, steward_code: sc, pct: pct });
+          if (!a && !pct) continue;
+          if (format === 'steward-first') {
+            rows.push({ company_code: a, steward_code: first, pct: pct });
+          } else {
+            rows.push({ company_code: first, steward_code: a, pct: pct });
+          }
         }
       });
-      return { rows: rows, errors: errors };
+      return { rows: rows, errors: errors, format: format };
     }
     document.getElementById('imp-commissions-go').onclick = function () {
       var out = document.getElementById('imp-commissions-out');
-      var parsed = parseCommissionWide(document.getElementById('imp-commissions-csv').value);
-      if (parsed.errors.length) {
-        out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + parsed.errors.map(esc).join('<br>') + '</div>' +
-          '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
-        return;
-      }
-      var rows = parsed.rows;
-      if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
-      out.innerHTML = '<p class="muted">Validating...</p>';
-      api.post('/api/admin/import-commissions', { rows: rows, dry_run: true }).then(function (d) {
-        if (!d.success) {
-          out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' +
-            '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
-          return;
-        }
-        out.innerHTML = '<h3>Validation</h3>' +
-          okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
-          '<button class="btn btn-primary" id="imp-commissions-confirm">Confirm import of ' + d.valid_count + ' rows</button>';
-        document.getElementById('imp-commissions-confirm').onclick = function () {
-          out.innerHTML = '<p class="muted">Importing...</p>';
-          api.post('/api/admin/import-commissions', { rows: rows, dry_run: false }).then(function (r) {
-            out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' commission rows for ' + r.companies + ' companies.');
-            loadCommissionsNow();
+      out.innerHTML = '<p class="muted">Detecting format...</p>';
+      api.get('/api/admin/stewards').then(function (stewards) {
+        api.get('/api/admin/companies').then(function (companies) {
+          var stewardIds = stewards.map(function (s) { return String(s.id); });
+          var companyCodes = companies.map(function (c) { return String(c.company_code); });
+          var parsed = parseCommissionWide(document.getElementById('imp-commissions-csv').value, stewardIds, companyCodes);
+          if (parsed.errors.length) {
+            out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + parsed.errors.map(esc).join('<br>') + '</div>' +
+              '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
+            return;
+          }
+          var rows = parsed.rows;
+          if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
+          var fmtMsg = parsed.format === 'steward-first'
+            ? 'Detected: one line per steward (steward ID, then company_code/pct pairs).'
+            : 'Detected: one line per company (company_code, then steward ID/pct pairs).';
+          out.innerHTML = '<p class="muted">' + fmtMsg + ' Validating...</p>';
+          api.post('/api/admin/import-commissions', { rows: rows, dry_run: true }).then(function (d) {
+            if (!d.success) {
+              out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' +
+                '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
+              return;
+            }
+            out.innerHTML = '<h3>Validation</h3><p class="muted">' + fmtMsg + '</p>' +
+              okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
+              '<button class="btn btn-primary" id="imp-commissions-confirm">Confirm import of ' + d.valid_count + ' rows</button>';
+            document.getElementById('imp-commissions-confirm').onclick = function () {
+              out.innerHTML = '<p class="muted">Importing...</p>';
+              api.post('/api/admin/import-commissions', { rows: rows, dry_run: false }).then(function (r) {
+                out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' commission rows for ' + r.companies + ' companies.');
+                loadCommissionsNow();
+              }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+            };
           }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
-        };
+        }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
     function del(target, mode, key, key2, confirmText) {
