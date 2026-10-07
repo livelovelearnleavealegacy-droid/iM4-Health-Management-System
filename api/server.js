@@ -213,8 +213,22 @@ async function migrate() {
     if (oldId === newId) { console.log('Renumber: ' + firstName + ' ' + lastName + ' already ID ' + newId); return; }
     const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
     if (taken.rows.length > 0) { console.log('Renumber skipped: ID ' + newId + ' already in use'); return; }
+    // FK constraints are not deferrable, so a plain UPDATE of the PK fails
+    // whichever order you do it in (child-first fails the parent check,
+    // parent-first fails the child check). Instead: copy the row to the new
+    // ID, repoint every referencing table, then delete the old row (nothing
+    // references it anymore, so no cascade can fire). The copy uses a
+    // temporary email because email is UNIQUE; the real email is restored
+    // after the old row is gone. All inside one transaction.
+    const origEmail = found.rows[0].email;
     await db.query('BEGIN');
     try {
+      await db.query(
+        'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
+        'reset_token, reset_expires, two_factor_enabled) ' +
+        "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
+        'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
+        [newId, oldId]);
       await db.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
       await db.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
       await db.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
@@ -224,10 +238,11 @@ async function migrate() {
       await db.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
       await db.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
       await db.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
-      await db.query('UPDATE stewards SET id = $1 WHERE id = $2', [newId, oldId]);
+      await db.query('DELETE FROM stewards WHERE id = $1', [oldId]);
+      await db.query('UPDATE stewards SET email = $1 WHERE id = $2', [origEmail, newId]);
       await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
       await db.query('COMMIT');
-      console.log('Renumbered steward ' + firstName + ' ' + lastName + ' (' + found.rows[0].email + '): ' + oldId + ' -> ' + newId);
+      console.log('Renumbered steward ' + firstName + ' ' + lastName + ' (' + origEmail + '): ' + oldId + ' -> ' + newId);
     } catch (e) {
       await db.query('ROLLBACK');
       throw e;
