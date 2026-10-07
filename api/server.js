@@ -1771,9 +1771,12 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
       }
     }
     const client = await db.connect();
+    let step = 'connect';
     try {
+      step = 'BEGIN';
       await client.query('BEGIN');
       if (!reuseGhost) {
+        step = 'INSERT copy';
         await client.query(
           'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
           'reset_token, reset_expires, two_factor_enabled) ' +
@@ -1781,21 +1784,32 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
           'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
           [newId, oldId]);
       }
-      await client.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await client.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
-      await client.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await client.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await client.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
+      const repoints = [
+        ['assignments', 'UPDATE assignments SET steward_id = $1 WHERE steward_id = $2'],
+        ['messages', 'UPDATE messages SET steward_id = $1 WHERE steward_id = $2'],
+        ['user_roles', 'UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2'],
+        ['password_reset_tokens', 'UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2'],
+        ['two_factor_codes', 'UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2'],
+        ['onboarding_clients', 'UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2'],
+        ['client_documents', 'UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2'],
+        ['forms', 'UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2'],
+        ['commissions', 'UPDATE commissions SET steward_code = $1 WHERE steward_code = $2'],
+      ];
+      for (const [label, sql] of repoints) {
+        step = 'repoint ' + label;
+        await client.query(sql, [newId, oldId]);
+      }
+      step = 'DELETE old steward';
       await client.query('DELETE FROM stewards WHERE id = $1', [oldId]);
+      step = 'restore email';
       await client.query('UPDATE stewards SET email = $1 WHERE id = $2', [origEmail, newId]);
+      step = 'setval sequence';
       await client.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
+      step = 'COMMIT';
       await client.query('COMMIT');
     } catch (e) {
-      await client.query('ROLLBACK');
+      try { await client.query('ROLLBACK'); } catch (rb) { /* ignore */ }
+      e.renumberStep = step;
       throw e;
     } finally {
       client.release();
@@ -1803,7 +1817,8 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
     res.json({ success: true, old_id: oldId, new_id: newId, reused_ghost: reuseGhost });
   } catch (error) {
     console.error('Admin renumber steward error:', error);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+    const stepInfo = error.renumberStep ? ' (failed at step: ' + error.renumberStep + ')' : '';
+    res.status(500).json({ error: (error.message || 'Internal server error') + stepInfo });
   }
 });
 
