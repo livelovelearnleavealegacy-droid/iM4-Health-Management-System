@@ -1130,7 +1130,7 @@ var IMPORT_FORMATS = {
   companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total (or ee_total), payroll_ineligible (or ee_ineligible), payroll_opted_out (or ee_optedout), payroll_qualified (or ee_qualified), payroll_enrolled (or ee_enrolled), payroll_not_enrolled (or ee_not_enrolled), payroll_new_qualified (or ee_new_qualified), payroll_dataset_date (or ee_dataset_date, YYYY-MM-DD), active (Y or N, default Y; N hides the company from views and totals without deleting anything). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)',
-  commissions: 'company_code, agent, pct (percent, e.g. 25 for 25%). Up to 10 agents per company code; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
+  commissions: 'One line per company: company_code, then repeating steward_code, pct pairs (e.g. company_code,steward_code,pct,steward_code,pct). steward_code is the Steward ID from the stewards list. Up to 10 stewards per company; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
 };
 
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
@@ -1536,16 +1536,65 @@ function viewAdminJobs() {
       api.get('/api/admin/commissions').then(function (list) {
         if (!list.length) { box.innerHTML = '<p class="muted">No commissions on file yet.</p>'; return; }
         var rows = list.map(function (c) {
-          return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.agent) + '</td><td>' + esc(String(c.pct)) + '%</td></tr>';
+          var nm = [c.first_name, c.last_name].filter(Boolean).join(' ') || c.email || '';
+          var who = '<b>' + esc(c.steward_code) + '</b>' + (nm ? ' &middot; ' + esc(nm) : '');
+          return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + who + '</td><td>' + esc(String(c.pct)) + '%</td></tr>';
         }).join('');
-        box.innerHTML = '<div class="table-scroll"><table class="data-table"><thead><tr><th>Company code</th><th>Agent</th><th>%</th></tr></thead><tbody>' +
+        box.innerHTML = '<div class="table-scroll"><table class="data-table"><thead><tr><th>Company code</th><th>Steward</th><th>%</th></tr></thead><tbody>' +
           rows + '</tbody></table></div>';
       }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
     }
     loadCommissionsNow();
+    // Wide commission format: one line per company — company_code, then
+    // repeating steward_code,pct pairs. Expands to one row per pair.
+    function parseCommissionWide(text) {
+      var lines = String(text).split(String.fromCharCode(10));
+      var rows = [];
+      var errors = [];
+      function splitCells(line) {
+        var cells = [];
+        var cur = '';
+        var inQ = false;
+        for (var i = 0; i < line.length; i++) {
+          var ch = line[i];
+          if (ch === '"') { inQ = !inQ; continue; }
+          if (ch === ',' && !inQ) { cells.push(cur.trim()); cur = ''; continue; }
+          cur += ch;
+        }
+        cells.push(cur.trim());
+        return cells;
+      }
+      var headerSeen = false;
+      lines.forEach(function (line, li) {
+        if (!line.trim()) return;
+        var cells = splitCells(line);
+        if (!headerSeen) { headerSeen = true; return; }
+        var code = (cells[0] || '').trim();
+        var rest = cells.slice(1);
+        while (rest.length && rest[rest.length - 1] === '') rest.pop();
+        if (rest.length === 0) { errors.push('Line ' + (li + 1) + ': no steward_code/pct pairs found'); return; }
+        if (rest.length % 2 !== 0) {
+          errors.push('Line ' + (li + 1) + ': uneven steward_code/pct pairs for company ' + (code || '(blank)') + ' — each steward needs a code and a percent');
+          return;
+        }
+        for (var p = 0; p < rest.length; p += 2) {
+          var sc = (rest[p] || '').trim();
+          var pct = (rest[p + 1] || '').trim();
+          if (!sc && !pct) continue;
+          rows.push({ company_code: code, steward_code: sc, pct: pct });
+        }
+      });
+      return { rows: rows, errors: errors };
+    }
     document.getElementById('imp-commissions-go').onclick = function () {
       var out = document.getElementById('imp-commissions-out');
-      var rows = parseCSV(document.getElementById('imp-commissions-csv').value);
+      var parsed = parseCommissionWide(document.getElementById('imp-commissions-csv').value);
+      if (parsed.errors.length) {
+        out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + parsed.errors.map(esc).join('<br>') + '</div>' +
+          '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
+        return;
+      }
+      var rows = parsed.rows;
       if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
       out.innerHTML = '<p class="muted">Validating...</p>';
       api.post('/api/admin/import-commissions', { rows: rows, dry_run: true }).then(function (d) {

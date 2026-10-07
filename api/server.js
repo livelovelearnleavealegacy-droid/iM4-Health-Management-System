@@ -169,15 +169,28 @@ async function migrate() {
     'mime_type TEXT NOT NULL, ' +
     'data BYTEA NOT NULL, ' +
     'uploaded_at TIMESTAMPTZ DEFAULT NOW())');
-  // Commission splits: one row per (company, agent). Uploaded via the Jobs
-  // page; each upload replaces the rows for every company code it mentions.
+  // Commission splits: one row per (company, steward). Uploaded via the Jobs
+  // page in wide format (one line per company, repeating steward_code,pct
+  // pairs); each upload replaces the rows for every company code it mentions.
   await db.query('CREATE TABLE IF NOT EXISTS commissions (' +
     'id SERIAL PRIMARY KEY, ' +
     'company_code TEXT NOT NULL, ' +
-    'agent TEXT NOT NULL, ' +
+    'steward_code INTEGER NOT NULL, ' +
     'pct NUMERIC NOT NULL, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
-    'UNIQUE(company_code, agent))');
+    'UNIQUE(company_code, steward_code))');
+  // v5.13.x migration: the column started life as agent TEXT.
+  const hasAgentCol = await db.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'commissions' AND column_name = 'agent'");
+  if (hasAgentCol.rows.length > 0) {
+    await db.query('ALTER TABLE commissions RENAME COLUMN agent TO steward_code');
+  }
+  const scType = await db.query(
+    "SELECT data_type FROM information_schema.columns WHERE table_name = 'commissions' AND column_name = 'steward_code'");
+  if (scType.rows.length > 0 && scType.rows[0].data_type !== 'integer') {
+    await db.query("DELETE FROM commissions WHERE steward_code !~ '^[0-9]+$'");
+    await db.query('ALTER TABLE commissions ALTER COLUMN steward_code TYPE INTEGER USING steward_code::integer');
+  }
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
@@ -2082,8 +2095,28 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
         "total_invoice, status, TO_CHAR(paid_date, 'YYYY-MM-DD') AS paid_date FROM invoices " +
         'ORDER BY company_code, payroll_date')).rows;
     } else if (type === 'commissions') {
-      headers = ['company_code', 'agent', 'pct'];
-      rows = (await db.query('SELECT company_code, agent, pct FROM commissions ORDER BY company_code, agent')).rows;
+      // Wide format matching the import: one row per company, repeating steward_code,pct pairs.
+      const r = await db.query('SELECT company_code, steward_code, pct FROM commissions ORDER BY company_code, steward_code');
+      const byCo = {};
+      const order = [];
+      r.rows.forEach(function (x) {
+        if (!byCo[x.company_code]) { byCo[x.company_code] = []; order.push(x.company_code); }
+        byCo[x.company_code].push(x);
+      });
+      let maxPairs = 0;
+      order.forEach(function (c) { maxPairs = Math.max(maxPairs, byCo[c].length); });
+      const h = ['company_code'];
+      for (let pi = 0; pi < maxPairs; pi++) h.push('steward_code', 'pct');
+      const lines = [h.join(',')];
+      order.forEach(function (c) {
+        const cells = [csvCell(c)];
+        byCo[c].forEach(function (x) { cells.push(csvCell(x.steward_code), csvCell(x.pct)); });
+        while (cells.length < h.length) cells.push('');
+        lines.push(cells.join(','));
+      });
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="commissions.csv"');
+      return res.send(lines.join('\r\n'));
     } else {
       return res.status(400).json({ error: 'unknown export type' });
     }
@@ -2097,10 +2130,11 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: commission table import
-// Columns: company_code, agent, pct. The file is the complete commission
-// table for every company code it mentions: validated all-or-nothing first,
-// then existing rows for those companies are replaced. Any problem rejects
-// the whole file with an explanation and imports nothing.
+// Wide format: one line per company — company_code, then repeating
+// steward_code,pct pairs (steward_code is the Steward ID). The file is the
+// complete commission table for every company code it mentions: validated
+// all-or-nothing first, then existing rows for those companies are replaced.
+// Any problem rejects the whole file with an explanation and imports nothing.
 app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
   try {
     const { rows, dry_run } = req.body || {};
@@ -2108,6 +2142,8 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
     const db = getPool();
     const coMap = {};
     (await db.query('SELECT company_code FROM companies')).rows.forEach(function (x) { coMap[String(x.company_code)] = true; });
+    const stMap = {};
+    (await db.query('SELECT id FROM stewards')).rows.forEach(function (x) { stMap[String(x.id)] = true; });
     const errors = [];
     const valid = [];
     const seen = {};
@@ -2116,12 +2152,15 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
       const line = idx + 2;
       const e = function (msg) { errors.push('Row ' + line + ': ' + msg); };
       const code = row.company_code ? String(row.company_code).trim() : '';
-      const agent = row.agent ? String(row.agent).trim() : '';
+      const scRaw = row.steward_code ? String(row.steward_code).trim() : '';
       if (!code) { e('company_code is required'); return; }
       if (!coMap[code]) { e('company ' + code + ' is not on the company list'); return; }
-      if (!agent) { e('agent is required'); return; }
-      const key = code + '|' + agent.toLowerCase();
-      if (seen[key]) { e('duplicate agent "' + agent + '" for company ' + code + ' in this file'); return; }
+      if (!scRaw) { e('steward_code is required'); return; }
+      const scId = parseInt(scRaw, 10);
+      if (isNaN(scId) || scId <= 0) { e('steward_code "' + scRaw + '" must be a Steward ID number'); return; }
+      if (!stMap[String(scId)]) { e('steward ' + scId + ' is not on the steward list'); return; }
+      const key = code + '|' + scId;
+      if (seen[key]) { e('duplicate steward ' + scId + ' for company ' + code + ' in this file'); return; }
       seen[key] = true;
       let pct = null;
       if (row.pct !== undefined && row.pct !== null && String(row.pct).trim() !== '') {
@@ -2129,14 +2168,14 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
       }
       if (pct === null || isNaN(pct)) { e('pct must be a number, e.g. 25 for 25%'); return; }
       if (pct <= 0 || pct > 100) { e('pct must be greater than 0 and at most 100'); return; }
-      valid.push({ company_code: code, agent: agent, pct: pct });
+      valid.push({ company_code: code, steward_code: scId, pct: pct });
       if (!perCompany[code]) perCompany[code] = [];
       perCompany[code].push(pct);
     });
     Object.keys(perCompany).forEach(function (code) {
       const pcts = perCompany[code];
       if (pcts.length > 10) {
-        errors.push('Company ' + code + ': ' + pcts.length + ' agents in this file — at most 10 agents per company. The file was rejected and nothing was imported.');
+        errors.push('Company ' + code + ': ' + pcts.length + ' stewards in this file — at most 10 stewards per company. The file was rejected and nothing was imported.');
       }
       const total = pcts.reduce(function (a, b) { return a + b; }, 0);
       const rounded = Math.round(total * 100) / 100;
@@ -2157,9 +2196,9 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
     let imported = 0;
     for (const v of valid) {
       await db.query(
-        'INSERT INTO commissions (company_code, agent, pct) VALUES ($1, $2, $3) ' +
-        'ON CONFLICT (company_code, agent) DO UPDATE SET pct = EXCLUDED.pct',
-        [v.company_code, v.agent, v.pct]);
+        'INSERT INTO commissions (company_code, steward_code, pct) VALUES ($1, $2, $3) ' +
+        'ON CONFLICT (company_code, steward_code) DO UPDATE SET pct = EXCLUDED.pct',
+        [v.company_code, v.steward_code, v.pct]);
       imported++;
     }
     res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [] });
@@ -2172,7 +2211,10 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 // Current commission table, for the admin view on the Jobs page.
 app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
   try {
-    const r = await getPool().query('SELECT company_code, agent, pct FROM commissions ORDER BY company_code, agent');
+    const r = await getPool().query(
+      'SELECT c.company_code, c.steward_code, c.pct, s.first_name, s.last_name, s.email ' +
+      'FROM commissions c LEFT JOIN stewards s ON s.id = c.steward_code ' +
+      'ORDER BY c.company_code, c.steward_code');
     res.json(r.rows);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
