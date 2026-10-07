@@ -1129,7 +1129,8 @@ var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
   companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total (or ee_total), payroll_ineligible (or ee_ineligible), payroll_opted_out (or ee_optedout), payroll_qualified (or ee_qualified), payroll_enrolled (or ee_enrolled), payroll_not_enrolled (or ee_not_enrolled), payroll_new_qualified (or ee_new_qualified), payroll_dataset_date (or ee_dataset_date, YYYY-MM-DD), active (Y or N, default Y; N hides the company from views and totals without deleting anything). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
-  billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)'
+  billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)',
+  commissions: 'company_code, agent, pct (percent, e.g. 25 for 25%). Up to 10 agents per company code; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
 };
 
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
@@ -1181,25 +1182,35 @@ function viewAdminJobs() {
       '<button class="btn btn-small" id="ftjestclear">Delete all estimates</button><div id="ftjestout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
-      '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, and Billing are updated.</p>' +
+      '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
       '<div class="card-grid">' +
       '<div class="card"><div class="card-title">Import stewards</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.stewards) + '</p>' +
       '<textarea id="imp-stewards-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
-      '<button class="btn btn-primary" id="imp-stewards-go">Validate</button><div id="imp-stewards-out"></div></div>' +
+      '<button class="btn btn-primary" id="imp-stewards-go">Validate</button> ' +
+      '<button class="btn btn-small" id="dl-stewards">Download current</button><div id="imp-stewards-out"></div></div>' +
       '<div class="card"><div class="card-title">Import companies</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.companies) + '</p>' +
       '<textarea id="imp-companies-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
-      '<button class="btn btn-primary" id="imp-companies-go">Validate</button><div id="imp-companies-out"></div></div>' +
+      '<button class="btn btn-primary" id="imp-companies-go">Validate</button> ' +
+      '<button class="btn btn-small" id="dl-companies">Download current</button><div id="imp-companies-out"></div></div>' +
       '<div class="card"><div class="card-title">Import assignments</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.assignments) + '</p>' +
       '<textarea id="imp-assignments-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
-      '<button class="btn btn-primary" id="imp-assignments-go">Validate</button><div id="imp-assignments-out"></div></div>' +
+      '<button class="btn btn-primary" id="imp-assignments-go">Validate</button> ' +
+      '<button class="btn btn-small" id="dl-assignments">Download current</button><div id="imp-assignments-out"></div></div>' +
       '<div class="card"><div class="card-title">Import billing</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.billing) + '</p>' +
       '<textarea id="imp-billing-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
-      '<button class="btn btn-primary" id="imp-billing-go">Validate</button><div id="imp-billing-out"></div></div>' +
+      '<button class="btn btn-primary" id="imp-billing-go">Validate</button> ' +
+      '<button class="btn btn-small" id="dl-billing">Download current</button><div id="imp-billing-out"></div></div>' +
+      '<div class="card"><div class="card-title">Import commissions</div>' +
+      '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.commissions) + '</p>' +
+      '<textarea id="imp-commissions-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<button class="btn btn-primary" id="imp-commissions-go">Validate</button> ' +
+      '<button class="btn btn-small" id="dl-commissions">Download current</button><div id="imp-commissions-out"></div></div>' +
       '</div>' +
+      '<h3>Current commissions</h3><div id="commissionsnow"><p class="muted">Loading...</p></div>' +
       '<h3>Delete data</h3>' +
       '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
       '<div class="card-grid">' +
@@ -1497,6 +1508,64 @@ function viewAdminJobs() {
     wireImportCard('companies', 'companies');
     wireImportCard('assignments', 'assignments');
     wireImportCard('billing', 'billing');
+    function wireDownload(btnId, type, fileName) {
+      document.getElementById(btnId).onclick = function () {
+        var headers = {};
+        if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+        fetch('/api/admin/export/' + type, { headers: headers }).then(function (resp) {
+          if (!resp.ok) throw new Error('Download failed');
+          return resp.blob();
+        }).then(function (blob) {
+          var el = document.createElement('a');
+          el.href = URL.createObjectURL(blob);
+          el.download = fileName;
+          document.body.appendChild(el);
+          el.click();
+          setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+        }).catch(function (err) { alert(err.message); });
+      };
+    }
+    wireDownload('dl-stewards', 'stewards', 'stewards.csv');
+    wireDownload('dl-companies', 'companies', 'companies.csv');
+    wireDownload('dl-assignments', 'assignments', 'assignments.csv');
+    wireDownload('dl-billing', 'billing', 'billing.csv');
+    wireDownload('dl-commissions', 'commissions', 'commissions.csv');
+    function loadCommissionsNow() {
+      var box = document.getElementById('commissionsnow');
+      if (!box) return;
+      api.get('/api/admin/commissions').then(function (list) {
+        if (!list.length) { box.innerHTML = '<p class="muted">No commissions on file yet.</p>'; return; }
+        var rows = list.map(function (c) {
+          return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.agent) + '</td><td>' + esc(String(c.pct)) + '%</td></tr>';
+        }).join('');
+        box.innerHTML = '<div class="table-scroll"><table class="data-table"><thead><tr><th>Company code</th><th>Agent</th><th>%</th></tr></thead><tbody>' +
+          rows + '</tbody></table></div>';
+      }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
+    }
+    loadCommissionsNow();
+    document.getElementById('imp-commissions-go').onclick = function () {
+      var out = document.getElementById('imp-commissions-out');
+      var rows = parseCSV(document.getElementById('imp-commissions-csv').value);
+      if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
+      out.innerHTML = '<p class="muted">Validating...</p>';
+      api.post('/api/admin/import-commissions', { rows: rows, dry_run: true }).then(function (d) {
+        if (!d.success) {
+          out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' +
+            '<p class="muted">Fix the file and validate again. Nothing was imported.</p>';
+          return;
+        }
+        out.innerHTML = '<h3>Validation</h3>' +
+          okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
+          '<button class="btn btn-primary" id="imp-commissions-confirm">Confirm import of ' + d.valid_count + ' rows</button>';
+        document.getElementById('imp-commissions-confirm').onclick = function () {
+          out.innerHTML = '<p class="muted">Importing...</p>';
+          api.post('/api/admin/import-commissions', { rows: rows, dry_run: false }).then(function (r) {
+            out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' commission rows for ' + r.companies + ' companies.');
+            loadCommissionsNow();
+          }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+        };
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
     function del(target, mode, key, key2, confirmText) {
       var out = document.getElementById('delout');
       if (!window.confirm(confirmText)) return;

@@ -169,6 +169,15 @@ async function migrate() {
     'mime_type TEXT NOT NULL, ' +
     'data BYTEA NOT NULL, ' +
     'uploaded_at TIMESTAMPTZ DEFAULT NOW())');
+  // Commission splits: one row per (company, agent). Uploaded via the Jobs
+  // page; each upload replaces the rows for every company code it mentions.
+  await db.query('CREATE TABLE IF NOT EXISTS commissions (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'company_code TEXT NOT NULL, ' +
+    'agent TEXT NOT NULL, ' +
+    'pct NUMERIC NOT NULL, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'UNIQUE(company_code, agent))');
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
@@ -2026,6 +2035,146 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     res.json({ success: true, dry_run: false, imported: imported, errors: commitErrors });
   } catch (error) {
     console.error('Import error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- admin CSV exports (download anything importable)
+function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (s.indexOf(',') !== -1 || s.indexOf('"') !== -1 || s.indexOf('\n') !== -1 || s.indexOf('\r') !== -1) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+function toCSV(headers, rows) {
+  const lines = [headers.map(csvCell).join(',')];
+  rows.forEach(function (r) { lines.push(headers.map(function (h) { return csvCell(r[h]); }).join(',')); });
+  return lines.join('\r\n');
+}
+app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
+  try {
+    const type = req.params.type;
+    const db = getPool();
+    let headers, rows;
+    if (type === 'stewards') {
+      headers = ['steward_id', 'email', 'first_name', 'last_name', 'phone'];
+      rows = (await db.query('SELECT id AS steward_id, email, first_name, last_name, phone FROM stewards ORDER BY id')).rows;
+    } else if (type === 'companies') {
+      headers = ['company_code', 'company_name', 'ee_company_code', 'ee_company_name', 'payroll_total',
+        'payroll_ineligible', 'payroll_opted_out', 'payroll_qualified', 'payroll_enrolled',
+        'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date', 'active'];
+      rows = (await db.query(
+        "SELECT company_code, company_name, ee_company_code, ee_company_name, payroll_total, payroll_ineligible, " +
+        "payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, " +
+        "TO_CHAR(payroll_dataset_date, 'YYYY-MM-DD') AS payroll_dataset_date, " +
+        "CASE WHEN active IS FALSE THEN 'N' ELSE 'Y' END AS active FROM companies ORDER BY company_code")).rows;
+    } else if (type === 'assignments') {
+      headers = ['steward_id', 'company_code'];
+      rows = (await db.query(
+        'SELECT a.steward_id, c.company_code FROM assignments a JOIN companies c ON c.id = a.company_id ' +
+        'ORDER BY a.steward_id, c.company_code')).rows;
+    } else if (type === 'billing') {
+      headers = ['company_code', 'company_name', 'payroll_date', 'lives_count', 'total_invoice', 'status', 'paid_date'];
+      rows = (await db.query(
+        "SELECT company_code, company_name, TO_CHAR(payroll_date, 'YYYY-MM-DD') AS payroll_date, lives_count, " +
+        "total_invoice, status, TO_CHAR(paid_date, 'YYYY-MM-DD') AS paid_date FROM invoices " +
+        'ORDER BY company_code, payroll_date')).rows;
+    } else if (type === 'commissions') {
+      headers = ['company_code', 'agent', 'pct'];
+      rows = (await db.query('SELECT company_code, agent, pct FROM commissions ORDER BY company_code, agent')).rows;
+    } else {
+      return res.status(400).json({ error: 'unknown export type' });
+    }
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', 'attachment; filename="' + type + '.csv"');
+    res.send(toCSV(headers, rows));
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- admin: commission table import
+// Columns: company_code, agent, pct. The file is the complete commission
+// table for every company code it mentions: validated all-or-nothing first,
+// then existing rows for those companies are replaced. Any problem rejects
+// the whole file with an explanation and imports nothing.
+app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
+  try {
+    const { rows, dry_run } = req.body || {};
+    if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'rows array is required' });
+    const db = getPool();
+    const coMap = {};
+    (await db.query('SELECT company_code FROM companies')).rows.forEach(function (x) { coMap[String(x.company_code)] = true; });
+    const errors = [];
+    const valid = [];
+    const seen = {};
+    const perCompany = {};
+    rows.map(normalizeRow).forEach(function (row, idx) {
+      const line = idx + 2;
+      const e = function (msg) { errors.push('Row ' + line + ': ' + msg); };
+      const code = row.company_code ? String(row.company_code).trim() : '';
+      const agent = row.agent ? String(row.agent).trim() : '';
+      if (!code) { e('company_code is required'); return; }
+      if (!coMap[code]) { e('company ' + code + ' is not on the company list'); return; }
+      if (!agent) { e('agent is required'); return; }
+      const key = code + '|' + agent.toLowerCase();
+      if (seen[key]) { e('duplicate agent "' + agent + '" for company ' + code + ' in this file'); return; }
+      seen[key] = true;
+      let pct = null;
+      if (row.pct !== undefined && row.pct !== null && String(row.pct).trim() !== '') {
+        pct = parseFloat(String(row.pct).trim().replace('%', ''));
+      }
+      if (pct === null || isNaN(pct)) { e('pct must be a number, e.g. 25 for 25%'); return; }
+      if (pct <= 0 || pct > 100) { e('pct must be greater than 0 and at most 100'); return; }
+      valid.push({ company_code: code, agent: agent, pct: pct });
+      if (!perCompany[code]) perCompany[code] = [];
+      perCompany[code].push(pct);
+    });
+    Object.keys(perCompany).forEach(function (code) {
+      const pcts = perCompany[code];
+      if (pcts.length > 10) {
+        errors.push('Company ' + code + ': ' + pcts.length + ' agents in this file — at most 10 agents per company. The file was rejected and nothing was imported.');
+      }
+      const total = pcts.reduce(function (a, b) { return a + b; }, 0);
+      const rounded = Math.round(total * 100) / 100;
+      if (Math.abs(total - 100) > 0.01) {
+        errors.push('Company ' + code + ': the percentages add up to ' + rounded + ', not 100. The file was rejected and nothing was imported.');
+      }
+    });
+    if (errors.length > 0) {
+      return res.json({ success: false, errors: errors });
+    }
+    const companyCount = Object.keys(perCompany).length;
+    if (dry_run !== false) {
+      return res.json({ success: true, dry_run: true, valid_count: valid.length, companies: companyCount, errors: [] });
+    }
+    for (const code of Object.keys(perCompany)) {
+      await db.query('DELETE FROM commissions WHERE company_code = $1', [code]);
+    }
+    let imported = 0;
+    for (const v of valid) {
+      await db.query(
+        'INSERT INTO commissions (company_code, agent, pct) VALUES ($1, $2, $3) ' +
+        'ON CONFLICT (company_code, agent) DO UPDATE SET pct = EXCLUDED.pct',
+        [v.company_code, v.agent, v.pct]);
+      imported++;
+    }
+    res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [] });
+  } catch (error) {
+    console.error('Commission import error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Current commission table, for the admin view on the Jobs page.
+app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT company_code, agent, pct FROM commissions ORDER BY company_code, agent');
+    res.json(r.rows);
+  } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
