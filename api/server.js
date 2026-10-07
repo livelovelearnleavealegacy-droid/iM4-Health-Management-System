@@ -1737,6 +1737,48 @@ app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
+// Renumber a steward's ID. Updates every table that references stewards(id)
+// (assignments, messages, user_roles, password_reset_tokens,
+// two_factor_codes, onboarding_clients.created_by,
+// client_documents.uploaded_by, forms.uploaded_by) plus
+// commissions.steward_code, in one transaction. If you renumber your own
+// account, sign out and back in afterwards.
+app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const db = getPool();
+    const oldId = parseInt(req.params.id, 10);
+    const newId = parseInt(req.body && req.body.new_id, 10);
+    if (isNaN(oldId) || oldId <= 0) return res.status(400).json({ error: 'Invalid steward id' });
+    if (isNaN(newId) || newId <= 0) return res.status(400).json({ error: 'New ID must be a positive number' });
+    if (newId === oldId) return res.status(400).json({ error: 'New ID is the same as the current ID' });
+    const target = await db.query('SELECT id FROM stewards WHERE id = $1', [oldId]);
+    if (target.rows.length === 0) return res.status(404).json({ error: 'Steward not found' });
+    const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
+    if (taken.rows.length > 0) return res.status(400).json({ error: 'ID ' + newId + ' is already in use' });
+    await db.query('BEGIN');
+    try {
+      await db.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await db.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await db.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await db.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await db.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await db.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
+      await db.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await db.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await db.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
+      await db.query('UPDATE stewards SET id = $1 WHERE id = $2', [newId, oldId]);
+      await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
+      await db.query('COMMIT');
+    } catch (e) {
+      await db.query('ROLLBACK');
+      throw e;
+    }
+    res.json({ success: true, old_id: oldId, new_id: newId });
+  } catch (error) {
+    console.error('Admin renumber steward error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 // v5.2: delete a steward (admin only). Refuses to delete the last admin.
 app.delete('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   try {

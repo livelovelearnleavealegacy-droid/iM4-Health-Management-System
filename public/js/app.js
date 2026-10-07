@@ -926,12 +926,14 @@ function viewAdminStewards() {
           '<td class="row-actions"><button class="btn btn-small" data-edit="' + s.id + '">Edit</button> ' +
           '<button class="btn btn-small" data-pw="' + s.id + '">Set password</button> ' +
           '<button class="btn btn-small" data-roles="' + s.id + '">Set roles</button> ' +
+          '<button class="btn btn-small" data-renumber="' + s.id + '">Renumber</button> ' +
           '<button class="btn btn-small btn-danger" data-del="' + s.id + '">Delete</button></td></tr>';
       }).join('');
       render(shell(
         '<h2>Stewards</h2><div id="msg"></div>' +
         '<p class="muted">Stewards are updated by CSV import only. ' +
-        'Use "Edit" to change name, email, or phone. "Set password" gives a steward their login password, "Set roles" grants Steward, Top Dog, or Admin.</p>' +
+        'Use "Edit" to change name, email, or phone. "Set password" gives a steward their login password, "Set roles" grants Steward, Top Dog, or Admin. ' +
+        '"Renumber" changes the Steward ID everywhere it is used (assignments, roles, messages, commission splits); if you renumber your own account, sign out and back in.</p>' +
         '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table><div id="editbox"></div><div id="pwbox"></div><div id="rolebox"></div>',
         '#/admin/stewards'));
@@ -981,6 +983,29 @@ function viewAdminStewards() {
             });
           };
         })(dbtns[d]);
+      }
+      var rbtns = document.querySelectorAll('[data-renumber]');
+      for (var r = 0; r < rbtns.length; r++) {
+        (function (b) {
+          b.onclick = function () {
+            var id = b.getAttribute('data-renumber');
+            var newId = prompt('Renumber steward ' + id + ' to which new Steward ID?', '');
+            if (newId === null) return;
+            newId = String(newId).trim();
+            if (!/^[1-9][0-9]*$/.test(newId)) { alert('Enter a positive whole number.'); return; }
+            if (!confirm('Change steward ' + id + ' to ID ' + newId + '? Assignments, roles, messages, and commission splits move with it.')) return;
+            api.post('/api/admin/stewards/' + id + '/renumber', { new_id: parseInt(newId, 10) }).then(function (res) {
+              var msg = 'Steward ' + res.old_id + ' is now ID ' + res.new_id + '.';
+              if (state.user && String(state.user.id) === String(res.old_id)) {
+                msg += ' That was your own account — sign out and back in.';
+              }
+              document.getElementById('msg').innerHTML = okHtml(msg);
+              viewAdminStewards();
+            }).catch(function (err) {
+              document.getElementById('msg').innerHTML = errorHtml(err.message);
+            });
+          };
+        })(rbtns[r]);
       }
       var btns = document.querySelectorAll('[data-pw]');
       for (var i = 0; i < btns.length; i++) {
