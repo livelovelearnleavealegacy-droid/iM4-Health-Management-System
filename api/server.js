@@ -192,64 +192,54 @@ async function migrate() {
     await db.query('ALTER TABLE commissions ALTER COLUMN steward_code TYPE INTEGER USING steward_code::integer');
   }
   // One-time 2026-10-07: Leroy asked for two specific steward ID changes
-  // (Leroy McCarty -> 100000, Daylynne Ward -> 100100). Idempotent: matches
-  // by first+last name or the full name column (trimmed, case-insensitive),
-  // requires exactly one match, and skips when the target ID is taken or
-  // already set. Runs inside migrate() because there is no other write path
-  // to the database from here.
-  async function renumberStewardOnce(firstName, lastName, newId) {
-    const fullName = firstName + ' ' + lastName;
-    const found = await db.query(
-      'SELECT id, first_name, last_name, name, email FROM stewards ' +
-      "WHERE (LOWER(TRIM(first_name)) = LOWER($1) AND LOWER(TRIM(last_name)) = LOWER($2)) " +
-      "OR LOWER(TRIM(name)) = LOWER($3)",
-      [firstName, lastName, fullName]);
+  // (hello@evolvedadministration.com -> 100000, daylynne@innovativehia.com
+  // -> 100100). Idempotent: matches by email (UNIQUE, so exactly one match
+  // or none). Uses a dedicated client so the copy/repoint/delete runs as
+  // one atomic transaction (pool.query would scatter statements across
+  // connections). Copy uses a temp email since email is UNIQUE; the real
+  // email is restored after the old row is deleted.
+  async function renumberStewardOnce(email, newId) {
+    const found = await db.query('SELECT id, email FROM stewards WHERE LOWER(email) = LOWER($1)', [email]);
     if (found.rows.length !== 1) {
-      console.log('Renumber skipped for ' + firstName + ' ' + lastName + ': found ' + found.rows.length + ' matching stewards ' +
-        JSON.stringify(found.rows.map(function (r) { return { id: r.id, email: r.email }; })));
+      console.log('Renumber skipped for ' + email + ': found ' + found.rows.length + ' matching stewards');
       return;
     }
     const oldId = found.rows[0].id;
-    if (oldId === newId) { console.log('Renumber: ' + firstName + ' ' + lastName + ' already ID ' + newId); return; }
+    if (oldId === newId) { console.log('Renumber: ' + email + ' already ID ' + newId); return; }
     const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
     if (taken.rows.length > 0) { console.log('Renumber skipped: ID ' + newId + ' already in use'); return; }
-    // FK constraints are not deferrable, so a plain UPDATE of the PK fails
-    // whichever order you do it in (child-first fails the parent check,
-    // parent-first fails the child check). Instead: copy the row to the new
-    // ID, repoint every referencing table, then delete the old row (nothing
-    // references it anymore, so no cascade can fire). The copy uses a
-    // temporary email because email is UNIQUE; the real email is restored
-    // after the old row is gone. All inside one transaction.
-    const origEmail = found.rows[0].email;
-    await db.query('BEGIN');
+    const client = await db.connect();
     try {
-      await db.query(
+      await client.query('BEGIN');
+      await client.query(
         'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
         'reset_token, reset_expires, two_factor_enabled) ' +
         "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
         'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
         [newId, oldId]);
-      await db.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await db.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await db.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await db.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await db.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
-      await db.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
-      await db.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await db.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
-      await db.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
-      await db.query('DELETE FROM stewards WHERE id = $1', [oldId]);
-      await db.query('UPDATE stewards SET email = $1 WHERE id = $2', [origEmail, newId]);
-      await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
-      await db.query('COMMIT');
-      console.log('Renumbered steward ' + firstName + ' ' + lastName + ' (' + origEmail + '): ' + oldId + ' -> ' + newId);
+      await client.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
+      await client.query('UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2', [newId, oldId]);
+      await client.query('UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await client.query('UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2', [newId, oldId]);
+      await client.query('UPDATE commissions SET steward_code = $1 WHERE steward_code = $2', [newId, oldId]);
+      await client.query('DELETE FROM stewards WHERE id = $1', [oldId]);
+      await client.query('UPDATE stewards SET email = $1 WHERE id = $2', [email, newId]);
+      await client.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
+      await client.query('COMMIT');
+      console.log('Renumbered steward ' + email + ': ' + oldId + ' -> ' + newId);
     } catch (e) {
-      await db.query('ROLLBACK');
+      await client.query('ROLLBACK');
       throw e;
+    } finally {
+      client.release();
     }
   }
-  await renumberStewardOnce('Leroy', 'McCarty', 100000);
-  await renumberStewardOnce('Daylynne', 'Ward', 100100);
+  await renumberStewardOnce('hello@evolvedadministration.com', 100000);
+  await renumberStewardOnce('daylynne@innovativehia.com', 100100);
   // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
   // the implementation tile is later removed, so real cases keep teaching us.
   await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
