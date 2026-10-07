@@ -1165,7 +1165,10 @@ function viewAdminJobs() {
       '<button class="btn btn-small" id="dl-billing">Download current</button><div id="imp-billing-out"></div></div>' +
       '<div class="card"><div class="card-title">Import commissions</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.commissions) + '</p>' +
-      '<textarea id="imp-commissions-csv" rows="4" class="csvbox" placeholder="paste CSV here"></textarea>' +
+      '<p class="muted">Or upload your commission schedule spreadsheet (XLSX) directly — it reads the ACCOUNT and AGENT/% columns automatically.</p>' +
+      '<input type="file" id="imp-commissions-file" accept=".xlsx,.xls"> ' +
+      '<button class="btn btn-primary" id="imp-commissions-upload">Upload &amp; validate</button><div id="imp-commissions-fileout"></div>' +
+      '<hr><textarea id="imp-commissions-csv" rows="4" class="csvbox" placeholder="or paste CSV here"></textarea>' +
       '<button class="btn btn-primary" id="imp-commissions-go">Validate</button> ' +
       '<button class="btn btn-small" id="dl-commissions">Download current</button><div id="imp-commissions-out"></div></div>' +
       '</div>' +
@@ -1632,6 +1635,41 @@ function viewAdminJobs() {
       });
       return { rows: rows, errors: errors, format: format };
     }
+    document.getElementById('imp-commissions-upload').onclick = function () {
+      var out = document.getElementById('imp-commissions-fileout');
+      var fi = document.getElementById('imp-commissions-file');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
+      var fd = new FormData();
+      fd.append('file', fi.files[0]);
+      out.innerHTML = '<p class="muted">Reading the schedule...</p>';
+      uploadFile('/api/admin/jobs/commissions-parse', fd).then(function (p) {
+        if (p.errors.length) {
+          out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + p.errors.map(esc).join('<br>') + '</div>' +
+            '<p class="muted">Fix the file and upload again. Nothing was imported.</p>';
+          return;
+        }
+        var rows = p.rows;
+        if (rows.length === 0) { out.innerHTML = errorHtml('No data rows found.'); return; }
+        out.innerHTML = '<p class="muted">Parsed ' + rows.length + ' rows from ' + esc(p.file_name) + '. Validating...</p>';
+        api.post('/api/admin/import-commissions', { rows: rows, dry_run: true }).then(function (d) {
+          if (!d.success) {
+            out.innerHTML = '<h3>Rejected</h3><div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' +
+              '<p class="muted">Fix the file and upload again. Nothing was imported.</p>';
+            return;
+          }
+          out.innerHTML = '<h3>Validation</h3>' +
+            okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
+            '<button class="btn btn-primary" id="imp-commissions-fileconfirm">Confirm import of ' + d.valid_count + ' rows</button>';
+          document.getElementById('imp-commissions-fileconfirm').onclick = function () {
+            out.innerHTML = '<p class="muted">Importing...</p>';
+            api.post('/api/admin/import-commissions', { rows: rows, dry_run: false }).then(function (r) {
+              out.innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' commission rows for ' + r.companies + ' companies.');
+              loadCommissionsNow();
+            }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+          };
+        }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
     document.getElementById('imp-commissions-go').onclick = function () {
       var out = document.getElementById('imp-commissions-out');
       out.innerHTML = '<p class="muted">Detecting format...</p>';

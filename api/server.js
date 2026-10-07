@@ -1904,6 +1904,74 @@ app.get('/api/admin/jobs/sol-export', requireAdmin, async (req, res) => {
   } catch (error) { console.error('Soluta export error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Parse a commission schedule XLSX (the IM4_COMM_SETUP format) into
+// { company_code, steward_code, pct } rows. Columns: ACCOUNT (steward ID),
+// then repeating (AGENT, %) pairs where AGENT is "123456 - Name" and %
+// is a decimal (0.375 = 37.5%). Duplicate company codes for the same
+// steward are summed.
+function parseCommissionSchedule(buffer) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+  if (arr.length < 2) throw new Error('No data rows found in the spreadsheet.');
+  const headers = (arr[0] || []).map(function (h) { return String(h || '').toUpperCase().trim(); });
+  const acctIdx = headers.indexOf('ACCOUNT');
+  if (acctIdx === -1) throw new Error('Could not find the ACCOUNT column.');
+  // Find (AGENT, %) pairs: an AGENT column followed by a % column.
+  const pairs = [];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    if ((h.indexOf('AGENT') !== -1 || h.indexOf('WRITING') !== -1) && i + 1 < headers.length) {
+      const nh = headers[i + 1];
+      if (nh.indexOf('%') !== -1) pairs.push({ agent: i, pct: i + 1 });
+    }
+  }
+  if (pairs.length === 0) throw new Error('Could not find the AGENT / % columns.');
+  const rows = [];
+  const errors = [];
+  for (let ri = 1; ri < arr.length; ri++) {
+    const r = arr[ri] || [];
+    const acctRaw = r[acctIdx];
+    if (acctRaw === null || acctRaw === undefined || String(acctRaw).trim() === '') continue;
+    const stewardId = String(acctRaw).trim();
+    const byCompany = {};
+    for (const p of pairs) {
+      const agentRaw = r[p.agent];
+      if (agentRaw === null || agentRaw === undefined || String(agentRaw).trim() === '') continue;
+      const code = String(agentRaw).split(' - ')[0].trim().split(' ')[0];
+      if (!code) continue;
+      const pctRaw = r[p.pct];
+      if (pctRaw === null || pctRaw === undefined || String(pctRaw).trim() === '') continue;
+      const dec = parseFloat(String(pctRaw));
+      if (isNaN(dec)) {
+        errors.push('Row ' + (ri + 1) + ': invalid % "' + pctRaw + '" for agent ' + code);
+        continue;
+      }
+      const pct = Math.round(dec * 100 * 10000) / 10000;
+      byCompany[code] = (byCompany[code] || 0) + pct;
+    }
+    const codes = Object.keys(byCompany);
+    if (codes.length === 0) continue;
+    const total = codes.reduce(function (a, c) { return a + byCompany[c]; }, 0);
+    if (Math.abs(total - 100) > 0.01) {
+      errors.push('Account ' + stewardId + ': percentages sum to ' + (Math.round(total * 100) / 100) + ', not 100.');
+    }
+    for (const code of codes) {
+      rows.push({ company_code: code, steward_code: stewardId, pct: Math.round(byCompany[code] * 10000) / 10000 });
+    }
+  }
+  return { rows: rows, errors: errors };
+}
+
+app.post('/api/admin/jobs/commissions-parse', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const parsed = parseCommissionSchedule(req.file.buffer);
+    res.json({ ok: true, rows: parsed.rows, errors: parsed.errors, file_name: req.file.originalname });
+  } catch (error) { console.error('Commission parse error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
 // ---------------------------------------------------------------- v5.9: delete bills (admin)
 // Any combination of statuses (open/paid), bill types (F/S), and accounts.
 app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
