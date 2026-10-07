@@ -416,6 +416,15 @@ function requireAdmin(req, res, next) {
   });
 }
 
+// Stewards / Companies / Assignments admin pages are visible to Top Dogs too.
+function requireAdminOrTopDog(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog') return res.status(403).json({ error: 'Admin or Top Dog only' });
+    next();
+  });
+}
+
 function checkSyncSecret(req, res) {
   if (!SYNC_SECRET || req.headers['x-sync-secret'] !== SYNC_SECRET) {
     res.status(403).json({ error: 'Forbidden' });
@@ -1678,7 +1687,7 @@ app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)
-app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
+app.get('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
       "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.role, s.created_at, " +
@@ -1692,7 +1701,7 @@ app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
+app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, res) => {
   try {
     const { password } = req.body || {};
     if (!password || String(password).length < 8) {
@@ -1709,7 +1718,7 @@ app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
 });
 
 // v5.2: edit a steward's profile (admin only).
-app.put('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
+app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   try {
     const { first_name, last_name, email, phone } = req.body || {};
     if (!email || String(email).trim() === '') {
@@ -1729,7 +1738,7 @@ app.put('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
 });
 
 // v5.2: delete a steward (admin only). Refuses to delete the last admin.
-app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
+app.delete('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   try {
     const db = getPool();
     const id = req.params.id;
@@ -1764,7 +1773,7 @@ app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
 });
 
 // v5: replace a steward's roles (admin only). Keeps at least one role.
-app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
+app.post('/api/admin/set-roles', requireAdminOrTopDog, async (req, res) => {
   try {
     const steward_id = req.body && req.body.steward_id;
     const roles = req.body && req.body.roles;
@@ -1792,7 +1801,7 @@ app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: companies (read-only list; import only)
-app.get('/api/admin/companies', requireAdmin, async (req, res) => {
+app.get('/api/admin/companies', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort('c'));
     const inv = await getPool().query(
@@ -1814,7 +1823,7 @@ app.get('/api/admin/companies', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: assignments (read-only list; import only)
-app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
+app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
       'SELECT a.id, a.steward_id, c.company_code, s.email AS steward_email ' +
@@ -2781,16 +2790,16 @@ function handleUpload(field) {
 function requireOnboarder(req, res, next) {
   requireAuth(req, res, function () {
     const roles = req.user.roles || [];
-    if (roles.indexOf('admin') !== -1 || roles.indexOf('onboarding') !== -1) return next();
+    if (roles.indexOf('admin') !== -1 || roles.indexOf('onboarding') !== -1 || roles.indexOf('top_dog') !== -1) return next();
     return res.status(403).json({ error: 'Onboarding access only' });
   });
 }
 
-// Forms tab: visible to top_dog, onboarding, and admin.
+// Forms tab: visible to top_dog and admin.
 function requireFormsViewer(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
-    if (r === 'admin' || r === 'top_dog' || r === 'onboarding') return next();
+    if (r === 'admin' || r === 'top_dog') return next();
     return res.status(403).json({ error: 'Not available for this role' });
   });
 }
@@ -3627,7 +3636,7 @@ app.post('/api/admin/onboarding/:id/reopen', requireAdmin, async (req, res) => {
 
 // ---------------------------------------------------------------- blank forms library
 // The Forms tab stores blank forms (e.g. the Soluta Billing Intake Form)
-// used to generate client paperwork. Visible to top_dog, onboarding, admin;
+// used to generate client paperwork. Visible to top_dog and admin;
 // uploads and deletes are admin-only.
 app.get('/api/forms', requireFormsViewer, async (req, res) => {
   try {

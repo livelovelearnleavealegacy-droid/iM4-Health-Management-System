@@ -52,7 +52,7 @@ function hasRole(r) {
   var u = state.user;
   return !!u && ((u.roles || []).indexOf(r) !== -1);
 }
-function canOnboard() { return hasRole('onboarding') || hasRole('admin'); }
+function canOnboard() { var r = activeRole(); return r === 'onboarding' || r === 'admin' || r === 'top_dog'; }
 
 // POST a FormData body (file uploads) with the auth token.
 function uploadFile(url, formData) {
@@ -189,37 +189,30 @@ function activeRole() {
 }
 
 // Screens per role:
-// steward: Dashboard, Companies, Billing, Implementation (assigned accounts only)
-// onboarding: Companies, Implementation, Onboarding (all clients)
-// top_dog: Dashboard, Companies, Billing, Implementation (all accounts)
 // admin: everything
+// top_dog: everything except Jobs
+// onboarding: Onboarding and Implementation only
+// steward: Dashboard, Companies, Billing, Implementation
 function navLinks() {
-  var u = state.user;
   var role = activeRole();
-  var links;
-  if (role === 'onboarding') {
-    links = [
-      ['#/clients', 'Companies'],
-      ['#/implementations', 'Implementation'],
-      ['#/onboarding', 'Onboarding']
-    ];
-  } else {
-    links = [
-      ['#/dashboard', 'Dashboard'],
-      ['#/clients', 'Companies'],
-      ['#/billing', 'Billing'],
-      ['#/implementations', 'Implementation']
-    ];
-    if (role === 'admin') links.push(['#/onboarding', 'Onboarding']);
+  var links = [];
+  if (role === 'admin' || role === 'top_dog' || role === 'steward') {
+    links.push(['#/dashboard', 'Dashboard']);
+    links.push(['#/clients', 'Companies']);
+    links.push(['#/billing', 'Billing']);
   }
+  links.push(['#/implementations', 'Implementation']);
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
-    links.push(['#/forms', 'Forms']);
+    links.push(['#/onboarding', 'Onboarding']);
   }
-  if (role === 'admin') {
-    links.push(['#/admin/jobs', 'Jobs']);
+  if (role === 'admin' || role === 'top_dog') {
+    links.push(['#/forms', 'Forms']);
     links.push(['#/admin/stewards', 'Stewards']);
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
+  }
+  if (role === 'admin') {
+    links.push(['#/admin/jobs', 'Jobs']);
   }
   return links;
 }
@@ -596,6 +589,7 @@ function viewSecurity() {
 // ---------------------------------------------------------------- clients (parent cards, rolled-up payroll)
 function viewClients() {
   requireUser(function () {
+    if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     var q = '';
     function load() {
       var url = '/api/clients' + (q ? '?q=' + encodeURIComponent(q) : '');
@@ -922,7 +916,8 @@ function viewProject(id) {
 // ---------------------------------------------------------------- admin: stewards (import only; password + roles set here)
 function viewAdminStewards() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
+    var ar = activeRole();
+    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/stewards').then(function (list) {
       var rows = list.map(function (s) {
         var roles = (s.roles || []).map(roleLabel).join(', ');
@@ -1047,7 +1042,8 @@ function viewAdminStewards() {
 // ---------------------------------------------------------------- admin: companies (import only, with parent columns)
 function viewAdminCompanies() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
+    var ar = activeRole();
+    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
       function parentCode(c) { return c.ee_company_code || c.parent_company_code; }
@@ -1077,7 +1073,8 @@ function viewAdminCompanies() {
 // ---------------------------------------------------------------- admin: assignments (import only)
 function viewAdminAssignments() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
+    var ar = activeRole();
+    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/assignments').then(function (list) {
       var rows = list.map(function (a) {
         return '<tr><td><b>' + a.steward_id + '</b><div class="muted">' + esc(a.steward_email || '') + '</div></td>' +
@@ -1136,7 +1133,7 @@ var IMPORT_FORMATS = {
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
 function viewAdminJobs() {
   requireUser(function () {
-    if (state.user.role !== 'admin') { location.hash = '#/dashboard'; return; }
+    if (activeRole() !== 'admin') { location.hash = '#/dashboard'; return; }
     render(shell(
       '<h2>Jobs</h2><div id="msg"></div>' +
       '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; updates run Sunday through Thursday at 9:00 PM.</p>' +
@@ -1758,7 +1755,7 @@ function obDocLabel(t) {
 function viewForms() {
   requireUser(function () {
     var role = activeRole();
-    if (['admin', 'top_dog', 'onboarding'].indexOf(role) === -1) { location.hash = '#/dashboard'; return; }
+    if (['admin', 'top_dog'].indexOf(role) === -1) { location.hash = '#/dashboard'; return; }
     var isAdmin = role === 'admin';
     function load() {
       api.get('/api/forms').then(function (list) {
