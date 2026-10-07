@@ -1127,7 +1127,7 @@ function parseCSV(text) {
 
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
-  companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total (or ee_total), payroll_ineligible (or ee_ineligible), payroll_opted_out (or ee_optedout), payroll_qualified (or ee_qualified), payroll_enrolled (or ee_enrolled), payroll_not_enrolled (or ee_not_enrolled), payroll_new_qualified (or ee_new_qualified), payroll_dataset_date (or ee_dataset_date, YYYY-MM-DD), active (Y or N, default Y; N hides the company from views and totals without deleting anything). Headers are case-insensitive.',
+  companies: 'parent_code, parent_name, company_code, company_name. Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code, company_name, payroll_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD, for paid invoices)',
   commissions: 'One line per company: company_code, then repeating steward_code, pct pairs (e.g. company_code,steward_code,pct,steward_code,pct). steward_code is the Steward ID from the stewards list. Up to 10 stewards per company; the percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'

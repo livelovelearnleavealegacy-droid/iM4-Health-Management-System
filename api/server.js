@@ -1829,9 +1829,7 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 
 // ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
 // stewards:    steward_id, email, first_name, last_name, phone, password (everyone imported is a steward)
-// companies:   company_code, company_name, ee_company_code, ee_company_name,
-//              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
-//              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
+// companies:   parent_code, parent_name, company_code, company_name
 // assignments: steward_id, company_code
 // Date values: accept YYYY-MM-DD or an Excel serial number (days since 1899-12-30).
 function toISODate(v) {
@@ -1910,25 +1908,12 @@ function validateImport(type, rows) {
       const key = String(row.company_code).trim();
       if (seen[key]) { e('duplicate company_code in file'); return; }
       seen[key] = true;
-      const eeCode = row.ee_company_code || row.parent_company_code;
-      const eeName = row.ee_company_name || row.parent_company_name;
-      let active = true;
-      if (row.active !== undefined && row.active !== null && String(row.active).trim() !== '') {
-        const av = String(row.active).trim().toUpperCase();
-        if (['Y', 'YES', 'TRUE', '1'].indexOf(av) !== -1) active = true;
-        else if (['N', 'NO', 'FALSE', '0'].indexOf(av) !== -1) active = false;
-        else { e('active must be Y or N'); return; }
-      }
+      const parentCode = row.parent_code || row.ee_company_code || row.parent_company_code;
+      const parentName = row.parent_name || row.ee_company_name || row.parent_company_name;
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
-        active: active,
-        ee_company_code: eeCode ? String(eeCode).trim() : null,
-        ee_company_name: eeName ? String(eeName).trim() : null,
-        payroll_total: num(row.payroll_total), payroll_ineligible: num(row.payroll_ineligible),
-        payroll_opted_out: num(row.payroll_opted_out), payroll_qualified: num(row.payroll_qualified),
-        payroll_enrolled: num(row.payroll_enrolled), payroll_not_enrolled: num(row.payroll_not_enrolled),
-        payroll_new_qualified: num(row.payroll_new_qualified),
-        payroll_dataset_date: toISODate(row.payroll_dataset_date)
+        ee_company_code: parentCode ? String(parentCode).trim() : null,
+        ee_company_name: parentName ? String(parentName).trim() : null
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
@@ -2015,19 +2000,11 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
       for (const c of v.valid) {
         try {
           await db.query(
-            'INSERT INTO companies (company_code, company_name, active, ee_company_code, ee_company_name, ' +
-            'payroll_total, payroll_ineligible, payroll_opted_out, ' +
-            'payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
-            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ' +
-            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, active = EXCLUDED.active, ' +
-            'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
-            'payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, ' +
-            'payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_qualified = EXCLUDED.payroll_qualified, ' +
-            'payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, ' +
-            'payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
-            [c.company_code, c.company_name, c.active, c.ee_company_code, c.ee_company_name,
-              c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
-              c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
+            'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name) ' +
+            'VALUES ($1,$2,$3,$4) ' +
+            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+            'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name',
+            [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name]);
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
       }
@@ -2075,14 +2052,10 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       headers = ['steward_id', 'email', 'first_name', 'last_name', 'phone'];
       rows = (await db.query('SELECT id AS steward_id, email, first_name, last_name, phone FROM stewards ORDER BY id')).rows;
     } else if (type === 'companies') {
-      headers = ['company_code', 'company_name', 'ee_company_code', 'ee_company_name', 'payroll_total',
-        'payroll_ineligible', 'payroll_opted_out', 'payroll_qualified', 'payroll_enrolled',
-        'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date', 'active'];
+      headers = ['parent_code', 'parent_name', 'company_code', 'company_name'];
       rows = (await db.query(
-        "SELECT company_code, company_name, ee_company_code, ee_company_name, payroll_total, payroll_ineligible, " +
-        "payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, " +
-        "TO_CHAR(payroll_dataset_date, 'YYYY-MM-DD') AS payroll_dataset_date, " +
-        "CASE WHEN active IS FALSE THEN 'N' ELSE 'Y' END AS active FROM companies ORDER BY company_code")).rows;
+        'SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, company_name ' +
+        'FROM companies ORDER BY company_code')).rows;
     } else if (type === 'assignments') {
       headers = ['steward_id', 'company_code'];
       rows = (await db.query(
