@@ -1671,6 +1671,36 @@ app.post('/api/admin/jobs/ftj-estimate-clear', requireAdmin, async (req, res) =>
   } catch (error) { console.error('FTJ estimate clear error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
+// ---------------------------------------------------------------- Soluta billing (S): report inspector
+// Parses an uploaded Soluta report and returns its structure (sheets, headers,
+// sample rows) so the column mapping can be confirmed before building the import.
+app.post('/api/admin/jobs/sol-preview', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const name = (req.file.originalname || '').toLowerCase();
+    let sheets = [];
+    if (name.endsWith('.csv')) {
+      const text = req.file.buffer.toString('utf-8');
+      const lines = text.split('\n').filter(function (l) { return l.trim(); }).slice(0, 6);
+      const rows = lines.map(function (l) { return l.split(',').map(function (c) { return c.trim().replace(/^"|"$/g, ''); }); });
+      sheets = [{ name: 'csv', headers: rows[0] || [], sample: rows.slice(1) }];
+    } else {
+      const XLSX = require('xlsx');
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+      sheets = wb.SheetNames.slice(0, 5).map(function (sn) {
+        const ws = wb.Sheets[sn];
+        const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+        const headers = (arr[0] || []).map(function (h) { return h === null ? '' : String(h); });
+        const sample = arr.slice(1, 6).map(function (r) {
+          return r.map(function (c) { return c === null ? '' : String(c); });
+        });
+        return { name: sn, headers: headers, sample: sample, total_rows: arr.length };
+      });
+    }
+    res.json({ ok: true, file_name: req.file.originalname, sheets: sheets });
+  } catch (error) { console.error('Soluta preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
 // ---------------------------------------------------------------- v5.9: delete bills (admin)
 // Any combination of statuses (open/paid), bill types (F/S), and accounts.
 app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {

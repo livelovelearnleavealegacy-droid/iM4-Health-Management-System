@@ -1109,15 +1109,18 @@ function viewAdminJobs() {
       '<p class="muted">Select a steward, then edit their details, password, roles, ID, or delete them. The Stewards page is view-only.</p>' +
       '<select id="editstewardsel" style="max-width: 100%;"><option value="">Loading...</option></select>' +
       '<div id="editstewardbox" style="margin-top:8px;"></div><div id="editstewardmsg"></div></div>' +
-      '<div class="card"><div class="card-title">FTJ billing: Premium Applied Report</div>' +
+      '<div class="card"><div class="card-title">FTJ billing (F): Premium Applied Report</div>' +
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div></div>' +
-      '<div class="card"><div class="card-title">F billing: estimate unpaid bills</div>' +
-      '<p class="muted">Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d, using the last bill\u2019s lives and total. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
+      '<hr><p class="muted"><b>Unpaid estimates.</b> Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
       '<label>Only accounts paid within the last <input id="ftjestdays" type="number" value="90" min="1" max="3650" style="width: 70px;"> days</label> ' +
       '<button class="btn btn-primary" id="ftjest">Preview estimates</button> ' +
       '<button class="btn btn-small" id="ftjestclear">Delete all estimates</button><div id="ftjestout"></div></div>' +
+      '<div class="card"><div class="card-title">Soluta billing (S): Soluta report</div>' +
+      '<p class="muted">Upload the Soluta report spreadsheet. It contains both paid and pending S bills \u2014 no estimating. Preview the bills first, then import.</p>' +
+      '<input type="file" id="solfile" accept=".xlsx,.xls,.csv"> ' +
+      '<button class="btn btn-primary" id="solpreview">Upload &amp; preview</button><div id="solout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
       '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
@@ -1409,6 +1412,27 @@ function viewAdminJobs() {
       out.innerHTML = '<p class="muted">Deleting estimates...</p>';
       api.post('/api/admin/jobs/ftj-estimate-clear', {}).then(function (r) {
         out.innerHTML = okHtml('Deleted ' + r.deleted + ' estimated bills.');
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
+    document.getElementById('solpreview').onclick = function () {
+      var out = document.getElementById('solout');
+      var fi = document.getElementById('solfile');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
+      var fd = new FormData();
+      fd.append('file', fi.files[0]);
+      out.innerHTML = '<p class="muted">Reading the report...</p>';
+      uploadFile('/api/admin/jobs/sol-preview', fd).then(function (r) {
+        var html = '<p><b>' + esc(r.file_name) + '</b> <span class="muted">— confirm the column mapping below, then tell me and I will build the S import.</span></p>';
+        r.sheets.forEach(function (sh) {
+          html += '<h4>Sheet: ' + esc(sh.name) + (sh.total_rows ? ' <span class="muted">(' + sh.total_rows + ' rows)</span>' : '') + '</h4>';
+          html += '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+            sh.headers.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') +
+            '</tr></thead><tbody>' +
+            sh.sample.map(function (row) {
+              return '<tr>' + row.map(function (c) { return '<td>' + esc(c) + '</td>'; }).join('') + '</tr>';
+            }).join('') + '</tbody></table></div>';
+        });
+        out.innerHTML = html;
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
     function wireImportCard(prefix, type) {
