@@ -1754,18 +1754,33 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
     if (newId === oldId) return res.status(400).json({ error: 'New ID is the same as the current ID' });
     const target = await db.query('SELECT id, email FROM stewards WHERE id = $1', [oldId]);
     if (target.rows.length === 0) return res.status(404).json({ error: 'Steward not found' });
-    const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [newId]);
-    if (taken.rows.length > 0) return res.status(400).json({ error: 'ID ' + newId + ' is already in use' });
     const origEmail = target.rows[0].email;
+    const taken = await db.query('SELECT id, email FROM stewards WHERE id = $1', [newId]);
+    // Self-heal: an interrupted renumber (v5.14.5's non-atomic migration) may
+    // have left a '.renumber-tmp' ghost copy at the target ID. If the ghost
+    // is this steward's own copy (verified by temp email), reuse it instead
+    // of failing: skip the INSERT, repoint (idempotent), delete the old row,
+    // restore the email.
+    let reuseGhost = false;
+    if (taken.rows.length > 0) {
+      const ghostEmail = taken.rows[0].email || '';
+      if (ghostEmail === origEmail + '.renumber-tmp') {
+        reuseGhost = true;
+      } else {
+        return res.status(400).json({ error: 'ID ' + newId + ' is already in use by ' + ghostEmail });
+      }
+    }
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      await client.query(
-        'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
-        'reset_token, reset_expires, two_factor_enabled) ' +
-        "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
-        'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
-        [newId, oldId]);
+      if (!reuseGhost) {
+        await client.query(
+          'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
+          'reset_token, reset_expires, two_factor_enabled) ' +
+          "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
+          'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
+          [newId, oldId]);
+      }
       await client.query('UPDATE assignments SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
       await client.query('UPDATE messages SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
       await client.query('UPDATE user_roles SET steward_id = $1 WHERE steward_id = $2', [newId, oldId]);
@@ -1785,7 +1800,7 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
     } finally {
       client.release();
     }
-    res.json({ success: true, old_id: oldId, new_id: newId });
+    res.json({ success: true, old_id: oldId, new_id: newId, reused_ghost: reuseGhost });
   } catch (error) {
     console.error('Admin renumber steward error:', error);
     res.status(500).json({ error: error.message || 'Internal server error' });
