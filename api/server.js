@@ -1905,10 +1905,11 @@ app.get('/api/admin/jobs/sol-export', requireAdmin, async (req, res) => {
 });
 
 // Parse a commission schedule XLSX (the IM4_COMM_SETUP format) into
-// { company_code, steward_code, pct } rows. Columns: ACCOUNT (steward ID),
-// then repeating (AGENT, %) pairs where AGENT is "123456 - Name" and %
-// is a decimal (0.375 = 37.5%). Duplicate company codes for the same
-// steward are summed.
+// { company_code, steward_code, pct } rows. Columns: ACCOUNT (company code),
+// ACCOUNT NAME, then repeating (AGENT, %) pairs where AGENT is
+// "155026 - First Last" (steward ID + name) and % is a decimal
+// (0.375 = 37.5%). Duplicate steward IDs for the same company are summed.
+// Each company's percentages must add up to 100%.
 function parseCommissionSchedule(buffer) {
   const XLSX = require('xlsx');
   const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
@@ -1934,31 +1935,32 @@ function parseCommissionSchedule(buffer) {
     const r = arr[ri] || [];
     const acctRaw = r[acctIdx];
     if (acctRaw === null || acctRaw === undefined || String(acctRaw).trim() === '') continue;
-    const stewardId = String(acctRaw).trim();
-    const byCompany = {};
+    const companyCode = String(acctRaw).trim();
+    const bySteward = {};
     for (const p of pairs) {
       const agentRaw = r[p.agent];
       if (agentRaw === null || agentRaw === undefined || String(agentRaw).trim() === '') continue;
-      const code = String(agentRaw).split(' - ')[0].trim().split(' ')[0];
-      if (!code) continue;
+      // "155026 - RLJAT" -> steward ID "155026"
+      const stewardId = String(agentRaw).split(' - ')[0].trim().split(' ')[0];
+      if (!stewardId) continue;
       const pctRaw = r[p.pct];
       if (pctRaw === null || pctRaw === undefined || String(pctRaw).trim() === '') continue;
       const dec = parseFloat(String(pctRaw));
       if (isNaN(dec)) {
-        errors.push('Row ' + (ri + 1) + ': invalid % "' + pctRaw + '" for agent ' + code);
+        errors.push('Row ' + (ri + 1) + ': invalid % "' + pctRaw + '" for steward ' + stewardId);
         continue;
       }
       const pct = Math.round(dec * 100 * 10000) / 10000;
-      byCompany[code] = (byCompany[code] || 0) + pct;
+      bySteward[stewardId] = (bySteward[stewardId] || 0) + pct;
     }
-    const codes = Object.keys(byCompany);
-    if (codes.length === 0) continue;
-    const total = codes.reduce(function (a, c) { return a + byCompany[c]; }, 0);
+    const stewardIds = Object.keys(bySteward);
+    if (stewardIds.length === 0) continue;
+    const total = stewardIds.reduce(function (a, sid) { return a + bySteward[sid]; }, 0);
     if (Math.abs(total - 100) > 0.01) {
-      errors.push('Account ' + stewardId + ': percentages sum to ' + (Math.round(total * 100) / 100) + ', not 100.');
+      errors.push('Company ' + companyCode + ': percentages sum to ' + (Math.round(total * 100) / 100) + ', not 100.');
     }
-    for (const code of codes) {
-      rows.push({ company_code: code, steward_code: stewardId, pct: Math.round(byCompany[code] * 10000) / 10000 });
+    for (const sid of stewardIds) {
+      rows.push({ company_code: companyCode, steward_code: sid, pct: Math.round(bySteward[sid] * 10000) / 10000 });
     }
   }
   return { rows: rows, errors: errors };
