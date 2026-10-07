@@ -1601,17 +1601,24 @@ function viewAdminJobs() {
           return;
         }
         // Auto-detect format from the first data line.
-        if (!format && stewardIds && companyCodes) {
-          var firstIsSteward = stewardIds.indexOf(first) !== -1;
-          var firstIsCompany = companyCodes.indexOf(first) !== -1;
+        // Strategy 1: exact ID match against the system lists.
+        // Strategy 2: length heuristic (company codes are 6-digit, steward IDs are 4-digit).
+        if (!format) {
+          var firstIsSteward = stewardIds && stewardIds.indexOf(first) !== -1;
+          var firstIsCompany = companyCodes && companyCodes.indexOf(first) !== -1;
           var pairKey = (rest[0] || '').trim();
-          var pairIsSteward = stewardIds.indexOf(pairKey) !== -1;
-          var pairIsCompany = companyCodes.indexOf(pairKey) !== -1;
+          var pairIsSteward = stewardIds && stewardIds.indexOf(pairKey) !== -1;
+          var pairIsCompany = companyCodes && companyCodes.indexOf(pairKey) !== -1;
           if (firstIsSteward && pairIsCompany) format = 'steward-first';
           else if (firstIsCompany && pairIsSteward) format = 'company-first';
-          else format = 'company-first';
+          else {
+            var firstLen = first.replace(/\D/g, '').length;
+            var pairLen = pairKey.replace(/\D/g, '').length;
+            if (firstLen <= 4 && pairLen >= 6) format = 'steward-first';
+            else if (firstLen >= 6 && pairLen <= 4) format = 'company-first';
+            else format = 'company-first';
+          }
         }
-        if (!format) format = 'company-first';
         for (var p = 0; p < rest.length; p += 2) {
           var a = (rest[p] || '').trim();
           var pct = (rest[p + 1] || '').trim();
