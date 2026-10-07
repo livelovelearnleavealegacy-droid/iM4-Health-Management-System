@@ -321,7 +321,6 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .summary {
   background: #fff;
   border: 1px solid var(--line);
-  border-left: 4px solid var(--accent);
   border-radius: 8px;
   padding: 10px 12px;
   margin: 10px 0;

@@ -279,6 +279,8 @@ async function migrate() {
     ['implementations', 'card_title', 'TEXT'],
     ['implementations', 'payroll_provider', 'TEXT'],
     ['implementations', 'payroll_frequency', 'TEXT'],
+    ['implementations', 'total_employees', 'INT'],
+    ['implementations', 'qualified_employee_count', 'INT'],
     ['implementations', 'notes', 'TEXT']
   ];
   for (const [table, col, def] of cols) {
@@ -2394,15 +2396,27 @@ async function buildTimeline(db, implId) {
   const currentStage = st.rows.length ? String(st.rows[0].stage || '') : '';
   const today = new Date();
   const weekElapsed = Math.max(0, Math.floor((today.getTime() - start.getTime()) / (7 * DAY)));
+  const curStageIdx = STAGES.indexOf(currentStage);
+  let currentMarked = false;
   const blocks = TIMELINE.map(function (b) {
     const sDate = new Date(start.getTime() + b.startWeek * 7 * DAY);
     const eDate = new Date(start.getTime() + b.endWeek * 7 * DAY);
+    const bStageIdx = STAGES.indexOf(b.stage);
+    // Color by actual stage, not by weeks elapsed: blocks before the current
+    // stage are done (blue), the first block of the current stage is current
+    // (purple).
+    const done = curStageIdx !== -1 && bStageIdx !== -1 && bStageIdx < curStageIdx;
+    let current = false;
+    if (!currentMarked && !done && curStageIdx !== -1 && b.stage === currentStage) {
+      current = true;
+      currentMarked = true;
+    }
     return {
       stage: b.stage, block: b.block, startWeek: b.startWeek, endWeek: b.endWeek,
       startDate: sDate.toISOString().slice(0, 10), endDate: eDate.toISOString().slice(0, 10),
       duties: b.duties,
-      done: weekElapsed >= b.endWeek,
-      current: weekElapsed >= b.startWeek && weekElapsed < b.endWeek
+      done: done,
+      current: current
     };
   });
   let cur = null;
@@ -2509,14 +2523,17 @@ async function runGithubSync() {
       const repo = (item.content && item.content.repository) ? item.content.repository.nameWithOwner : null;
       const stage = normalizeStage(status);
       const up = await db.query(
-        'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, updated_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ' +
+        'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, total_employees, qualified_employee_count, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()) ' +
         'ON CONFLICT (github_item_id) DO UPDATE SET company_id = EXCLUDED.company_id, stage = EXCLUDED.stage, ' +
         'status = EXCLUDED.status, github_issue_number = EXCLUDED.github_issue_number, github_repo = EXCLUDED.github_repo, ' +
         'card_title = EXCLUDED.card_title, payroll_provider = EXCLUDED.payroll_provider, ' +
-        'payroll_frequency = EXCLUDED.payroll_frequency, updated_at = NOW() RETURNING id',
+        'payroll_frequency = EXCLUDED.payroll_frequency, total_employees = EXCLUDED.total_employees, ' +
+        'qualified_employee_count = EXCLUDED.qualified_employee_count, updated_at = NOW() RETURNING id',
         [companyId, stage, fields['Priority'] || 'NORMAL', item.id, issueNumber, repo,
-          fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null]);
+          fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null,
+          fields['Total Employees'] != null ? Math.trunc(fields['Total Employees']) : null,
+          fields['Qualified Employee Count'] != null ? Math.trunc(fields['Qualified Employee Count']) : null]);
       await trackStage(db, up.rows[0].id, stage);
       syncedIds.push(item.id);
       synced++;

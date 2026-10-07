@@ -650,7 +650,8 @@ function miniPipeline(current) {
 function implCard(i) {
   var lvl = STAGES.indexOf(i.stage);
   var lvlText = lvl === -1 ? 'Level —' : 'Level ' + (lvl + 1) + ' of ' + STAGES.length;
-  var lives = (i.lives === null || i.lives === undefined) ? '—' : Number(i.lives).toLocaleString('en-US');
+  var totalEE = (i.total_employees === null || i.total_employees === undefined) ? '—' : Number(i.total_employees).toLocaleString('en-US');
+  var qualEE = (i.qualified_employee_count === null || i.qualified_employee_count === undefined) ? '—' : Number(i.qualified_employee_count).toLocaleString('en-US');
   return '<a class="card" href="#/project/' + i.id + '">' +
     '<div class="card-code">' + esc(i.company_code) + '</div>' +
     '<div class="card-title">' + esc(i.company_name) + '</div>' +
@@ -658,7 +659,7 @@ function implCard(i) {
     '<div class="card-line">' + statusHtml(i) + '</div>' +
     '<div class="card-line"><b>' + esc(i.stage || '') + '</b></div>' +
     '<div class="card-line muted">' + lvlText + '</div>' +
-    '<div class="card-line">' + lives + ' lives</div>' +
+    '<div class="card-line">Total EE: ' + totalEE + ' &nbsp; Qualified EE: ' + qualEE + '</div>' +
     '</a>';
 }
 
@@ -922,144 +923,14 @@ function viewAdminStewards() {
       var rows = list.map(function (s) {
         var roles = (s.roles || []).map(roleLabel).join(', ');
         return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
-          '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role) + '</td>' +
-          '<td class="row-actions"><button class="btn btn-small" data-edit="' + s.id + '">Edit</button> ' +
-          '<button class="btn btn-small" data-pw="' + s.id + '">Set password</button> ' +
-          '<button class="btn btn-small" data-roles="' + s.id + '">Set roles</button> ' +
-          '<button class="btn btn-small" data-renumber="' + s.id + '">Renumber</button> ' +
-          '<button class="btn btn-small btn-danger" data-del="' + s.id + '">Delete</button></td></tr>';
+          '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role) + '</td></tr>';
       }).join('');
       render(shell(
-        '<h2>Stewards</h2><div id="msg"></div>' +
-        '<p class="muted">Stewards are updated by CSV import only. ' +
-        'Use "Edit" to change name, email, or phone. "Set password" gives a steward their login password, "Set roles" grants Steward, Top Dog, or Admin. ' +
-        '"Renumber" changes the Steward ID everywhere it is used (assignments, roles, messages, commission splits); if you renumber your own account, sign out and back in.</p>' +
-        '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table><div id="editbox"></div><div id="pwbox"></div><div id="rolebox"></div>',
+        '<h2>Stewards</h2>' +
+        '<p class="muted">Stewards are updated by CSV import only. To edit a steward, use the "Edit stewards" card on the Jobs page.</p>' +
+        '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>',
         '#/admin/stewards'));
-      var ebtns = document.querySelectorAll('[data-edit]');
-      for (var e = 0; e < ebtns.length; e++) {
-        (function (b) {
-          b.onclick = function () {
-            var id = b.getAttribute('data-edit');
-            var cur = null;
-            for (var k = 0; k < list.length; k++) {
-              if (String(list[k].id) === String(id)) cur = list[k];
-            }
-            document.getElementById('editbox').innerHTML =
-              '<h3>Edit steward</h3><form id="editf">' +
-              '<label>First name <input id="edit-fn" value="' + esc(cur.first_name || '') + '"></label> ' +
-              '<label>Last name <input id="edit-ln" value="' + esc(cur.last_name || '') + '"></label><br>' +
-              '<label>Email <input id="edit-em" type="email" value="' + esc(cur.email || '') + '" required></label> ' +
-              '<label>Phone <input id="edit-ph" value="' + esc(cur.phone || '') + '"></label> ' +
-              '<button class="btn btn-primary" type="submit">Save</button></form><div id="editmsg"></div>';
-            document.getElementById('editf').onsubmit = function (ev) {
-              ev.preventDefault();
-              api.put('/api/admin/stewards/' + id, {
-                first_name: document.getElementById('edit-fn').value,
-                last_name: document.getElementById('edit-ln').value,
-                email: document.getElementById('edit-em').value,
-                phone: document.getElementById('edit-ph').value
-              }).then(function () {
-                document.getElementById('editmsg').innerHTML = okHtml('Steward updated.');
-                viewAdminStewards();
-              }).catch(function (err) {
-                document.getElementById('editmsg').innerHTML = errorHtml(err.message);
-              });
-            };
-          };
-        })(ebtns[e]);
-      }
-      var dbtns = document.querySelectorAll('[data-del]');
-      for (var d = 0; d < dbtns.length; d++) {
-        (function (b) {
-          b.onclick = function () {
-            var id = b.getAttribute('data-del');
-            if (!confirm('Delete this steward? Their assignments will be removed. This cannot be undone.')) return;
-            api.delete('/api/admin/stewards/' + id).then(function () {
-              viewAdminStewards();
-            }).catch(function (err) {
-              document.getElementById('msg').innerHTML = errorHtml(err.message);
-            });
-          };
-        })(dbtns[d]);
-      }
-      var rbtns = document.querySelectorAll('[data-renumber]');
-      for (var r = 0; r < rbtns.length; r++) {
-        (function (b) {
-          b.onclick = function () {
-            var id = b.getAttribute('data-renumber');
-            var newId = prompt('Renumber steward ' + id + ' to which new Steward ID?', '');
-            if (newId === null) return;
-            newId = String(newId).trim();
-            if (!/^[1-9][0-9]*$/.test(newId)) { alert('Enter a positive whole number.'); return; }
-            if (!confirm('Change steward ' + id + ' to ID ' + newId + '? Assignments, roles, messages, and commission splits move with it.')) return;
-            api.post('/api/admin/stewards/' + id + '/renumber', { new_id: parseInt(newId, 10) }).then(function (res) {
-              var msg = 'Steward ' + res.old_id + ' is now ID ' + res.new_id + '.';
-              if (state.user && String(state.user.id) === String(res.old_id)) {
-                msg += ' That was your own account — sign out and back in.';
-              }
-              document.getElementById('msg').innerHTML = okHtml(msg);
-              viewAdminStewards();
-            }).catch(function (err) {
-              document.getElementById('msg').innerHTML = errorHtml(err.message);
-            });
-          };
-        })(rbtns[r]);
-      }
-      var btns = document.querySelectorAll('[data-pw]');
-      for (var i = 0; i < btns.length; i++) {
-        (function (b) {
-          b.onclick = function () {
-            var id = b.getAttribute('data-pw');
-            document.getElementById('pwbox').innerHTML =
-              '<h3>Set password</h3><form id="pwf" class="form-inline">' +
-              '<input id="pw-in" type="password" placeholder="New password (8+ chars)" required minlength="8"> ' +
-              '<button class="btn btn-primary" type="submit">Save</button></form><div id="pwmsg"></div>';
-            document.getElementById('pwf').onsubmit = function (e) {
-              e.preventDefault();
-              api.post('/api/admin/stewards/' + id + '/password', { password: document.getElementById('pw-in').value })
-                .then(function () { document.getElementById('pwmsg').innerHTML = okHtml('Password updated.'); })
-                .catch(function (err) { document.getElementById('pwmsg').innerHTML = errorHtml(err.message); });
-            };
-          };
-        })(btns[i]);
-      }
-      var rbtns = document.querySelectorAll('[data-roles]');
-      for (var j = 0; j < rbtns.length; j++) {
-        (function (b) {
-          b.onclick = function () {
-            var id = b.getAttribute('data-roles');
-            var cur = null;
-            for (var k = 0; k < list.length; k++) {
-              if (String(list[k].id) === String(id)) cur = list[k].roles || [];
-            }
-            function chk(v) { return '<label><input type="checkbox" class="rolechk" value="' + v + '"' + (cur.indexOf(v) !== -1 ? ' checked' : '') + '> ' + roleLabel(v) + '</label>'; }
-            document.getElementById('rolebox').innerHTML =
-              '<h3>Set roles</h3><form id="rolef" class="form-inline">' +
-              chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' +
-              '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="rolemsg"></div>';
-            document.getElementById('rolef').onsubmit = function (e) {
-              e.preventDefault();
-              var boxes = document.querySelectorAll('.rolechk');
-              var picked = [];
-              for (var m = 0; m < boxes.length; m++) {
-                if (boxes[m].checked) picked.push(boxes[m].value);
-              }
-              if (picked.length === 0) {
-                document.getElementById('rolemsg').innerHTML = errorHtml('Pick at least one role.');
-                return;
-              }
-              api.post('/api/admin/set-roles', { steward_id: parseInt(id, 10), roles: picked }).then(function () {
-                document.getElementById('rolemsg').innerHTML = okHtml('Roles updated.');
-                viewAdminStewards();
-              }).catch(function (err) {
-                document.getElementById('rolemsg').innerHTML = errorHtml(err.message);
-              });
-            };
-          };
-        })(rbtns[j]);
-      }
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
   });
 }
@@ -1076,43 +947,36 @@ function viewAdminCompanies() {
       var rows = list.map(function (c) {
         var isActive = c.active !== false;
         var act = isActive ? 'Yes' : '<b>No</b>';
-        var toggleLabel = isActive ? 'Term' : 'Reinstate';
-        return '<tr>' + cell(parentCode(c)) + cell(parentName(c)) +
+        return '<tr data-active="' + (isActive ? '1' : '0') + '">' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
-          '<td>' + act + ' <button class="btn btn-small" data-toggle-active="' + esc(c.company_code) + '" data-active-now="' + (isActive ? '1' : '0') + '">' + toggleLabel + '</button></td>' +
+          '<td>' + act + '</td>' +
           cell(c.payroll_ineligible) + cell(c.payroll_enrolled) +
           '<td>' + (c.open_invoice_count || 0) + '</td><td><b>' + fmtMoney(c.open_invoice_total || 0) + '</b></td></tr>';
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
         '<p class="muted">Companies are updated by CSV import only. ' +
-        'Use "Term" / "Reinstate" to change the Active flag; termed companies keep their data but are hidden from steward views and billing.</p>' +
+        'Show: <label><input type="radio" name="cfilter" value="active" checked> Active</label> ' +
+        '<label><input type="radio" name="cfilter" value="termed"> Termed</label> ' +
+        '<label><input type="radio" name="cfilter" value="all"> All</label></p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>Company Name</th><th>Active</th>' +
         '<th colspan="2">Last Payroll</th><th colspan="2">Invoices outstanding</th></tr>' +
         '<tr><th></th><th></th><th></th><th></th><th></th>' +
         '<th>Ineligible</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table></div>',
+        '<tbody id="companyrows">' + rows + '</tbody></table></div>',
         '#/admin/companies'));
-      var tbtns = document.querySelectorAll('[data-toggle-active]');
-      for (var t = 0; t < tbtns.length; t++) {
-        (function (b) {
-          b.onclick = function () {
-            var code = b.getAttribute('data-toggle-active');
-            var nowActive = b.getAttribute('data-active-now') === '1';
-            var newActive = !nowActive;
-            var verb = newActive ? 'reinstate' : 'term';
-            if (!confirm((newActive ? 'Reinstate' : 'Term') + ' company ' + code + '? ' +
-              (newActive ? 'It will show up in steward views and billing again.'
-                         : 'Its data stays, but it will be hidden from steward views and billing.'))) return;
-            api.post('/api/admin/companies/' + encodeURIComponent(code) + '/active', { active: newActive }).then(function () {
-              viewAdminCompanies();
-            }).catch(function (err) {
-              alert('Could not ' + verb + ' company: ' + err.message);
-            });
-          };
-        })(tbtns[t]);
+      function applyCompanyFilter() {
+        var v = document.querySelector('input[name="cfilter"]:checked').value;
+        document.querySelectorAll('#companyrows tr').forEach(function (tr) {
+          var a = tr.getAttribute('data-active') === '1';
+          tr.style.display = (v === 'all' || (v === 'active') === a) ? '' : 'none';
+        });
       }
+      document.querySelectorAll('input[name="cfilter"]').forEach(function (r) {
+        r.onchange = applyCompanyFilter;
+      });
+      applyCompanyFilter();
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/companies')); });
   });
 }
@@ -1123,16 +987,42 @@ function viewAdminAssignments() {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/assignments').then(function (list) {
-      var rows = list.map(function (a) {
-        return '<tr><td><b>' + a.steward_id + '</b><div class="muted">' + esc(a.steward_email || '') + '</div></td>' +
-          '<td><b>' + esc(a.company_code) + '</b></td></tr>';
-      }).join('');
-      render(shell(
-        '<h2>Assignments</h2>' +
-        '<p class="muted">Assignments are updated by CSV import only.</p>' +
-        '<table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table>',
-        '#/admin/assignments'));
+      api.get('/api/admin/stewards').then(function (stewards) {
+        var rows = list.map(function (a) {
+          return '<tr data-sid="' + a.steward_id + '"><td><b>' + a.steward_id + '</b><div class="muted">' + esc(a.steward_email || '') + '</div></td>' +
+            '<td><b>' + esc(a.company_code) + '</b></td></tr>';
+        }).join('');
+        var opts = stewards.map(function (s) {
+          var label = s.id + ' — ' + esc(s.email || '');
+          return '<label style="display:inline-block;margin:2px 8px 2px 0;white-space:nowrap;">' +
+            '<input type="checkbox" class="sidpick" value="' + s.id + '" checked> ' + label + '</label>';
+        }).join('');
+        render(shell(
+          '<h2>Assignments</h2>' +
+          '<p class="muted">Assignments are updated by CSV import only.</p>' +
+          '<div class="card"><h4>Stewards</h4>' +
+          '<p><button class="btn btn-small" id="sidall">All</button> <button class="btn btn-small" id="sidnone">None</button></p>' +
+          '<div>' + opts + '</div></div>' +
+          '<table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
+          '<tbody id="assignrows">' + rows + '</tbody></table>',
+          '#/admin/assignments'));
+        function applySidFilter() {
+          var sel = {};
+          document.querySelectorAll('.sidpick:checked').forEach(function (c) { sel[c.value] = true; });
+          document.querySelectorAll('#assignrows tr').forEach(function (tr) {
+            tr.style.display = sel[tr.getAttribute('data-sid')] ? '' : 'none';
+          });
+        }
+        document.querySelectorAll('.sidpick').forEach(function (c) { c.onchange = applySidFilter; });
+        document.getElementById('sidall').onclick = function () {
+          document.querySelectorAll('.sidpick').forEach(function (c) { c.checked = true; });
+          applySidFilter();
+        };
+        document.getElementById('sidnone').onclick = function () {
+          document.querySelectorAll('.sidpick').forEach(function (c) { c.checked = false; });
+          applySidFilter();
+        };
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/assignments')); });
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/assignments')); });
   });
 }
@@ -1215,6 +1105,10 @@ function viewAdminJobs() {
       '<input type="file" id="logofile" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"> ' +
       '<button class="btn btn-primary" id="logoupload">Upload logo</button> ' +
       '<button class="btn btn-small btn-danger" id="logodelete">Remove logo</button><div id="logoout"></div></div>' +
+      '<div class="card"><div class="card-title">Edit stewards</div>' +
+      '<p class="muted">Select a steward, then edit their details, password, roles, ID, or delete them. The Stewards page is view-only.</p>' +
+      '<select id="editstewardsel" style="max-width: 100%;"><option value="">Loading...</option></select>' +
+      '<div id="editstewardbox" style="margin-top:8px;"></div><div id="editstewardmsg"></div></div>' +
       '<div class="card"><div class="card-title">FTJ billing: Premium Applied Report</div>' +
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
@@ -1699,6 +1593,131 @@ function viewAdminJobs() {
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });
+    };
+    // Edit stewards card: pick a steward, then edit.
+    var esSel = document.getElementById('editstewardsel');
+    var esBox = document.getElementById('editstewardbox');
+    var esMsg = document.getElementById('editstewardmsg');
+    var esList = [];
+    function loadStewardPicker() {
+      api.get('/api/admin/stewards').then(function (list) {
+        esList = list;
+        esSel.innerHTML = list.length
+          ? '<option value="">Choose a steward...</option>' + list.map(function (s) {
+              return '<option value="' + s.id + '">' + s.id + ' — ' + esc(s.email) + '</option>';
+            }).join('')
+          : '<option value="">No stewards</option>';
+      }).catch(function () {
+        esSel.innerHTML = '<option value="">Could not load stewards</option>';
+      });
+    }
+    loadStewardPicker();
+    esSel.onchange = function () {
+      var id = esSel.value;
+      esBox.innerHTML = '';
+      esMsg.innerHTML = '';
+      if (!id) return;
+      var cur = null;
+      for (var k = 0; k < esList.length; k++) {
+        if (String(esList[k].id) === String(id)) cur = esList[k];
+      }
+      if (!cur) return;
+      var curRoles = cur.roles || [];
+      function chk(v) {
+        return '<label style="margin-right:8px;"><input type="checkbox" class="es-rolechk" value="' + v + '"' +
+          (curRoles.indexOf(v) !== -1 ? ' checked' : '') + '> ' + roleLabel(v) + '</label>';
+      }
+      esBox.innerHTML =
+        '<p><b>' + esc(cur.first_name || '') + ' ' + esc(cur.last_name || '') + '</b> <span class="muted">' + esc(cur.email) + '</span></p>' +
+        '<div class="card"><div class="card-title">Edit details</div>' +
+        '<form id="es-editf"><label>First name <input id="es-fn" value="' + esc(cur.first_name || '') + '"></label> ' +
+        '<label>Last name <input id="es-ln" value="' + esc(cur.last_name || '') + '"></label><br>' +
+        '<label>Email <input id="es-em" type="email" value="' + esc(cur.email || '') + '" required></label> ' +
+        '<label>Phone <input id="es-ph" value="' + esc(cur.phone || '') + '"></label> ' +
+        '<button class="btn btn-primary" type="submit">Save</button></form><div id="es-editmsg"></div></div>' +
+        '<div class="card"><div class="card-title">Set password</div>' +
+        '<form id="es-pwf" class="form-inline"><input id="es-pw" type="password" placeholder="New password (8+ chars)" required minlength="8"> ' +
+        '<button class="btn btn-primary" type="submit">Save</button></form><div id="es-pwmsg"></div></div>' +
+        '<div class="card"><div class="card-title">Set roles</div>' +
+        '<form id="es-rolef" class="form-inline">' +
+        chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' +
+        '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="es-rolemsg"></div></div>' +
+        '<div class="card"><div class="card-title">Renumber</div>' +
+        '<p class="muted">Changes the Steward ID everywhere it is used. If this is your own account, sign out and back in afterwards.</p>' +
+        '<form id="es-renumf" class="form-inline"><input id="es-newid" placeholder="New Steward ID" required pattern="[1-9][0-9]*"> ' +
+        '<button class="btn btn-primary" type="submit">Renumber</button></form><div id="es-renummsg"></div></div>' +
+        '<div class="card"><div class="card-title">Delete</div>' +
+        '<p class="muted">Removes the steward and their assignments. Cannot be undone.</p>' +
+        '<button class="btn btn-danger" id="es-del">Delete steward</button><div id="es-delmsg"></div></div>';
+      document.getElementById('es-editf').onsubmit = function (ev) {
+        ev.preventDefault();
+        api.put('/api/admin/stewards/' + id, {
+          first_name: document.getElementById('es-fn').value,
+          last_name: document.getElementById('es-ln').value,
+          email: document.getElementById('es-em').value,
+          phone: document.getElementById('es-ph').value
+        }).then(function () {
+          document.getElementById('es-editmsg').innerHTML = okHtml('Steward updated.');
+          loadStewardPicker();
+        }).catch(function (err) {
+          document.getElementById('es-editmsg').innerHTML = errorHtml(err.message);
+        });
+      };
+      document.getElementById('es-pwf').onsubmit = function (ev) {
+        ev.preventDefault();
+        api.post('/api/admin/stewards/' + id + '/password', { password: document.getElementById('es-pw').value })
+          .then(function () { document.getElementById('es-pwmsg').innerHTML = okHtml('Password updated.'); })
+          .catch(function (err) { document.getElementById('es-pwmsg').innerHTML = errorHtml(err.message); });
+      };
+      document.getElementById('es-rolef').onsubmit = function (ev) {
+        ev.preventDefault();
+        var boxes = document.querySelectorAll('.es-rolechk');
+        var picked = [];
+        for (var m = 0; m < boxes.length; m++) {
+          if (boxes[m].checked) picked.push(boxes[m].value);
+        }
+        if (picked.length === 0) {
+          document.getElementById('es-rolemsg').innerHTML = errorHtml('Pick at least one role.');
+          return;
+        }
+        api.post('/api/admin/set-roles', { steward_id: parseInt(id, 10), roles: picked }).then(function () {
+          document.getElementById('es-rolemsg').innerHTML = okHtml('Roles updated.');
+        }).catch(function (err) {
+          document.getElementById('es-rolemsg').innerHTML = errorHtml(err.message);
+        });
+      };
+      document.getElementById('es-renumf').onsubmit = function (ev) {
+        ev.preventDefault();
+        var newId = document.getElementById('es-newid').value.trim();
+        if (!/^[1-9][0-9]*$/.test(newId)) {
+          document.getElementById('es-renummsg').innerHTML = errorHtml('Enter a positive whole number.');
+          return;
+        }
+        if (!window.confirm('Change steward ' + id + ' to ID ' + newId + '? Assignments, roles, messages, and commission splits move with it.')) return;
+        api.post('/api/admin/stewards/' + id + '/renumber', { new_id: parseInt(newId, 10) }).then(function (res) {
+          var msg = 'Steward ' + res.old_id + ' is now ID ' + res.new_id + '.';
+          if (state.user && String(state.user.id) === String(res.old_id)) {
+            msg += ' That was your own account — sign out and back in.';
+          }
+          document.getElementById('es-renummsg').innerHTML = okHtml(msg);
+          loadStewardPicker();
+          esSel.value = '';
+          esBox.innerHTML = '';
+        }).catch(function (err) {
+          document.getElementById('es-renummsg').innerHTML = errorHtml(err.message);
+        });
+      };
+      document.getElementById('es-del').onclick = function () {
+        if (!window.confirm('Delete this steward? Their assignments will be removed. This cannot be undone.')) return;
+        api.delete('/api/admin/stewards/' + id).then(function () {
+          esMsg.innerHTML = okHtml('Steward deleted.');
+          loadStewardPicker();
+          esSel.value = '';
+          esBox.innerHTML = '';
+        }).catch(function (err) {
+          esMsg.innerHTML = errorHtml(err.message);
+        });
+      };
     };
     document.getElementById('delstewards').onclick = function () {
       del('stewards', 'all', '', '', 'Delete ALL non-admin stewards and their assignments? This cannot be undone.');
