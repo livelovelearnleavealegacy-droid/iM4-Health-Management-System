@@ -2592,6 +2592,12 @@ async function runWeeklyEmail(daysBack) {
       const companyCodes = companies.map(function (c) { return String(c.company_code); });
       const recipName = [recip.first_name, recip.last_name].filter(Boolean).join(' ') || recip.name || recip.email;
 
+      // No assigned companies (and not top dog / admin) -> no newsletter.
+      if (!isTopDog && !isAdmin && companies.length === 0) {
+        results.push({ email: recip.email, sent: false, skipped: 'no assigned companies' });
+        continue;
+      }
+
       // Activity in the window.
       let updates = [];
       let messages = [];
@@ -2638,6 +2644,13 @@ async function runWeeklyEmail(daysBack) {
         openInv = oi.rows;
       }
 
+      // Nothing new on any of their companies this week -> no newsletter.
+      const hadActivity = updates.length > 0 || messages.length > 0 || stageChanges.length > 0 || invoices.length > 0;
+      if (!hadActivity) {
+        results.push({ email: recip.email, sent: false, skipped: 'no updates this week' });
+        continue;
+      }
+
       const fmtList = function (arr, fn) {
         return arr.length === 0 ? '(none)' : arr.map(fn).join(nl);
       };
@@ -2680,7 +2693,7 @@ async function runWeeklyEmail(daysBack) {
         '- one short paragraph or 2-3 bullets per company that had activity; skip companies with nothing new' + nl + nl +
         'OPEN MONEY ITEMS:' + nl +
         '- open invoices that need attention, oldest first, with company and amount' + nl + nl +
-        'Keep it plain-spoken and tight. No preamble, no sign-off. If there was genuinely no activity, say so in one line and list the standing open items.';
+        'Keep it plain-spoken and tight. No preamble, no sign-off.';
 
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
