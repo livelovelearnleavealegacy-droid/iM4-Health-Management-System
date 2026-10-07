@@ -468,7 +468,6 @@ function viewBilling() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     var acctFilter = null;
-    var typeFilter = '';
     var statusFilter = '';
     function load() {
       api.get('/api/billing?status=open').then(function (openRows) {
@@ -479,7 +478,6 @@ function viewBilling() {
           var codes = Object.keys(codeMap).sort();
           if (acctFilter === null) acctFilter = codes.slice();
           function matches(r) {
-            if (typeFilter && String(r.bill_type || 'F') !== typeFilter) return false;
             if (statusFilter) {
               var st = r.is_estimate ? 'estimated' : r.status;
               if (st !== statusFilter) return false;
@@ -517,15 +515,18 @@ function viewBilling() {
           }).join('');
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
-            '<div class="card"><div class="card-title">Filters</div>' +
+            '<h3>All Bills (' + rows.length + ')</h3>' +
+            (rows.length === 0
+              ? '<p class="muted">No bills match the filters.</p>'
+              : '<div class="table-scroll" style="max-height:920px;overflow-y:auto;"><table class="data-table"><thead>' +
+                '<tr><th>Company Code</th><th>Company Name</th><th>EIN</th><th>Pay Frequency</th>' +
+                '<th>Payroll Begin Date</th><th>Payroll End Date</th><th>Check Date</th>' +
+                '<th>Lives</th><th>Total $</th><th>Status</th></tr>' +
+                '</thead><tbody>' + body + '</tbody></table></div>') +
+            '<div class="card" style="margin-top:16px;"><div class="card-title">Filters</div>' +
             '<div class="form-inline" style="align-items:flex-start;">' +
             '<div><b>Accounts</b><br>' +
             '<div id="bacctboxes" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);padding:6px 10px;min-width:220px;">' + boxes + '</div></div> ' +
-            '<div><label>Bill type:<br><select id="btype">' +
-            '<option value="">All types</option>' +
-            '<option value="F"' + (typeFilter === 'F' ? ' selected' : '') + '>F - FTJ</option>' +
-            '<option value="S"' + (typeFilter === 'S' ? ' selected' : '') + '>S - Soluta</option>' +
-            '</select></label></div> ' +
             '<div><label>Status:<br><select id="bstatus">' +
             '<option value="">All statuses</option>' +
             '<option value="paid"' + (statusFilter === 'paid' ? ' selected' : '') + '>Paid</option>' +
@@ -533,15 +534,7 @@ function viewBilling() {
             '<option value="estimated"' + (statusFilter === 'estimated' ? ' selected' : '') + '>Estimated</option>' +
             '</select></label></div> ' +
             '<div><br><button class="btn btn-small" id="bcodeclear">Reset filters</button></div>' +
-            '</div></div>' +
-            '<h3>All Bills (' + rows.length + ')</h3>' +
-            (rows.length === 0
-              ? '<p class="muted">No bills match the filters.</p>'
-              : '<div class="table-scroll" style="max-height:600px;overflow-y:auto;"><table class="data-table"><thead>' +
-                '<tr><th>Company Code</th><th>Company Name</th><th>EIN</th><th>Pay Frequency</th>' +
-                '<th>Payroll Begin Date</th><th>Payroll End Date</th><th>Check Date</th>' +
-                '<th>Lives</th><th>Total $</th><th>Status</th></tr>' +
-                '</thead><tbody>' + body + '</tbody></table></div>'),
+            '</div></div>',
             '#/billing'));
           var boxEls = document.querySelectorAll('.bacctbox');
           Array.prototype.forEach.call(boxEls, function (cb) {
@@ -551,9 +544,8 @@ function viewBilling() {
               load();
             };
           });
-          document.getElementById('btype').onchange = function () { typeFilter = this.value; load(); };
           document.getElementById('bstatus').onchange = function () { statusFilter = this.value; load(); };
-          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; typeFilter = ''; statusFilter = ''; load(); };
+          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; statusFilter = ''; load(); };
         }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
     }
@@ -1014,17 +1006,21 @@ function viewAdminAssignments() {
         }).join('');
         var opts = stewards.map(function (s) {
           var label = s.id + ' — ' + esc(s.email || '');
-          return '<label style="display:inline-block;margin:2px 8px 2px 0;white-space:nowrap;">' +
+          return '<label style="display:block;white-space:nowrap;">' +
             '<input type="checkbox" class="sidpick" value="' + s.id + '" checked> ' + label + '</label>';
         }).join('');
         render(shell(
           '<h2>Assignments</h2>' +
           '<p class="muted">Assignments are updated by CSV import only.</p>' +
-          '<div class="card"><h4>Stewards</h4>' +
-          '<p><button class="btn btn-small" id="sidall">All</button> <button class="btn btn-small" id="sidnone">None</button></p>' +
-          '<div>' + opts + '</div></div>' +
-          '<table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
-          '<tbody id="assignrows">' + rows + '</tbody></table>',
+          '<h3>All Assignments (' + list.length + ')</h3>' +
+          '<div class="table-scroll" style="max-height:920px;overflow-y:auto;"><table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
+          '<tbody id="assignrows">' + rows + '</tbody></table></div>' +
+          '<div class="card" style="margin-top:16px;"><div class="card-title">Filters</div>' +
+          '<div class="form-inline" style="align-items:flex-start;">' +
+          '<div><b>Stewards</b><br>' +
+          '<div style="max-height:180px;overflow-y:auto;border:1px solid var(--line);padding:6px 10px;min-width:220px;">' + opts + '</div></div> ' +
+          '<div><br><button class="btn btn-small" id="sidall">All</button> <button class="btn btn-small" id="sidnone">None</button></div>' +
+          '</div></div>',
           '#/admin/assignments'));
         function applySidFilter() {
           var sel = {};
