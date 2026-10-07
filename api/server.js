@@ -1791,7 +1791,7 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
         ['password_reset_tokens', 'UPDATE password_reset_tokens SET steward_id = $1 WHERE steward_id = $2'],
         ['two_factor_codes', 'UPDATE two_factor_codes SET steward_id = $1 WHERE steward_id = $2'],
         ['onboarding_clients', 'UPDATE onboarding_clients SET created_by = $1 WHERE created_by = $2'],
-        ['client_documents', 'UPDATE client_documents SET uploaded_by = $1 WHERE uploaded_by = $2'],
+        ['onboarding_documents', 'UPDATE onboarding_documents SET uploaded_by = $1 WHERE uploaded_by = $2'],
         ['forms', 'UPDATE forms SET uploaded_by = $1 WHERE uploaded_by = $2'],
         ['commissions', 'UPDATE commissions SET steward_code = $1 WHERE steward_code = $2'],
       ];
