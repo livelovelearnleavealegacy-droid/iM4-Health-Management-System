@@ -376,6 +376,18 @@ async function migrate() {
     for (const c of rc2.rows) { await db.query('ALTER TABLE user_roles DROP CONSTRAINT ' + c.conname); }
     await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding', 'client', 'service'))");
   } catch (e) { console.error('Client/service role migration:', e.message); }
+  // v5.30: accounts receivable module.
+  await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'invoice_id INT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE, ' +
+    "action_type TEXT NOT NULL DEFAULT 'note', " +
+    'notes TEXT, ' +
+    'promise_date DATE, ' +
+    'tier INT, ' +
+    'created_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_email TEXT');
+  await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ar_hold BOOLEAN NOT NULL DEFAULT FALSE');
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -3003,6 +3015,218 @@ app.get('/api/tickets-service-team', requireAuth, async (req, res) => {
     res.json(r.rows);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- accounts receivable
+// AR tiers: bills are due upon receipt. Tier 1 = 10+ days, Tier 2 = 20+ days, Tier 3 = 30+ days.
+function arTier(daysOverdue) {
+  if (daysOverdue >= 30) return 3;
+  if (daysOverdue >= 20) return 2;
+  if (daysOverdue >= 10) return 1;
+  return 0;
+}
+
+// Watch list: open, non-estimate bills 10+ days overdue, not on hold.
+app.get('/api/ar/watchlist', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    let q = 'SELECT i.id, i.company_code, i.company_name, i.payroll_date, i.total_invoice, i.bill_type, ' +
+      'i.ar_hold, c.billing_email, (CURRENT_DATE - i.payroll_date)::int AS days_overdue, ' +
+      '(SELECT COUNT(*) FROM ar_followups WHERE invoice_id = i.id) AS touch_count, ' +
+      '(SELECT MAX(created_at) FROM ar_followups WHERE invoice_id = i.id) AS last_touch, ' +
+      '(SELECT MAX(tier) FROM ar_followups WHERE invoice_id = i.id AND action_type = ' + "'email'" + ') AS last_tier_emailed ' +
+      'FROM invoices i LEFT JOIN companies c ON c.company_code = i.company_code ' +
+      "WHERE i.status = 'open' AND i.is_estimate = FALSE AND i.ar_hold = FALSE " +
+      'AND i.payroll_date IS NOT NULL AND (CURRENT_DATE - i.payroll_date) >= 10';
+    const params = [];
+    if (!canSeeAllTickets(user)) {
+      const codes = await getVisibleCodes(user);
+      if (!codes || codes.length === 0) return res.json([]);
+      q += ' AND i.company_code = ANY($1)';
+      params.push(codes);
+    }
+    q += ' ORDER BY (CURRENT_DATE - i.payroll_date) DESC, i.total_invoice DESC';
+    const result = await getPool().query(q, params);
+    const rows = result.rows.map(function (x) {
+      x.tier = arTier(x.days_overdue);
+      return x;
+    });
+    res.json(rows);
+  } catch (error) {
+    console.error('AR watchlist error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Follow-up history for a bill.
+app.get('/api/ar/followups/:invoiceId', requireAuth, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT f.*, s.first_name, s.last_name FROM ar_followups f ' +
+      'LEFT JOIN stewards s ON s.id = f.created_by WHERE f.invoice_id = $1 ORDER BY f.created_at DESC',
+      [req.params.invoiceId]);
+    res.json(r.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Log a manual follow-up touch.
+app.post('/api/ar/followups', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    const { invoice_id, action_type, notes, promise_date } = req.body || {};
+    if (!invoice_id) return res.status(400).json({ error: 'invoice_id is required' });
+    const validTypes = ['email', 'call', 'note', 'promise'];
+    const at = validTypes.indexOf(action_type) !== -1 ? action_type : 'note';
+    await getPool().query(
+      'INSERT INTO ar_followups (invoice_id, action_type, notes, promise_date, created_by) VALUES ($1, $2, $3, $4, $5)',
+      [parseInt(invoice_id, 10), at, notes || null, promise_date || null, user.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('AR followup error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Set/clear the billing email for a company (admin/top_dog/service).
+app.patch('/api/ar/billing-email', requireAuth, async (req, res) => {
+  try {
+    if (!canManageTickets(req.user)) return res.status(403).json({ error: 'Not authorized' });
+    const { company_code, billing_email } = req.body || {};
+    if (!company_code) return res.status(400).json({ error: 'company_code is required' });
+    await getPool().query('UPDATE companies SET billing_email = $1 WHERE company_code = $2',
+      [billing_email || null, String(company_code)]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Put a bill on hold / take it off hold (disputed, payment plan, etc).
+app.patch('/api/ar/hold/:invoiceId', requireAuth, async (req, res) => {
+  try {
+    if (!canManageTickets(req.user)) return res.status(403).json({ error: 'Not authorized' });
+    const hold = req.body && req.body.hold === true;
+    await getPool().query('UPDATE invoices SET ar_hold = $1 WHERE id = $2', [hold, req.params.invoiceId]);
+    if (req.body && req.body.notes) {
+      await getPool().query(
+        'INSERT INTO ar_followups (invoice_id, action_type, notes, created_by) VALUES ($1, ' + "'note'" + ', $2, $3)',
+        [req.params.invoiceId, (hold ? '[Hold] ' : '[Unhold] ') + String(req.body.notes), req.user.id]);
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// AR summary counts for the nav badge / dashboard.
+app.get('/api/ar/summary', requireAuth, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      "SELECT (CURRENT_DATE - payroll_date)::int AS days_overdue FROM invoices " +
+      "WHERE status = 'open' AND is_estimate = FALSE AND ar_hold = FALSE " +
+      'AND payroll_date IS NOT NULL AND (CURRENT_DATE - payroll_date) >= 10');
+    const counts = { tier1: 0, tier2: 0, tier3: 0, total: 0 };
+    let totalAmt = 0;
+    const amtR = await getPool().query(
+      "SELECT COALESCE(SUM(total_invoice), 0) AS amt FROM invoices " +
+      "WHERE status = 'open' AND is_estimate = FALSE AND ar_hold = FALSE " +
+      'AND payroll_date IS NOT NULL AND (CURRENT_DATE - payroll_date) >= 10');
+    totalAmt = parseFloat(amtR.rows[0].amt) || 0;
+    r.rows.forEach(function (x) {
+      const t = arTier(x.days_overdue);
+      counts.total++;
+      if (t === 1) counts.tier1++;
+      else if (t === 2) counts.tier2++;
+      else if (t === 3) counts.tier3++;
+    });
+    counts.total_amount = Math.round(totalAmt * 100) / 100;
+    res.json(counts);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Daily cron: send tier emails for newly-overdue bills, escalate tier 3 to tickets.
+app.post('/api/admin/run-ar-followup-cron', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  const db = getPool();
+  const out = { emailed: 0, tickets: 0, skipped_no_email: 0, errors: [] };
+  try {
+    const bills = await db.query(
+      'SELECT i.id, i.company_code, i.company_name, i.payroll_date, i.total_invoice, i.bill_type, ' +
+      'c.billing_email, (CURRENT_DATE - i.payroll_date)::int AS days_overdue, ' +
+      '(SELECT MAX(tier) FROM ar_followups WHERE invoice_id = i.id AND action_type = ' + "'email'" + ') AS last_tier_emailed, ' +
+      '(SELECT COUNT(*) FROM tickets WHERE title LIKE ' + "'%Overdue bill%' AND description LIKE '%invoice #' || i.id || '%'" + ') AS ticket_count ' +
+      'FROM invoices i LEFT JOIN companies c ON c.company_code = i.company_code ' +
+      "WHERE i.status = 'open' AND i.is_estimate = FALSE AND i.ar_hold = FALSE " +
+      'AND i.payroll_date IS NOT NULL AND (CURRENT_DATE - i.payroll_date) >= 10 ' +
+      'ORDER BY (CURRENT_DATE - i.payroll_date) DESC');
+    for (const b of bills.rows) {
+      const tier = arTier(b.days_overdue);
+      const lastEmailed = b.last_tier_emailed || 0;
+      try {
+        // Send the tier email if we haven't sent for this tier yet.
+        if (tier > lastEmailed) {
+          if (!b.billing_email) { out.skipped_no_email++; }
+          else {
+            const subjects = {
+              1: 'Friendly reminder: invoice ' + b.days_overdue + ' days past due',
+              2: 'Second notice: invoice ' + b.days_overdue + ' days past due',
+              3: 'Final notice: invoice ' + b.days_overdue + ' days past due — escalation pending'
+            };
+            const bodies = {
+              1: 'This is a friendly reminder that the invoice below is now ' + b.days_overdue + ' days past due. Bills are due upon receipt — please remit at your earliest convenience.',
+              2: 'This is a second notice. The invoice below is now ' + b.days_overdue + ' days past due. Please remit promptly to avoid escalation.',
+              3: 'FINAL NOTICE. The invoice below is now ' + b.days_overdue + ' days past due. If payment is not received promptly this account will be escalated for further action.'
+            };
+            const amt = '$' + Number(b.total_invoice).toLocaleString('en-US', { minimumFractionDigits: 2 });
+            await sendEmail(b.billing_email, subjects[tier],
+              '<p>' + bodies[tier] + '</p>' +
+              '<p><b>Company:</b> ' + escHtml(b.company_code) + ' — ' + escHtml(b.company_name || '') + '<br>' +
+              '<b>Payroll date:</b> ' + b.payroll_date.toISOString().slice(0, 10) + '<br>' +
+              '<b>Amount:</b> ' + amt + '<br>' +
+              '<b>Days overdue:</b> ' + b.days_overdue + '</p>' +
+              '<p>Reply to this email or contact us if you have questions about this invoice.</p>');
+            await db.query(
+              'INSERT INTO ar_followups (invoice_id, action_type, notes, tier) VALUES ($1, ' + "'email'" + ', $2, $3)',
+              [b.id, 'Tier ' + tier + ' automated reminder sent to ' + b.billing_email, tier]);
+            out.emailed++;
+          }
+        }
+        // Tier 3: auto-create a ticket if none exists for this invoice.
+        if (tier === 3 && parseInt(b.ticket_count, 10) === 0) {
+          const oncall = await getCurrentOnCall();
+          const amt = '$' + Number(b.total_invoice).toLocaleString('en-US', { minimumFractionDigits: 2 });
+          const ins = await db.query(
+            'INSERT INTO tickets (company_code, title, description, category, priority, status, assigned_to) ' +
+            'VALUES ($1, $2, $3, ' + "'billing'" + ', ' + "'high'" + ', ' + "'open'" + ', $4) RETURNING id',
+            [b.company_code,
+             'Overdue bill: ' + b.company_code + ' ' + amt + ' (' + b.days_overdue + ' days)',
+             'Invoice #' + b.id + ' for ' + b.company_name + ' is ' + b.days_overdue + ' days overdue. ' +
+             'Amount: ' + amt + ', payroll date: ' + b.payroll_date.toISOString().slice(0, 10) + '. ' +
+             'Automated tier-3 reminders sent. Follow up for payment.',
+             oncall ? oncall.steward_id : null]);
+          out.tickets++;
+        }
+      } catch (e) {
+        out.errors.push('Invoice ' + b.id + ': ' + e.message);
+      }
+    }
+    res.json(Object.assign({ success: true }, out));
+  } catch (error) {
+    console.error('AR followup cron error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

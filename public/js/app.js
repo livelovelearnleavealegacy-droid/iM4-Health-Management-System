@@ -205,9 +205,11 @@ function navLinks() {
     links.push(['#/dashboard', 'Dashboard']);
     links.push(['#/clients', 'Companies']);
     links.push(['#/billing', 'Billing']);
+    links.push(['#/ar', 'A/R']);
   }
   if (role === 'service') {
     links.push(['#/clients', 'Companies']);
+    links.push(['#/ar', 'A/R']);
   }
   links.push(['#/implementations', 'Implementation']);
   if (role === 'admin' || role === 'top_dog' || role === 'steward' || role === 'service' || role === 'client') {
@@ -1209,6 +1211,140 @@ function viewTicketDetail(id) {
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/tickets')); });
   });
 }
+
+// ---------------------------------------------------------------- accounts receivable
+function viewAR() {
+  requireUser(function () {
+    var r = activeRole();
+    if (['admin', 'top_dog', 'service', 'steward'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    var manage = (r === 'admin' || r === 'top_dog' || r === 'service');
+    api.get('/api/ar/watchlist').then(function (list) {
+      api.get('/api/ar/summary').then(function (sum) {
+        function tierBadge(t) {
+          if (t === 3) return '<span class="pill-danger">30+ days</span>';
+          if (t === 2) return '<span class="pill-warn">20+ days</span>';
+          return '<span class="pill">10+ days</span>';
+        }
+        var rows = list.map(function (b) {
+          var amt = fmtMoney(b.total_invoice || 0);
+          var emailCell = b.billing_email
+            ? esc(b.billing_email)
+            : '<span class="muted">none</span> <button class="btn btn-link" data-setemail="' + esc(b.company_code) + '">set</button>';
+          var holdBtn = manage
+            ? ' <button class="btn btn-link" data-hold="' + b.id + '">hold</button>'
+            : '';
+          return '<tr>' +
+            '<td><b>' + esc(b.company_code) + '</b><div class="muted">' + esc(b.company_name || '') + '</div></td>' +
+            '<td>' + esc(String(b.payroll_date).slice(0, 10)) + '</td>' +
+            '<td><b>' + amt + '</b></td>' +
+            '<td><b>' + b.days_overdue + '</b></td>' +
+            '<td>' + tierBadge(b.tier) + '</td>' +
+            '<td>' + emailCell + '</td>' +
+            '<td class="muted">' + (b.touch_count || 0) + ' touches' +
+            (b.last_touch ? '<br>' + esc(String(b.last_touch).slice(0, 10)) : '') + '</td>' +
+            '<td><button class="btn btn-link" data-detail="' + b.id + '">follow-ups</button>' +
+            (manage ? ' <button class="btn btn-link" data-ticket="' + b.id + '">ticket</button>' + holdBtn : '') +
+            '</td></tr>';
+        }).join('');
+        var body = list.length === 0
+          ? '<p class="muted">No overdue bills. Everything is current.</p>'
+          : '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+            '<th>Company</th><th>Payroll date</th><th>Amount</th><th>Days late</th><th>Tier</th>' +
+            '<th>Billing email</th><th>Follow-ups</th><th></th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+        render(shell(
+          '<h2>Accounts Receivable</h2>' +
+          '<p class="muted">Bills are due upon receipt. ' +
+          '<span class="pill">' + (sum.tier1 || 0) + ' at 10+ days</span> ' +
+          '<span class="pill-warn">' + (sum.tier2 || 0) + ' at 20+ days</span> ' +
+          '<span class="pill-danger">' + (sum.tier3 || 0) + ' at 30+ days</span> — ' +
+          '<b>' + fmtMoney(sum.total_amount || 0) + '</b> outstanding.</p>' +
+          '<div id="err"></div>' + body + '<div id="ardetail"></div>',
+          '#/ar'));
+        // Follow-up detail expander.
+        document.querySelectorAll('[data-detail]').forEach(function (btn) {
+          btn.onclick = function () {
+            var invId = btn.getAttribute('data-detail');
+            var bill = list.filter(function (b) { return String(b.id) === invId; })[0];
+            api.get('/api/ar/followups/' + invId).then(function (fl) {
+              var items = fl.map(function (f) {
+                var an = ((f.first_name || '') + ' ' + (f.last_name || '')).trim() || 'system';
+                var extra = f.promise_date ? ' <span class="muted">promise: ' + esc(f.promise_date.slice(0, 10)) + '</span>' : '';
+                var tierTag = f.tier ? ' <span class="pill">tier ' + f.tier + '</span>' : '';
+                return '<div class="reply"><div class="reply-head"><b>' + esc(f.action_type) + '</b>' + tierTag +
+                  ' by ' + esc(an) + ' <span class="muted">' + esc(String(f.created_at).slice(0, 16).replace('T', ' ')) + '</span>' + extra + '</div>' +
+                  (f.notes ? '<div class="reply-body">' + esc(f.notes).replace(/\n/g, '<br>') + '</div>' : '') + '</div>';
+              }).join('') || '<p class="muted">No follow-ups logged yet.</p>';
+              var logForm = manage ?
+                '<div class="card"><div class="card-title">Log follow-up</div>' +
+                '<form id="ar-logf" class="form-inline">' +
+                '<select id="ar-action"><option value="call">Call</option><option value="email">Email</option>' +
+                '<option value="note">Note</option><option value="promise">Promise to pay</option></select> ' +
+                '<input id="ar-notes" placeholder="Notes" style="width: 260px;"> ' +
+                '<input id="ar-promise" type="date" title="Promise date"> ' +
+                '<button class="btn btn-primary" type="submit">Log</button></form><div id="ar-logmsg"></div></div>' : '';
+              document.getElementById('ardetail').innerHTML =
+                '<h3>Follow-ups: ' + esc(bill.company_code) + ' — ' + fmtMoney(bill.total_invoice || 0) + '</h3>' +
+                items + logForm;
+              var lf = document.getElementById('ar-logf');
+              if (lf) lf.onsubmit = function (e) {
+                e.preventDefault();
+                api.post('/api/ar/followups', {
+                  invoice_id: invId,
+                  action_type: document.getElementById('ar-action').value,
+                  notes: document.getElementById('ar-notes').value,
+                  promise_date: document.getElementById('ar-promise').value || null
+                }).then(function () { route(); })
+                  .catch(function (err) { document.getElementById('ar-logmsg').innerHTML = errorHtml(err.message); });
+              };
+              document.getElementById('ardetail').scrollIntoView();
+            });
+          };
+        });
+        // Set billing email.
+        document.querySelectorAll('[data-setemail]').forEach(function (btn) {
+          btn.onclick = function () {
+            var code = btn.getAttribute('data-setemail');
+            var em = prompt('Billing email for ' + code + ':');
+            if (em === null) return;
+            api.patch('/api/ar/billing-email', { company_code: code, billing_email: em.trim() || null })
+              .then(function () { route(); })
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+        // Hold a bill.
+        document.querySelectorAll('[data-hold]').forEach(function (btn) {
+          btn.onclick = function () {
+            var reason = prompt('Reason for putting this bill on hold (disputed, payment plan, etc.):');
+            if (reason === null) return;
+            api.patch('/api/ar/hold/' + btn.getAttribute('data-hold'), { hold: true, notes: reason })
+              .then(function () { route(); })
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+        // Open a ticket from a bill.
+        document.querySelectorAll('[data-ticket]').forEach(function (btn) {
+          btn.onclick = function () {
+            var invId = btn.getAttribute('data-ticket');
+            var bill = list.filter(function (b) { return String(b.id) === invId; })[0];
+            api.post('/api/tickets', {
+              company_code: bill.company_code,
+              title: 'Overdue bill: ' + bill.company_code + ' ' + fmtMoney(bill.total_invoice || 0) + ' (' + bill.days_overdue + ' days)',
+              description: 'Invoice #' + bill.id + ' for ' + (bill.company_name || bill.company_code) +
+                ' is ' + bill.days_overdue + ' days overdue. Amount: ' + fmtMoney(bill.total_invoice || 0) +
+                ', payroll date: ' + String(bill.payroll_date).slice(0, 10) + '.',
+              category: 'billing',
+              priority: bill.tier === 3 ? 'high' : 'medium'
+            }).then(function (t) { location.hash = '#/tickets/' + t.id; })
+              .catch(function (err) { document.getElementById('err').innerHTML = errorHtml(err.message); });
+          };
+        });
+      });
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/ar')); });
+  });
+}
+
+// ---------------------------------------------------------------- admin: on-call schedule
 
 // ---------------------------------------------------------------- admin: on-call schedule
 
@@ -2656,6 +2792,7 @@ function route() {
     if (pathParts[1]) return viewTicketDetail(pathParts[1]);
     return viewTickets();
   }
+  if (pathParts[0] === 'ar') return viewAR();
   location.hash = '#/login';
 }
 
