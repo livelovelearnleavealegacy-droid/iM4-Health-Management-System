@@ -1267,9 +1267,8 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- v5: billing
-app.get('/api/billing', requireAuth, async (req, res) => {
+app.get('/api/billing', requireAdmin, async (req, res) => {
   try {
-    if (req.user.activeRole === 'onboarding') return res.status(403).json({ error: 'Not available for this role' });
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
@@ -2730,7 +2729,7 @@ app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const r = user.activeRole;
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+    if (r !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
     let q = 'SELECT t.*, c.company_name, ' +
@@ -2768,7 +2767,7 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const r = user.activeRole;
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+    if (r !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
     const { company_code, title, description, category, priority } = req.body || {};
@@ -2826,7 +2825,7 @@ app.get('/api/tickets/:id', requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const r = user.activeRole;
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+    if (r !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
     const t = await getPool().query(
@@ -2862,7 +2861,7 @@ app.post('/api/tickets/:id/replies', requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const r = user.activeRole;
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+    if (r !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
     const { body, is_internal } = req.body || {};
@@ -3014,6 +3013,53 @@ app.get('/api/tickets-service-team', requireAuth, async (req, res) => {
       "JOIN user_roles ur ON ur.steward_id = s.id WHERE ur.role IN ('service', 'admin', 'top_dog') ORDER BY s.first_name, s.last_name");
     res.json(r.rows);
   } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- accountability
+// Personal stats + team ranking for the dashboard.
+app.get('/api/accountability', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const db = getPool();
+    // My open tickets.
+    const myTickets = await db.query(
+      "SELECT COUNT(*) AS c FROM tickets WHERE assigned_to = $1 AND status != 'resolved'",
+      [user.id]);
+    // My overdue bills (steward's companies).
+    let myOverdue = { c: 0 };
+    const codes = await getVisibleCodes(user);
+    if (!codes || codes.length > 0) {
+      let q = "SELECT COUNT(*) AS c FROM invoices WHERE status = 'open' AND is_estimate = FALSE " +
+        "AND ar_hold = FALSE AND payroll_date IS NOT NULL AND (CURRENT_DATE - payroll_date) >= 10";
+      const params = [];
+      if (codes) { q += ' AND company_code = ANY($1)'; params.push(codes); }
+      myOverdue = (await db.query(q, params)).rows[0];
+    }
+    // My recent resolutions (last 30 days).
+    const myResolved = await db.query(
+      "SELECT COUNT(*) AS c FROM tickets WHERE assigned_to = $1 AND status = 'resolved' " +
+      "AND resolved_at > NOW() - INTERVAL '30 days'",
+      [user.id]);
+    const out = {
+      my_open_tickets: parseInt(myTickets.rows[0].c, 10),
+      my_overdue_bills: parseInt(myOverdue.c, 10),
+      my_resolved_30d: parseInt(myResolved.rows[0].c, 10)
+    };
+    // Team view for admin/top_dog.
+    if (user.activeRole === 'admin' || user.activeRole === 'top_dog') {
+      const team = await db.query(
+        "SELECT s.id, s.first_name, s.last_name, s.email, " +
+        "(SELECT COUNT(*) FROM tickets t WHERE t.assigned_to = s.id AND t.status != 'resolved') AS open_tickets, " +
+        "(SELECT COUNT(*) FROM tickets t WHERE t.assigned_to = s.id AND t.status = 'resolved' AND t.resolved_at > NOW() - INTERVAL '30 days') AS resolved_30d " +
+        "FROM stewards s WHERE s.id IN (SELECT DISTINCT assigned_to FROM tickets WHERE assigned_to IS NOT NULL) " +
+        "ORDER BY open_tickets DESC");
+      out.team = team.rows;
+    }
+    res.json(out);
+  } catch (error) {
+    console.error('Accountability error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

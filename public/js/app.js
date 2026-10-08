@@ -204,15 +204,17 @@ function navLinks() {
   if (role === 'admin' || role === 'top_dog' || role === 'steward') {
     links.push(['#/dashboard', 'Dashboard']);
     links.push(['#/clients', 'Companies']);
-    links.push(['#/billing', 'Billing']);
     links.push(['#/ar', 'A/R']);
+  }
+  if (role === 'admin') {
+    links.push(['#/billing', 'Billing']);
   }
   if (role === 'service') {
     links.push(['#/clients', 'Companies']);
     links.push(['#/ar', 'A/R']);
   }
   links.push(['#/implementations', 'Implementation']);
-  if (role === 'admin' || role === 'top_dog' || role === 'steward' || role === 'service' || role === 'client') {
+  if (role === 'admin') {
     links.push(['#/tickets', 'Tickets']);
   }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
@@ -449,6 +451,9 @@ function viewDashboard() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
     api.get('/api/dashboard').then(function (d) {
+      return api.get('/api/accountability').then(function (a) { return { d: d, a: a }; });
+    }).then(function (both) {
+      var d = both.d, a = both.a;
       var stageOrder = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
       var stageMap = {};
       d.clientsByStage.forEach(function (s) { stageMap[s.stage] = s.count; });
@@ -470,6 +475,17 @@ function viewDashboard() {
         '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div></div>' +
         '<div class="card"><div class="card-title">$ Outstanding</div><div class="stat-big">' + fmtMoney(d.billingOpen.total) + '</div></div>' +
         '</div>' +
+        '<h3>My Accountability</h3>' +
+        '<div class="card-grid">' +
+        '<div class="card"><div class="card-title">My Open Tickets</div><div class="stat-big">' + (a.my_open_tickets || 0) + '</div></div>' +
+        '<div class="card"><div class="card-title">My Overdue Bills</div><div class="stat-big">' + (a.my_overdue_bills || 0) + '</div></div>' +
+        '<div class="card"><div class="card-title">Resolved (30d)</div><div class="stat-big">' + (a.my_resolved_30d || 0) + '</div></div>' +
+        '</div>' +
+        (a.team && a.team.length ? '<h3>Team Accountability</h3><div class="card"><table class="data-table"><thead><tr><th>Person</th><th>Open Tickets</th><th>Resolved (30d)</th></tr></thead><tbody>' +
+        a.team.map(function (m) {
+          var nm = ((m.first_name || '') + ' ' + (m.last_name || '')).trim() || m.email;
+          return '<tr><td>' + esc(nm) + '</td><td><b>' + m.open_tickets + '</b></td><td>' + m.resolved_30d + '</td></tr>';
+        }).join('') + '</tbody></table></div>' : '') +
         '<h3>Implementation Stage</h3>' +
         '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>',
         '#/dashboard'));
@@ -480,7 +496,7 @@ function viewDashboard() {
 // ---------------------------------------------------------------- billing
 function viewBilling() {
   requireUser(function () {
-    if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
+    if (activeRole() !== 'admin') { location.hash = '#/dashboard'; return; }
     var acctFilter = null;
     var statusFilter = '';
     function load() {
@@ -1024,7 +1040,7 @@ function canManageTicketsUI() {
 function viewTickets() {
   requireUser(function () {
     var r = activeRole();
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    if (r !== 'admin') { location.hash = '#/dashboard'; return; }
     var fStatus = '', fPriority = '', fCategory = '', q = '';
     function load() {
       var params = [];
@@ -1088,7 +1104,7 @@ function viewTickets() {
 function viewNewTicket() {
   requireUser(function () {
     var r = activeRole();
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    if (r !== 'admin') { location.hash = '#/dashboard'; return; }
     // Companies the user can file for.
     var coUrl = (r === 'admin' || r === 'top_dog' || r === 'service') ? '/api/admin/companies' : '/api/clients';
     api.get(coUrl).then(function (cos) {
@@ -1137,7 +1153,7 @@ function viewNewTicket() {
 function viewTicketDetail(id) {
   requireUser(function () {
     var r = activeRole();
-    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    if (r !== 'admin') { location.hash = '#/dashboard'; return; }
     var manage = canManageTicketsUI();
     api.get('/api/tickets/' + id).then(function (t) {
       function nameOf(pref) {
