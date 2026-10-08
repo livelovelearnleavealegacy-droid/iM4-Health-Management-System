@@ -45,6 +45,8 @@ function roleLabel(r) {
   if (r === 'admin') return 'Admin';
   if (r === 'top_dog') return 'Top Dog';
   if (r === 'onboarding') return 'Onboarding';
+  if (r === 'service') return 'Service';
+  if (r === 'client') return 'Client';
   return 'Steward';
 }
 
@@ -170,6 +172,7 @@ var api = {
   get: function (url) { return this.call('GET', url); },
   post: function (url, body) { return this.call('POST', url, body); },
   put: function (url, body) { return this.call('PUT', url, body); },
+  patch: function (url, body) { return this.call('PATCH', url, body); },
   delete: function (url) { return this.call('DELETE', url); }
 };
 
@@ -192,7 +195,9 @@ function activeRole() {
 // admin: everything
 // top_dog: everything except Jobs
 // onboarding: Onboarding and Implementation only
-// steward: Dashboard, Companies, Billing, Implementation
+// steward: Dashboard, Companies, Billing, Implementation, Tickets
+// service: Tickets, Companies, Implementation (support desk)
+// client: Tickets (own company only)
 function navLinks() {
   var role = activeRole();
   var links = [];
@@ -201,7 +206,13 @@ function navLinks() {
     links.push(['#/clients', 'Companies']);
     links.push(['#/billing', 'Billing']);
   }
+  if (role === 'service') {
+    links.push(['#/clients', 'Companies']);
+  }
   links.push(['#/implementations', 'Implementation']);
+  if (role === 'admin' || role === 'top_dog' || role === 'steward' || role === 'service' || role === 'client') {
+    links.push(['#/tickets', 'Tickets']);
+  }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/onboarding', 'Onboarding']);
   }
@@ -992,6 +1003,215 @@ function viewAdminCommissions() {
   });
 }
 
+// ---------------------------------------------------------------- tickets
+var TICKET_STATUSES = ['open', 'in_progress', 'waiting_customer', 'resolved'];
+var TICKET_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+var TICKET_CATEGORIES = ['billing', 'onboarding', 'technical', 'general'];
+
+function ticketStatusLabel(s) {
+  if (s === 'in_progress') return 'In Progress';
+  if (s === 'waiting_customer') return 'Waiting on Customer';
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function canManageTicketsUI() {
+  var r = activeRole();
+  return r === 'admin' || r === 'top_dog' || r === 'service';
+}
+
+function viewTickets() {
+  requireUser(function () {
+    var r = activeRole();
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    var fStatus = '', fPriority = '', fCategory = '', q = '';
+    function load() {
+      var params = [];
+      if (fStatus) params.push('status=' + encodeURIComponent(fStatus));
+      if (fPriority) params.push('priority=' + encodeURIComponent(fPriority));
+      if (fCategory) params.push('category=' + encodeURIComponent(fCategory));
+      if (q) params.push('q=' + encodeURIComponent(q));
+      api.get('/api/tickets' + (params.length ? '?' + params.join('&') : '')).then(function (list) {
+        api.get('/api/tickets-oncall').then(function (oc) {
+          var ocHtml = oc && !oc.none
+            ? '<p class="muted">On call now: <b>' + esc((oc.first_name || '') + ' ' + (oc.last_name || '')) + '</b> — new tickets auto-assign here.</p>'
+            : '<p class="muted">No one is on call right now — new tickets will wait for manual assignment.</p>';
+          var statusOpts = '<option value="">All statuses</option>' + TICKET_STATUSES.map(function (s) {
+            return '<option value="' + s + '"' + (s === fStatus ? ' selected' : '') + '>' + ticketStatusLabel(s) + '</option>';
+          }).join('');
+          var priOpts = '<option value="">All priorities</option>' + TICKET_PRIORITIES.map(function (p) {
+            return '<option value="' + p + '"' + (p === fPriority ? ' selected' : '') + '>' + p.charAt(0).toUpperCase() + p.slice(1) + '</option>';
+          }).join('');
+          var catOpts = '<option value="">All categories</option>' + TICKET_CATEGORIES.map(function (c) {
+            return '<option value="' + c + '"' + (c === fCategory ? ' selected' : '') + '>' + c.charAt(0).toUpperCase() + c.slice(1) + '</option>';
+          }).join('');
+          var rows = list.map(function (t) {
+            var creator = ((t.creator_first || '') + ' ' + (t.creator_last || '')).trim() || 'Unknown';
+            var assignee = ((t.assignee_first || '') + ' ' + (t.assignee_last || '')).trim() || '<span class="muted">Unassigned</span>';
+            var priClass = t.priority === 'urgent' ? 'pill-danger' : (t.priority === 'high' ? 'pill-warn' : 'pill');
+            return '<tr><td><a href="#/tickets/' + t.id + '"><b>#' + t.id + '</b></a></td>' +
+              '<td><a href="#/tickets/' + t.id + '">' + esc(t.title) + '</a><div class="muted">' + esc(t.company_code) +
+              (t.company_name ? ' — ' + esc(t.company_name) : '') + '</div></td>' +
+              '<td><span class="pill">' + ticketStatusLabel(t.status) + '</span></td>' +
+              '<td><span class="' + priClass + '">' + esc(t.priority) + '</span></td>' +
+              '<td>' + esc(t.category) + '</td>' +
+              '<td>' + assignee + '</td>' +
+              '<td class="muted">' + (t.reply_count || 0) + ' replies</td></tr>';
+          }).join('');
+          var body = list.length === 0
+            ? '<p class="muted">No tickets found.</p>'
+            : '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+              '<th>ID</th><th>Title</th><th>Status</th><th>Priority</th><th>Category</th><th>Assignee</th><th></th>' +
+              '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+          render(shell(
+            '<h2>Tickets</h2>' + ocHtml +
+            '<div class="filterbar">' +
+            '<input id="tq" type="search" placeholder="Search..." value="' + esc(q) + '"> ' +
+            '<select id="tstatus">' + statusOpts + '</select> ' +
+            '<select id="tpri">' + priOpts + '</select> ' +
+            '<select id="tcat">' + catOpts + '</select> ' +
+            '<a class="btn btn-primary" href="#/tickets/new">New ticket</a></div>' +
+            '<div id="err"></div>' + body,
+            '#/tickets'));
+          document.getElementById('tq').oninput = function (e) { q = e.target.value; load(); };
+          document.getElementById('tstatus').onchange = function (e) { fStatus = e.target.value; load(); };
+          document.getElementById('tpri').onchange = function (e) { fPriority = e.target.value; load(); };
+          document.getElementById('tcat').onchange = function (e) { fCategory = e.target.value; load(); };
+        });
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/tickets')); });
+    }
+    load();
+  });
+}
+
+function viewNewTicket() {
+  requireUser(function () {
+    var r = activeRole();
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    // Companies the user can file for.
+    var coUrl = (r === 'admin' || r === 'top_dog' || r === 'service') ? '/api/admin/companies' : '/api/clients';
+    api.get(coUrl).then(function (cos) {
+      var list = Array.isArray(cos) ? cos : (cos.companies || []);
+      var opts = list.map(function (c) {
+        var code = c.company_code || c.code;
+        var name = c.company_name || c.name || code;
+        return '<option value="' + esc(code) + '">' + esc(code) + ' — ' + esc(name) + '</option>';
+      }).join('');
+      var catOpts = TICKET_CATEGORIES.map(function (c) {
+        return '<option value="' + c + '">' + c.charAt(0).toUpperCase() + c.slice(1) + '</option>';
+      }).join('');
+      var priOpts = TICKET_PRIORITIES.map(function (p) {
+        return '<option value="' + p + '"' + (p === 'medium' ? ' selected' : '') + '>' + p.charAt(0).toUpperCase() + p.slice(1) + '</option>';
+      }).join('');
+      render(shell(
+        '<h2>New ticket</h2><div id="err"></div>' +
+        '<form id="ntf" class="form">' +
+        '<label>Company<select id="nt-co" required>' + opts + '</select></label>' +
+        '<label>Title<input id="nt-title" required maxlength="200"></label>' +
+        '<label>Description<textarea id="nt-desc" rows="6" required></textarea></label>' +
+        '<label>Category<select id="nt-cat">' + catOpts + '</select></label>' +
+        '<label>Priority<select id="nt-pri">' + priOpts + '</select></label>' +
+        '<button class="btn btn-primary" type="submit">File ticket</button> ' +
+        '<a class="btn" href="#/tickets">Cancel</a></form>',
+        '#/tickets'));
+      document.getElementById('ntf').onsubmit = function (e) {
+        e.preventDefault();
+        var data = {
+          company_code: document.getElementById('nt-co').value,
+          title: document.getElementById('nt-title').value,
+          description: document.getElementById('nt-desc').value,
+          category: document.getElementById('nt-cat').value,
+          priority: document.getElementById('nt-pri').value
+        };
+        api.post('/api/tickets', data).then(function (r) {
+          location.hash = '#/tickets/' + r.id;
+        }).catch(function (err) {
+          document.getElementById('err').innerHTML = errorHtml(err.message);
+        });
+      };
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/tickets')); });
+  });
+}
+
+function viewTicketDetail(id) {
+  requireUser(function () {
+    var r = activeRole();
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) { location.hash = '#/dashboard'; return; }
+    var manage = canManageTicketsUI();
+    api.get('/api/tickets/' + id).then(function (t) {
+      function nameOf(pref) {
+        return ((t[pref + '_first'] || '') + ' ' + (t[pref + '_last'] || '')).trim() || 'Unknown';
+      }
+      var replies = (t.replies || []).map(function (rp) {
+        var an = ((rp.first_name || '') + ' ' + (rp.last_name || '')).trim() || rp.email || 'Unknown';
+        var tag = rp.is_internal ? ' <span class="pill-warn">internal</span>' : '';
+        return '<div class="reply' + (rp.is_internal ? ' reply-internal' : '') + '">' +
+          '<div class="reply-head"><b>' + esc(an) + '</b>' + tag +
+          ' <span class="muted">' + esc(rp.created_at || '') + '</span></div>' +
+          '<div class="reply-body">' + esc(rp.body).replace(/\n/g, '<br>') + '</div></div>';
+      }).join('') || '<p class="muted">No replies yet.</p>';
+      var mgmtHtml = '';
+      if (manage) {
+        mgmtHtml = '<div class="card"><div class="card-title">Manage</div><div class="form-inline">' +
+          '<label>Status<select id="tm-status">' + TICKET_STATUSES.map(function (s) {
+            return '<option value="' + s + '"' + (s === t.status ? ' selected' : '') + '>' + ticketStatusLabel(s) + '</option>';
+          }).join('') + '</select></label> ' +
+          '<label>Priority<select id="tm-pri">' + TICKET_PRIORITIES.map(function (p) {
+            return '<option value="' + p + '"' + (p === t.priority ? ' selected' : '') + '>' + p + '</option>';
+          }).join('') + '</select></label> ' +
+          '<label>Assignee<select id="tm-assignee"><option value="">Unassigned</option></select></label> ' +
+          '<button class="btn btn-primary" id="tm-save">Save</button></div><div id="tm-msg"></div></div>';
+      }
+      render(shell(
+        '<h2>Ticket #' + t.id + '</h2><div id="err"></div>' +
+        '<div class="card"><div class="card-title">' + esc(t.title) + '</div>' +
+        '<p><span class="pill">' + ticketStatusLabel(t.status) + '</span> ' +
+        '<span class="pill">' + esc(t.priority) + '</span> ' +
+        '<span class="pill">' + esc(t.category) + '</span></p>' +
+        '<p class="muted">' + esc(t.company_code) + (t.company_name ? ' — ' + esc(t.company_name) : '') +
+        ' · Filed by ' + esc(nameOf('creator')) + ' · ' + esc(t.created_at || '') + '</p>' +
+        '<p>' + esc(t.description).replace(/\n/g, '<br>') + '</p></div>' +
+        mgmtHtml +
+        '<h3>Replies</h3>' + replies +
+        '<div class="card"><div class="card-title">Reply</div>' +
+        '<form id="trf"><textarea id="tr-body" rows="4" required placeholder="Write a reply..."></textarea>' +
+        (manage ? '<label><input type="checkbox" id="tr-internal"> Internal note (not visible to client)</label><br>' : '') +
+        '<button class="btn btn-primary" type="submit">Send reply</button></form><div id="tr-msg"></div></div>',
+        '#/tickets'));
+      document.getElementById('trf').onsubmit = function (e) {
+        e.preventDefault();
+        var data = { body: document.getElementById('tr-body').value };
+        var ichk = document.getElementById('tr-internal');
+        if (ichk) data.is_internal = ichk.checked;
+        api.post('/api/tickets/' + id + '/replies', data).then(function () { route(); })
+          .catch(function (err) { document.getElementById('tr-msg').innerHTML = errorHtml(err.message); });
+      };
+      if (manage) {
+        api.get('/api/tickets-service-team').then(function (team) {
+          var sel = document.getElementById('tm-assignee');
+          team.forEach(function (m) {
+            var nm = ((m.first_name || '') + ' ' + (m.last_name || '')).trim() || m.email;
+            var opt = document.createElement('option');
+            opt.value = m.id; opt.textContent = nm;
+            if (String(m.id) === String(t.assigned_to)) opt.selected = true;
+            sel.appendChild(opt);
+          });
+        });
+        document.getElementById('tm-save').onclick = function () {
+          var data = {
+            status: document.getElementById('tm-status').value,
+            priority: document.getElementById('tm-pri').value,
+            assigned_to: document.getElementById('tm-assignee').value || null
+          };
+          api.patch('/api/tickets/' + id, data).then(function () { route(); })
+            .catch(function (err) { document.getElementById('tm-msg').innerHTML = errorHtml(err.message); });
+        };
+      }
+    }).catch(function (err) { render(shell(errorHtml(err.message), '#/tickets')); });
+  });
+}
+
+// ---------------------------------------------------------------- admin: on-call schedule
+
 // ---------------------------------------------------------------- admin: companies (import only, with parent columns)
 function viewAdminCompanies() {
   requireUser(function () {
@@ -1153,7 +1373,13 @@ function viewAdminJobs() {
       '<p class="muted">Claude writes a personalized Friday summary for each steward, top dog, and admin — week in review, their to-dos, company updates. Sends via Resend.</p>' +
       '<label>Days back: <input id="emaildays" type="number" value="7" min="1" max="30" style="width: 60px;"></label> ' +
       '<button class="btn btn-primary" id="runemail">Send weekly email now</button><div id="emailout"></div></div>' +
-      '<div class="card"><div class="card-title">Private message filters</div>' +
+      '<div class="card"><div class="card-title">On-call schedule</div>' +
+      '<p class="muted">Who auto-assignment sends new tickets to. Add a date range per person; the person covering today gets new tickets.</p>' +
+      '<div id="oclist"><p class="muted">Loading...</p></div>' +
+      '<form id="ocform" class="form-inline"><select id="ocperson"><option value="">Loading...</option></select> ' +
+      '<input id="ocstart" type="date" required> <input id="ocend" type="date" required> ' +
+      '<button class="btn btn-primary" type="submit">Add</button></form><div id="ocmsg"></div></div>' +
+'<div class="card"><div class="card-title">Private message filters</div>' +
       '<p class="muted">Anyone on this list can be @mentioned privately: any message containing @their-github-username is hidden from the app, the nightly updates, and the weekly email.</p>' +
       '<div id="pmflist"><p class="muted">Loading...</p></div>' +
       '<form id="pmfform" class="form-inline"><input id="pmfname" placeholder="Name" required> ' +
@@ -1361,6 +1587,45 @@ function viewAdminJobs() {
         loadPmf();
       }).catch(function (err) {
         document.getElementById('pmfmsg').innerHTML = errorHtml(err.message);
+      });
+    };
+    // On-call schedule.
+    function loadOclist() {
+      api.get('/api/admin/oncall-schedule').then(function (list) {
+        var html = list.length === 0 ? '<p class="muted">No on-call entries yet.</p>' :
+          '<table class="data-table"><thead><tr><th>Person</th><th>Start</th><th>End</th><th></th></tr></thead><tbody>' +
+          list.map(function (o) {
+            var nm = ((o.first_name || '') + ' ' + (o.last_name || '')).trim() || o.email;
+            return '<tr><td>' + esc(nm) + '</td><td>' + esc(o.start_date) + '</td><td>' + esc(o.end_date) + '</td>' +
+              '<td><button class="btn btn-link" data-ocdel="' + o.id + '">Remove</button></td></tr>';
+          }).join('') + '</tbody></table>';
+        document.getElementById('oclist').innerHTML = html;
+        document.querySelectorAll('[data-ocdel]').forEach(function (b) {
+          b.onclick = function () {
+            api.delete('/api/admin/oncall-schedule/' + b.getAttribute('data-ocdel')).then(loadOclist);
+          };
+        });
+      });
+    }
+    api.get('/api/tickets-service-team').then(function (team) {
+      var sel = document.getElementById('ocperson');
+      sel.innerHTML = team.map(function (m) {
+        var nm = ((m.first_name || '') + ' ' + (m.last_name || '')).trim() || m.email;
+        return '<option value="' + m.id + '">' + esc(nm) + '</option>';
+      }).join('');
+    });
+    loadOclist();
+    document.getElementById('ocform').onsubmit = function (e) {
+      e.preventDefault();
+      api.post('/api/admin/oncall-schedule', {
+        steward_id: document.getElementById('ocperson').value,
+        start_date: document.getElementById('ocstart').value,
+        end_date: document.getElementById('ocend').value
+      }).then(function () {
+        document.getElementById('ocmsg').innerHTML = okHtml('On-call entry added.');
+        loadOclist();
+      }).catch(function (err) {
+        document.getElementById('ocmsg').innerHTML = errorHtml(err.message);
       });
     };
     function refreshBrandLogo() {
@@ -1847,7 +2112,7 @@ function viewAdminJobs() {
         '<button class="btn btn-primary" type="submit">Save</button></form><div id="es-pwmsg"></div></div>' +
         '<div class="card"><div class="card-title">Set roles</div>' +
         '<form id="es-rolef" class="form-inline">' +
-        chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' +
+        chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' + chk('service') + ' ' + chk('client') + ' ' +
         '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="es-rolemsg"></div></div>' +
         '<div class="card"><div class="card-title">Renumber</div>' +
         '<p class="muted">Changes the Steward ID everywhere it is used. If this is your own account, sign out and back in afterwards.</p>' +
@@ -2386,6 +2651,11 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'assignments') return viewAdminAssignments();
   if (pathParts[0] === 'admin' && pathParts[1] === 'commissions') return viewAdminCommissions();
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
+  if (pathParts[0] === 'tickets') {
+    if (pathParts[1] === 'new') return viewNewTicket();
+    if (pathParts[1]) return viewTicketDetail(pathParts[1]);
+    return viewTickets();
+  }
   location.hash = '#/login';
 }
 

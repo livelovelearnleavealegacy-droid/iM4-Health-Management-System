@@ -343,6 +343,39 @@ async function migrate() {
   await db.query('ALTER TABLE onboarding_documents DROP CONSTRAINT IF EXISTS onboarding_documents_doc_type_check');
   await db.query("ALTER TABLE onboarding_documents ADD CONSTRAINT onboarding_documents_doc_type_check " +
     "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake'))");
+  // v5.29: ticket system tables.
+  await db.query('CREATE TABLE IF NOT EXISTS tickets (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'company_code TEXT NOT NULL, ' +
+    'title TEXT NOT NULL, ' +
+    'description TEXT NOT NULL, ' +
+    "category TEXT NOT NULL DEFAULT 'general', " +
+    "priority TEXT NOT NULL DEFAULT 'medium', " +
+    "status TEXT NOT NULL DEFAULT 'open', " +
+    'created_by INT REFERENCES stewards(id), ' +
+    'assigned_to INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'resolved_at TIMESTAMPTZ)');
+  await db.query('CREATE TABLE IF NOT EXISTS ticket_replies (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'ticket_id INT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE, ' +
+    'author_id INT REFERENCES stewards(id), ' +
+    'body TEXT NOT NULL, ' +
+    'is_internal BOOLEAN NOT NULL DEFAULT FALSE, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS on_call_schedule (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'steward_id INT NOT NULL REFERENCES stewards(id) ON DELETE CASCADE, ' +
+    'start_date DATE NOT NULL, ' +
+    'end_date DATE NOT NULL, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  // v5.29: 'client' and 'service' join the allowed roles.
+  try {
+    const rc2 = await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'user_roles'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%onboarding%'");
+    for (const c of rc2.rows) { await db.query('ALTER TABLE user_roles DROP CONSTRAINT ' + c.conname); }
+    await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding', 'client', 'service'))");
+  } catch (e) { console.error('Client/service role migration:', e.message); }
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -499,6 +532,27 @@ async function getVisibleCodes(user) {
     'SELECT DISTINCT c.company_code FROM assignments a JOIN companies c ON c.id = a.company_id WHERE a.steward_id = $1',
     [user.id]);
   return r.rows.map(x => x.company_code);
+}
+
+// Ticket system: service role sees all tickets; clients/stewards see their companies' tickets.
+function canSeeAllTickets(user) {
+  const r = user.activeRole;
+  return r === 'admin' || r === 'top_dog' || r === 'service';
+}
+
+function canManageTickets(user) {
+  const r = user.activeRole;
+  return r === 'admin' || r === 'top_dog' || r === 'service';
+}
+
+// Find who's on call right now for ticket auto-assignment.
+async function getCurrentOnCall() {
+  const r = await getPool().query(
+    'SELECT o.steward_id, s.first_name, s.last_name, s.email FROM on_call_schedule o ' +
+    'JOIN stewards s ON s.id = o.steward_id ' +
+    'WHERE CURRENT_DATE BETWEEN o.start_date AND o.end_date ' +
+    'ORDER BY o.start_date DESC LIMIT 1');
+  return r.rows.length > 0 ? r.rows[0] : null;
 }
 
 // ---------------------------------------------------------------- email (Resend)
@@ -2167,7 +2221,7 @@ app.post('/api/admin/set-roles', requireAdminOrTopDog, async (req, res) => {
   try {
     const steward_id = req.body && req.body.steward_id;
     const roles = req.body && req.body.roles;
-    const allowed = ['admin', 'steward', 'top_dog', 'onboarding'];
+    const allowed = ['admin', 'steward', 'top_dog', 'onboarding', 'client', 'service'];
     if (!steward_id || !Array.isArray(roles) || roles.length === 0) {
       return res.status(400).json({ error: 'steward_id and a non-empty roles array are required' });
     }
@@ -2654,6 +2708,300 @@ app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, r
     res.json(order.map(function (code) { return byCompany[code]; }));
   } catch (error) {
     console.error('Commissions by company error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- ticket system
+// List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
+app.get('/api/tickets', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    let q = 'SELECT t.*, c.company_name, ' +
+      'cb.first_name AS creator_first, cb.last_name AS creator_last, ' +
+      'ab.first_name AS assignee_first, ab.last_name AS assignee_last, ' +
+      '(SELECT COUNT(*) FROM ticket_replies WHERE ticket_id = t.id) AS reply_count ' +
+      'FROM tickets t LEFT JOIN companies c ON c.company_code = t.company_code ' +
+      'LEFT JOIN stewards cb ON cb.id = t.created_by ' +
+      'LEFT JOIN stewards ab ON ab.id = t.assigned_to';
+    const params = [];
+    if (!canSeeAllTickets(user)) {
+      const codes = await getVisibleCodes(user);
+      if (!codes || codes.length === 0) return res.json([]);
+      q += ' WHERE t.company_code = ANY($1)';
+      params.push(codes);
+    }
+    // Optional filters
+    const filters = [];
+    if (req.query.status) { params.push(req.query.status); filters.push('t.status = $' + params.length); }
+    if (req.query.priority) { params.push(req.query.priority); filters.push('t.priority = $' + params.length); }
+    if (req.query.category) { params.push(req.query.category); filters.push('t.category = $' + params.length); }
+    if (req.query.q) { params.push('%' + req.query.q + '%'); filters.push('(t.title ILIKE $' + params.length + ' OR t.description ILIKE $' + params.length + ')'); }
+    if (filters.length > 0) q += (params.length > filters.length || q.indexOf('WHERE') !== -1 ? ' AND ' : ' WHERE ') + filters.join(' AND ');
+    q += ' ORDER BY t.updated_at DESC LIMIT 200';
+    const result = await getPool().query(q, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Ticket list error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create a ticket. Auto-assigns to whoever is on call.
+app.post('/api/tickets', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    const { company_code, title, description, category, priority } = req.body || {};
+    if (!company_code || !title || !description) {
+      return res.status(400).json({ error: 'company_code, title, and description are required' });
+    }
+    // Verify the user can file for this company.
+    if (!canSeeAllTickets(user)) {
+      const codes = await getVisibleCodes(user);
+      if (!codes || codes.indexOf(String(company_code)) === -1) {
+        return res.status(403).json({ error: 'Not authorized for this company' });
+      }
+    }
+    const validCats = ['billing', 'onboarding', 'technical', 'general'];
+    const validPris = ['low', 'medium', 'high', 'urgent'];
+    const cat = validCats.indexOf(category) !== -1 ? category : 'general';
+    const pri = validPris.indexOf(priority) !== -1 ? priority : 'medium';
+    // Auto-assign to on-call.
+    let assignee = null;
+    const oncall = await getCurrentOnCall();
+    if (oncall) assignee = oncall.steward_id;
+    const ins = await getPool().query(
+      'INSERT INTO tickets (company_code, title, description, category, priority, status, created_by, assigned_to) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+      [String(company_code), String(title), String(description), cat, pri, 'open', user.id, assignee]);
+    const ticketId = ins.rows[0].id;
+    // Notify the assignee, or all service staff if unassigned.
+    try {
+      let notifyEmails = [];
+      if (assignee) {
+        const ar = await getPool().query('SELECT email FROM stewards WHERE id = $1', [assignee]);
+        if (ar.rows.length > 0) notifyEmails.push(ar.rows[0].email);
+      } else {
+        const sr = await getPool().query(
+          "SELECT DISTINCT s.email FROM stewards s JOIN user_roles ur ON ur.steward_id = s.id WHERE ur.role = 'service'");
+        notifyEmails = sr.rows.map(x => x.email);
+      }
+      const coName = (await getPool().query('SELECT company_name FROM companies WHERE company_code = $1', [String(company_code)])).rows[0];
+      for (const em of notifyEmails) {
+        await sendEmail(em, 'New ticket #' + ticketId + ': ' + title,
+          '<p>A new ' + pri + ' priority ticket was filed for <b>' + escHtml(String(company_code)) + '</b>' +
+          (coName ? ' (' + escHtml(coName.company_name) + ')' : '') + '.</p>' +
+          '<p><b>' + escHtml(title) + '</b></p><p>' + escHtml(description).replace(/\n/g, '<br>') + '</p>');
+      }
+    } catch (e) { console.error('Ticket notify error:', e.message); }
+    res.json({ id: ticketId, assigned_to: assignee });
+  } catch (error) {
+    console.error('Ticket create error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Ticket detail with replies. Clients don't see internal notes.
+app.get('/api/tickets/:id', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    const t = await getPool().query(
+      'SELECT t.*, c.company_name, cb.first_name AS creator_first, cb.last_name AS creator_last, cb.email AS creator_email, ' +
+      'ab.first_name AS assignee_first, ab.last_name AS assignee_last ' +
+      'FROM tickets t LEFT JOIN companies c ON c.company_code = t.company_code ' +
+      'LEFT JOIN stewards cb ON cb.id = t.created_by LEFT JOIN stewards ab ON ab.id = t.assigned_to ' +
+      'WHERE t.id = $1', [req.params.id]);
+    if (t.rows.length === 0) return res.status(404).json({ error: 'Ticket not found' });
+    const ticket = t.rows[0];
+    if (!canSeeAllTickets(user)) {
+      const codes = await getVisibleCodes(user);
+      if (!codes || codes.indexOf(ticket.company_code) === -1) {
+        return res.status(403).json({ error: 'Not authorized for this ticket' });
+      }
+    }
+    let rq = 'SELECT tr.*, s.first_name, s.last_name, s.email FROM ticket_replies tr ' +
+      'LEFT JOIN stewards s ON s.id = tr.author_id WHERE tr.ticket_id = $1';
+    // Clients never see internal notes.
+    if (r === 'client') rq += ' AND tr.is_internal = FALSE';
+    rq += ' ORDER BY tr.created_at ASC';
+    const replies = await getPool().query(rq, [req.params.id]);
+    ticket.replies = replies.rows;
+    res.json(ticket);
+  } catch (error) {
+    console.error('Ticket detail error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add a reply. Only service/admin/top_dog can mark internal.
+app.post('/api/tickets/:id/replies', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const r = user.activeRole;
+    if (['admin', 'top_dog', 'service', 'steward', 'client'].indexOf(r) === -1) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    const { body, is_internal } = req.body || {};
+    if (!body || !String(body).trim()) return res.status(400).json({ error: 'Reply body is required' });
+    const t = await getPool().query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
+    if (t.rows.length === 0) return res.status(404).json({ error: 'Ticket not found' });
+    const ticket = t.rows[0];
+    if (!canSeeAllTickets(user)) {
+      const codes = await getVisibleCodes(user);
+      if (!codes || codes.indexOf(ticket.company_code) === -1) {
+        return res.status(403).json({ error: 'Not authorized for this ticket' });
+      }
+    }
+    const internal = canManageTickets(user) && is_internal === true;
+    await getPool().query(
+      'INSERT INTO ticket_replies (ticket_id, author_id, body, is_internal) VALUES ($1, $2, $3, $4)',
+      [req.params.id, user.id, String(body), internal]);
+    await getPool().query('UPDATE tickets SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+    // Notify the other side (skip for internal notes).
+    if (!internal) {
+      try {
+        const authorName = displayName(user);
+        let notifyTo = null;
+        if (r === 'client') {
+          // Client replied: notify the assignee.
+          if (ticket.assigned_to) {
+            const ar = await getPool().query('SELECT email FROM stewards WHERE id = $1', [ticket.assigned_to]);
+            if (ar.rows.length > 0) notifyTo = ar.rows[0].email;
+          }
+        } else {
+          // Staff replied: notify the requester.
+          const cr = await getPool().query('SELECT email FROM stewards WHERE id = $1', [ticket.created_by]);
+          if (cr.rows.length > 0 && cr.rows[0].email !== user.email) notifyTo = cr.rows[0].email;
+        }
+        if (notifyTo) {
+          await sendEmail(notifyTo, 'Re: Ticket #' + ticket.id + ': ' + ticket.title,
+            '<p><b>' + escHtml(authorName) + '</b> replied to ticket #' + ticket.id + ':</p>' +
+            '<p>' + escHtml(String(body)).replace(/\n/g, '<br>') + '</p>');
+        }
+      } catch (e) { console.error('Ticket reply notify error:', e.message); }
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Ticket reply error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update ticket: status, priority, assignee, category. Staff only.
+app.patch('/api/tickets/:id', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    if (!canManageTickets(user)) return res.status(403).json({ error: 'Not authorized' });
+    const t = await getPool().query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
+    if (t.rows.length === 0) return res.status(404).json({ error: 'Ticket not found' });
+    const ticket = t.rows[0];
+    const { status, priority, assigned_to, category } = req.body || {};
+    const updates = [];
+    const params = [];
+    const validStatuses = ['open', 'in_progress', 'waiting_customer', 'resolved'];
+    const validPris = ['low', 'medium', 'high', 'urgent'];
+    const validCats = ['billing', 'onboarding', 'technical', 'general'];
+    if (status && validStatuses.indexOf(status) !== -1) {
+      params.push(status); updates.push('status = $' + params.length);
+      if (status === 'resolved') updates.push('resolved_at = NOW()');
+      else updates.push('resolved_at = NULL');
+    }
+    if (priority && validPris.indexOf(priority) !== -1) { params.push(priority); updates.push('priority = $' + params.length); }
+    if (category && validCats.indexOf(category) !== -1) { params.push(category); updates.push('category = $' + params.length); }
+    if (assigned_to !== undefined) {
+      if (assigned_to === null || assigned_to === '') { updates.push('assigned_to = NULL'); }
+      else { params.push(parseInt(assigned_to, 10)); updates.push('assigned_to = $' + params.length); }
+    }
+    if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+    updates.push('updated_at = NOW()');
+    params.push(req.params.id);
+    await getPool().query('UPDATE tickets SET ' + updates.join(', ') + ' WHERE id = $' + params.length, params);
+    // Notify requester on resolve.
+    if (status === 'resolved' && ticket.status !== 'resolved') {
+      try {
+        const cr = await getPool().query('SELECT email FROM stewards WHERE id = $1', [ticket.created_by]);
+        if (cr.rows.length > 0) {
+          await sendEmail(cr.rows[0].email, 'Ticket #' + ticket.id + ' resolved: ' + ticket.title,
+            '<p>Your ticket <b>#' + ticket.id + ' ' + escHtml(ticket.title) + '</b> has been marked resolved.</p>' +
+            '<p>Reply to this ticket if the issue persists.</p>');
+        }
+      } catch (e) { console.error('Ticket resolve notify error:', e.message); }
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Ticket update error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Current on-call person (for display + auto-assignment transparency).
+app.get('/api/tickets-oncall', requireAuth, async (req, res) => {
+  try {
+    const oc = await getCurrentOnCall();
+    res.json(oc || { none: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: on-call schedule management.
+app.get('/api/admin/oncall-schedule', requireAdmin, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT o.id, o.steward_id, o.start_date, o.end_date, s.first_name, s.last_name, s.email ' +
+      'FROM on_call_schedule o JOIN stewards s ON s.id = o.steward_id ORDER BY o.start_date DESC');
+    res.json(r.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/oncall-schedule', requireAdmin, async (req, res) => {
+  try {
+    const { steward_id, start_date, end_date } = req.body || {};
+    if (!steward_id || !start_date || !end_date) {
+      return res.status(400).json({ error: 'steward_id, start_date, and end_date are required' });
+    }
+    const ins = await getPool().query(
+      'INSERT INTO on_call_schedule (steward_id, start_date, end_date) VALUES ($1, $2, $3) RETURNING id',
+      [parseInt(steward_id, 10), start_date, end_date]);
+    res.json({ id: ins.rows[0].id });
+  } catch (error) {
+    console.error('On-call schedule create error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/admin/oncall-schedule/:id', requireAdmin, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM on_call_schedule WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Service team roster (for the assignee dropdown).
+app.get('/api/tickets-service-team', requireAuth, async (req, res) => {
+  try {
+    if (!canManageTickets(req.user)) return res.status(403).json({ error: 'Not authorized' });
+    const r = await getPool().query(
+      "SELECT DISTINCT s.id, s.first_name, s.last_name, s.email FROM stewards s " +
+      "JOIN user_roles ur ON ur.steward_id = s.id WHERE ur.role IN ('service', 'admin', 'top_dog') ORDER BY s.first_name, s.last_name");
+    res.json(r.rows);
+  } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
