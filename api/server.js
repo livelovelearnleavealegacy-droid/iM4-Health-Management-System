@@ -273,6 +273,12 @@ async function migrate() {
     ['companies', 'payroll_enrolled', 'INT'],
     ['companies', 'payroll_not_enrolled', 'INT'],
     ['companies', 'payroll_new_qualified', 'INT'],
+    ['companies', 'payroll_bill_premium', 'NUMERIC'],
+    ['companies', 'payroll_bill_claims', 'NUMERIC'],
+    ['companies', 'payroll_bill_admin', 'NUMERIC'],
+    ['companies', 'payroll_bill_savings', 'NUMERIC'],
+    ['companies', 'payroll_pay_schedule', 'TEXT'],
+    ['companies', 'payroll_ein', 'TEXT'],
     ['companies', 'payroll_dataset_date', 'DATE'],
     ['companies', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE'],
     ['implementations', 'github_item_id', 'TEXT UNIQUE'],
@@ -958,7 +964,9 @@ function numericCodeSort(prefix) {
 // Build parent groups from company rows. Each group: one card on Clients.
 // Payroll is rolled up from the children: Total, Eligible, Enrolled.
 const PAYROLL_FIELDS = ['payroll_total', 'payroll_qualified', 'payroll_ineligible', 'payroll_opted_out',
-  'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date'];
+  'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_bill_premium',
+  'payroll_bill_claims', 'payroll_bill_admin', 'payroll_bill_savings', 'payroll_pay_schedule',
+  'payroll_ein', 'payroll_dataset_date'];
 function hasPayrollRow(c) {
   return PAYROLL_FIELDS.some(function (k) { return c[k] !== null && c[k] !== undefined; });
 }
@@ -1843,6 +1851,7 @@ function parsePayrollExport(buffer, fileName) {
       enrolled_count: 0, new_count: 0,
       total_gross_wages: 0, total_net_pay: 0, total_premium: 0, total_admin_fee: 0,
       total_benefit: 0, total_claim: 0, total_fica_savings: 0,
+      bill_premium: 0, bill_claims: 0, bill_admin: 0, bill_savings: 0,
       file_name: fileName || null
     };
     const schedCount = {};
@@ -1852,7 +1861,14 @@ function parsePayrollExport(buffer, fileName) {
       if (e.elig) g.eligible_count++;
       if (e.opt) g.opt_out_count++;
       if (e.isnew && e.fin) g.new_count++;
-      else if (e.fin) g.enrolled_count++;
+      else if (e.fin) {
+        g.enrolled_count++;
+        // Bill and Savings Summary is computed over enrolled employees only.
+        g.bill_premium += e.prem;
+        g.bill_claims += e.claim;
+        g.bill_admin += e.admin;
+        g.bill_savings += Math.round(e.prem * 0.0765 * 100) / 100;
+      }
       g.total_gross_wages += e.gross;
       g.total_net_pay += e.net;
       g.total_premium += e.prem;
@@ -1968,9 +1984,12 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
         for (const acct of accts) {
           const up = await db.query(
             'UPDATE companies SET payroll_total = $1, payroll_qualified = $2, payroll_ineligible = $3, ' +
-            'payroll_opted_out = $4, payroll_enrolled = $5, payroll_not_enrolled = $6, payroll_new_qualified = $7, payroll_dataset_date = CURRENT_DATE ' +
-            'WHERE company_code = $8',
-            [g.employee_count, g.eligible_count, g.ineligible_count, g.opt_out_count, g.enrolled_count, notEnrolled, g.new_count, acct]);
+            'payroll_opted_out = $4, payroll_enrolled = $5, payroll_not_enrolled = $6, payroll_new_qualified = $7, ' +
+            'payroll_bill_premium = $8, payroll_bill_claims = $9, payroll_bill_admin = $10, payroll_bill_savings = $11, ' +
+            'payroll_pay_schedule = $12, payroll_ein = $13, payroll_dataset_date = CURRENT_DATE ' +
+            'WHERE company_code = $14',
+            [g.employee_count, g.eligible_count, g.ineligible_count, g.opt_out_count, g.enrolled_count, notEnrolled,
+             g.new_count, g.bill_premium, g.bill_claims, g.bill_admin, g.bill_savings, g.pay_schedule, g.ein, acct]);
           if (up.rowCount > 0) companiesUpdated++;
         }
       }

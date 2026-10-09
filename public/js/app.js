@@ -89,6 +89,12 @@ function downloadOnboardingDoc(clientId, docId, fileName) {
   }).catch(function (err) { alert(err.message); });
 }
 
+function enrolledLine(enrolled, hasPayroll) {
+  if (enrolled !== null && enrolled !== undefined) return '<span><b>' + enrolled + '</b> enrolled</span>';
+  if (hasPayroll) return '';
+  return '<span class="muted">No payroll data yet</span>';
+}
+
 function rollLine(total, eligible, enrolled, hasPayroll) {
   var parts = [];
   if (total !== null && total !== undefined) parts.push('<span><b>' + total + '</b> total</span>');
@@ -104,7 +110,9 @@ function rollLine(total, eligible, enrolled, hasPayroll) {
 // True when a company row has any payroll data in any payroll column.
 function hasPayrollData(c) {
   return ['payroll_total', 'payroll_qualified', 'payroll_ineligible', 'payroll_opted_out',
-    'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_dataset_date']
+    'payroll_enrolled', 'payroll_not_enrolled', 'payroll_new_qualified', 'payroll_bill_premium',
+    'payroll_bill_claims', 'payroll_bill_admin', 'payroll_bill_savings', 'payroll_pay_schedule',
+    'payroll_ein', 'payroll_dataset_date']
     .some(function (k) { return c[k] !== null && c[k] !== undefined; });
 }
 
@@ -138,7 +146,7 @@ function companyCard(o) {
   return '<a class="' + cls + '" href="' + o.link + '">' +
     '<div class="card-code">' + esc(o.code) + '</div>' +
     '<div class="card-title">' + esc(o.name) + '</div>' +
-    '<div class="card-numbers">' + rollLine(o.total, o.eligible, o.enrolled, o.hasPayroll) + '</div>' +
+    '<div class="card-numbers">' + enrolledLine(o.enrolled, o.hasPayroll) + '</div>' +
     invoiceLine(o.openCount, o.openTotal, o.oldestOpen) +
     (o.sub ? '<div class="muted">' + o.sub + '</div>' : '') + '</a>';
 }
@@ -725,7 +733,7 @@ function viewParent(code) {
       render(shell(
         '<p><a href="#/clients">&larr; Companies</a></p>' +
         '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
-        '<div class="rollup"><b>Roll-up:</b> ' + rollLine(p.total, p.eligible, p.enrolled, p.has_payroll) + '</div>' +
+        '<div class="rollup"><b>Roll-up:</b> ' + enrolledLine(p.enrolled, p.has_payroll) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Companies</h3><div class="card-grid">' + childCards + '</div>' +
         '<h3>Implementations</h3>' +
@@ -744,16 +752,42 @@ function payrollTable(c) {
   function row(label, v) {
     return '<tr><td>' + label + '</td><td><b>' + (v === null || v === undefined ? '&mdash;' : esc(v)) + '</b></td></tr>';
   }
-  return '<table class="data-table"><tbody>' +
-    row('Total employees', c.payroll_total) +
-    row('Ineligible', c.payroll_ineligible) +
-    row('Opted out', c.payroll_opted_out) +
-    row('Eligible', elig()) +
-    row('Enrolled', c.payroll_enrolled) +
-    row('Not enrolled', c.payroll_not_enrolled) +
-    row('New qualified', c.payroll_new_qualified) +
+  function moneyRow(label, v) {
+    return '<tr><td>' + label + '</td><td><b>' + (v === null || v === undefined ? '&mdash;' : esc(fmtMoney(v))) + '</b></td></tr>';
+  }
+  var prem = c.payroll_bill_premium, claims = c.payroll_bill_claims,
+      admin = c.payroll_bill_admin, savings = c.payroll_bill_savings;
+  var hasBill = prem !== null && prem !== undefined;
+  var premLessClaims = hasBill ? (+prem - +claims) : null;
+  var netSavings = (hasBill && admin !== null && admin !== undefined) ? (+savings - +admin) : null;
+  var totalDue = (premLessClaims !== null && admin !== null && admin !== undefined) ? (premLessClaims + +admin) : null;
+  var html = '<h3>Payroll Summary</h3><table class="data-table"><tbody>' +
+    row('Employer Name', c.company_name) +
+    row('Group', c.payroll_ein) +
+    row('Payroll Frequency', c.payroll_pay_schedule) +
     '</tbody></table>' +
-    (c.payroll_dataset_date ? '<p class="muted">Last payroll data: ' + fmtDate(c.payroll_dataset_date) + '</p>' : '');
+    '<h3>Plan Selection Results</h3><table class="data-table"><tbody>' +
+    row('Total Employees', c.payroll_total) +
+    row('Ineligible', c.payroll_ineligible) +
+    row('Opted-Out', c.payroll_opted_out) +
+    row('Eligible', elig()) +
+    row('New Qualified', c.payroll_new_qualified) +
+    row('Enrolled', c.payroll_enrolled) +
+    row('Not Enrolled', c.payroll_not_enrolled) +
+    '</tbody></table>';
+  if (hasBill) {
+    html += '<h3>Bill and Savings Summary</h3><table class="data-table"><tbody>' +
+      moneyRow('Total Premium', prem) +
+      moneyRow('Total Claims', claims) +
+      moneyRow('Premium Less Claims', premLessClaims) +
+      moneyRow('Total Admin Fees', admin) +
+      moneyRow('Employer Savings', savings) +
+      moneyRow('Net Employer Savings', netSavings) +
+      moneyRow('Total Due this Payroll', totalDue) +
+      '</tbody></table>';
+  }
+  html += (c.payroll_dataset_date ? '<p class="muted">Last payroll data: ' + fmtDate(c.payroll_dataset_date) + '</p>' : '');
+  return html;
 }
 
 // Child detail: payroll + stewards + implementation cards.
@@ -1379,7 +1413,7 @@ function viewAdminCompanies() {
         return '<tr data-active="' + (isActive ? '1' : '0') + '">' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
           '<td>' + act + '</td>' +
-          cell(c.payroll_ineligible) + cell(c.payroll_enrolled) +
+          cell(c.payroll_total) + cell(c.payroll_enrolled) +
           '<td>' + (c.open_invoice_count || 0) + '</td><td><b>' + fmtMoney(c.open_invoice_total || 0) + '</b></td></tr>';
       }).join('');
       render(shell(
@@ -1392,7 +1426,7 @@ function viewAdminCompanies() {
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>Company Name</th><th>Active</th>' +
         '<th colspan="2">Last Payroll</th><th colspan="2">Invoices outstanding</th></tr>' +
         '<tr><th></th><th></th><th></th><th></th><th></th>' +
-        '<th>Ineligible</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
+        '<th>Total</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>',
         '#/admin/companies'));
       function applyCompanyFilter() {
@@ -1563,7 +1597,7 @@ function viewAdminJobs() {
       '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
       '<button class="btn btn-small" id="soldelexport">Export current S bills</button><div id="solout"></div></div>' +
       '<div class="card"><div class="card-title">Payroll company summary (Power BI)</div>' +
-      '<p class="muted">Upload the Power BI payroll export spreadsheet. It takes the latest done case per company (EIN) and stores Total, Ineligible (incl. opt-outs) and Enrolled, then pushes those numbers to the Companies page via the EIN cross-reference \u2014 no employee PII is stored. Preview first, then import.</p>' +
+      '<p class="muted">Upload the Power BI payroll export spreadsheet. It takes the latest done case per company (EIN) and stores the headcounts plus the Bill and Savings Summary, then pushes those numbers to the Companies page via the EIN cross-reference \u2014 no employee PII is stored. Preview first, then import.</p>' +
       '<input type="file" id="payfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="paypreview">Upload &amp; preview</button><div id="payout"></div></div>' +
       '<div class="card"><div class="card-title">EIN \u2194 Account cross-reference</div>' +
