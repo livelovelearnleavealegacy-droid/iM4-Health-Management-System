@@ -1763,9 +1763,10 @@ function parsePayrollExport(buffer, fileName) {
   const cases = {};
   rows.forEach(function (r) {
     const caseNum = txt(r[cCase]);
-    // Normalize EIN to digits: the export mixes '47-2606741' and '472606741'
-    // for the same company, which would otherwise split one company in two.
-    const ein = txt(r[cEin]) ? txt(r[cEin]).replace(/[^0-9]/g, '') : null;
+    // Normalize EIN: the export mixes '47-2606741' and '472606741' for the same
+    // company, which would otherwise split one company in two. Keep letters so
+    // division suffixes ('-reg', '-105A') stay distinct entities.
+    const ein = txt(r[cEin]) ? txt(r[cEin]).replace(/[^0-9a-zA-Z]/g, '') : null;
     if (!caseNum || !ein) return;
     const key = ein + '|' + caseNum;
     let c = cases[key];
@@ -1863,11 +1864,11 @@ app.post('/api/admin/jobs/payroll-preview', requireAdmin, handleUpload('file'), 
     const db = getPool();
     let matched = 0;
     try {
-      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n FROM ein_account_xref WHERE tin IS NOT NULL', ['[^0-9]', '', 'g']);
+      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n FROM ein_account_xref WHERE tin IS NOT NULL', ['[^0-9a-zA-Z]', '', 'g']);
       const tinSet = {};
       xr.rows.forEach(function (r) { if (r.tin_n) tinSet[r.tin_n] = true; });
       groups.forEach(function (g) {
-        const en = String(g.ein || '').replace(/[^0-9]/g, '');
+        const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
         if (en && tinSet[en]) matched++;
       });
     } catch (e) { /* xref table may not exist yet */ }
@@ -1912,7 +1913,7 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
     // downstream of companies.payroll_*) picks them up.
     let companiesUpdated = 0, xrefMissed = 0;
     try {
-      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL', ['[^0-9]', '', 'g']);
+      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL', ['[^0-9a-zA-Z]', '', 'g']);
       const acctByTin = {};
       xr.rows.forEach(function (r) {
         if (!r.tin_n || !r.acct) return;
@@ -1920,7 +1921,7 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
         acctByTin[r.tin_n].push(String(r.acct).trim());
       });
       for (const g of groups) {
-        const en = String(g.ein || '').replace(/[^0-9]/g, '');
+        const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
         const accts = acctByTin[en] || [];
         if (!accts.length) { xrefMissed++; continue; }
         const notEnrolled = Math.max(g.eligible_count - g.enrolled_count, 0);
