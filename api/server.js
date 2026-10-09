@@ -416,6 +416,22 @@ async function migrate() {
     'file_name TEXT, ' +
     'is_latest_case BOOLEAN, ' +
     'imported_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS ein_account_xref (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'hop TEXT, ' +
+    'grp TEXT, ' +
+    'acct TEXT, ' +
+    'tin TEXT, ' +
+    'acct_name TEXT, ' +
+    'addr1 TEXT, ' +
+    'addr2 TEXT, ' +
+    'city TEXT, ' +
+    'state TEXT, ' +
+    'zip TEXT, ' +
+    'eff_date DATE, ' +
+    'term_date DATE, ' +
+    'file_name TEXT, ' +
+    'imported_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -1825,6 +1841,111 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
     payrollPreviewCache.delete(previewToken);
     res.json({ ok: true, imported: imported });
   } catch (error) { console.error('Payroll import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// ---------------------------------------------------------------- v5.33: EIN <-> account cross-reference
+// Maps TIN (EIN) to Acct (company code) across sources.
+const xrefPreviewCache = new Map();
+
+function xrefDate(v) {
+  if (v === undefined || v === null || v === '') return null;
+  if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+  const s = String(v).trim();
+  if (!s) return null;
+  const d = new Date(s);
+  if (!isNaN(d)) return d.toISOString().slice(0, 10);
+  return null;
+}
+
+function parseXrefExport(buffer, fileName) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+  if (!rows.length) throw new Error('No data rows found in this file.');
+  const norm = {};
+  Object.keys(rows[0]).forEach(function (k) { norm[String(k).trim().toLowerCase()] = k; });
+  function col() {
+    for (let i = 0; i < arguments.length; i++) {
+      const k = norm[String(arguments[i]).trim().toLowerCase()];
+      if (k !== undefined) return k;
+    }
+    return null;
+  }
+  const cAcct = col('acct', 'account', 'account_code', 'company_code', 'company code');
+  const cTin = col('tin', 'ein');
+  if (!cAcct) throw new Error('Could not find an Acct (company code) column.');
+  if (!cTin) throw new Error('Could not find a TIN (EIN) column.');
+  const cHop = col('hop');
+  const cGrp = col('group');
+  const cName = col('acct name', 'account name', 'acct_name');
+  const cA1 = col('addr 1', 'address 1', 'addr1');
+  const cA2 = col('addr 2', 'address 2', 'addr2');
+  const cCity = col('city');
+  const cState = col('state');
+  const cZip = col('zip', 'zipcode', 'zip code');
+  const cEff = col('eff date', 'effective date', 'eff_date');
+  const cTerm = col('term date', 'termination date', 'term_date');
+  function txt(r, c) { return (c && r[c] !== null && r[c] !== undefined && String(r[c]).trim() !== '') ? String(r[c]).trim() : null; }
+  const out = [];
+  rows.forEach(function (r) {
+    const acct = txt(r, cAcct);
+    if (!acct) return;
+    out.push({
+      hop: txt(r, cHop), grp: txt(r, cGrp), acct: acct, tin: txt(r, cTin),
+      acct_name: txt(r, cName), addr1: txt(r, cA1), addr2: txt(r, cA2),
+      city: txt(r, cCity), state: txt(r, cState), zip: txt(r, cZip),
+      eff_date: cEff ? xrefDate(r[cEff]) : null,
+      term_date: cTerm ? xrefDate(r[cTerm]) : null,
+      file_name: fileName || null
+    });
+  });
+  return out;
+}
+
+app.post('/api/admin/jobs/xref-preview', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const rows = parseXrefExport(req.file.buffer, req.file.originalname);
+    if (!rows.length) return res.status(400).json({ error: 'No rows found in this file' });
+    const crypto = require('crypto');
+    const previewToken = crypto.randomBytes(16).toString('hex');
+    const now = Date.now();
+    for (const [tk, v] of xrefPreviewCache) { if (v.expires < now) xrefPreviewCache.delete(tk); }
+    xrefPreviewCache.set(previewToken, { rows: rows, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
+    const accts = {};
+    rows.forEach(function (r) { accts[r.acct] = true; });
+    res.json({
+      ok: true,
+      preview_token: previewToken,
+      stats: { rows: rows.length, accounts: Object.keys(accts).length, file_name: req.file.originalname },
+      sample: rows.slice(0, 8)
+    });
+  } catch (error) { console.error('Xref preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+app.post('/api/admin/jobs/xref-import', requireAdmin, async (req, res) => {
+  try {
+    const previewToken = req.body && req.body.preview_token;
+    const cached = previewToken ? xrefPreviewCache.get(previewToken) : null;
+    if (!cached || cached.expires < Date.now()) {
+      if (previewToken) xrefPreviewCache.delete(previewToken);
+      return res.status(400).json({ error: 'Preview expired. Upload the file again.' });
+    }
+    const rows = cached.rows;
+    const db = getPool();
+    await db.query('DELETE FROM ein_account_xref');
+    let imported = 0;
+    for (const r of rows) {
+      await db.query(
+        'INSERT INTO ein_account_xref (hop, grp, acct, tin, acct_name, addr1, addr2, city, state, zip, eff_date, term_date, file_name) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+        [r.hop, r.grp, r.acct, r.tin, r.acct_name, r.addr1, r.addr2, r.city, r.state, r.zip, r.eff_date, r.term_date, r.file_name]);
+      imported++;
+    }
+    xrefPreviewCache.delete(previewToken);
+    res.json({ ok: true, imported: imported });
+  } catch (error) { console.error('Xref import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- v5.9: estimate unpaid F bills

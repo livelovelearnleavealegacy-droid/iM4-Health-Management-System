@@ -1566,6 +1566,10 @@ function viewAdminJobs() {
       '<p class="muted">Upload the Power BI payroll export spreadsheet. It aggregates employee rows up to company level (case number + EIN + cycle) \u2014 no employee PII is stored. Preview first, then import to replace the summary table.</p>' +
       '<input type="file" id="payfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="paypreview">Upload &amp; preview</button><div id="payout"></div></div>' +
+      '<div class="card"><div class="card-title">EIN \u2194 Account cross-reference</div>' +
+      '<p class="muted">Upload the account info spreadsheet (TIN/EIN \u2194 Acct/company code). Preview first, then import to replace the cross-reference table.</p>' +
+      '<input type="file" id="xreffile" accept=".xlsx,.xls,.csv"> ' +
+      '<button class="btn btn-primary" id="xrefpreview">Upload &amp; preview</button><div id="xrefout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
       '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
@@ -1900,6 +1904,35 @@ function viewAdminJobs() {
       out.innerHTML = '<p class="muted">Deleting estimates...</p>';
       api.post('/api/admin/jobs/ftj-estimate-clear', {}).then(function (r) {
         out.innerHTML = okHtml('Deleted ' + r.deleted + ' estimated bills.');
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
+    document.getElementById('xrefpreview').onclick = function () {
+      var out = document.getElementById('xrefout');
+      var fi = document.getElementById('xreffile');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
+      var fd = new FormData();
+      fd.append('file', fi.files[0]);
+      out.innerHTML = '<p class="muted">Parsing the cross-reference file...</p>';
+      uploadFile('/api/admin/jobs/xref-preview', fd).then(function (r) {
+        var s = r.stats;
+        var html = '<p><b>' + s.rows + '</b> rows, <b>' + s.accounts + '</b> accounts ' +
+          '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Acct</th><th>TIN</th><th>Acct Name</th><th>City</th><th>State</th><th>Eff Date</th><th>Term Date</th></tr></thead><tbody>' +
+          r.sample.map(function (x) {
+            return '<tr><td><b>' + esc(x.acct) + '</b></td><td>' + esc(x.tin || '') + '</td><td>' + esc(x.acct_name || '') + '</td><td>' +
+              esc(x.city || '') + '</td><td>' + esc(x.state || '') + '</td><td>' + esc(x.eff_date || '') + '</td><td>' + esc(x.term_date || '') + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+        html += '<p><button class="btn btn-primary" id="xrefimport">Import ' + s.rows + ' rows</button> ' +
+          '<span class="muted">Replaces the cross-reference table.</span></p><div id="xrefimportout"></div>';
+        out.innerHTML = html;
+        document.getElementById('xrefimport').onclick = function () {
+          if (!window.confirm('Import cross-reference? This replaces the current table.')) return;
+          var iout = document.getElementById('xrefimportout');
+          iout.innerHTML = '<p class="muted">Importing...</p>';
+          api.post('/api/admin/jobs/xref-import', { preview_token: r.preview_token }).then(function (imp) {
+            iout.innerHTML = okHtml('Done: ' + imp.imported + ' rows imported.');
+          }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
+        };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
     document.getElementById('solpreview').onclick = function () {
