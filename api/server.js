@@ -1855,8 +1855,8 @@ function parsePayrollExport(buffer, fileName) {
       g.employee_count++;
       if (e.elig) g.eligible_count++;
       if (e.opt) g.opt_out_count++;
-      if (e.fin) g.enrolled_count++;
-      if (e.isnew) g.new_count++;
+      if (e.isnew && e.fin) g.new_count++;
+      else if (e.fin) g.enrolled_count++;
       g.total_gross_wages += e.gross;
       g.total_net_pay += e.net;
       g.total_premium += e.prem;
@@ -1967,13 +1967,13 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
         const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
         const accts = acctByTin[en] || [];
         if (!accts.length) { xrefMissed++; continue; }
-        const notEnrolled = Math.max(g.eligible_count - g.enrolled_count, 0);
+        const notEnrolled = Math.max(g.eligible_count - g.enrolled_count - g.new_count, 0);
         for (const acct of accts) {
           const up = await db.query(
             'UPDATE companies SET payroll_total = $1, payroll_qualified = $2, payroll_ineligible = $3, ' +
-            'payroll_opted_out = $4, payroll_enrolled = $5, payroll_not_enrolled = $6, payroll_dataset_date = CURRENT_DATE ' +
-            'WHERE company_code = $7',
-            [g.employee_count, g.eligible_count, g.ineligible_count, g.opt_out_count, g.enrolled_count, notEnrolled, acct]);
+            'payroll_opted_out = $4, payroll_enrolled = $5, payroll_not_enrolled = $6, payroll_new_qualified = $7, payroll_dataset_date = CURRENT_DATE ' +
+            'WHERE company_code = $8',
+            [g.employee_count, g.eligible_count, g.ineligible_count, g.opt_out_count, g.enrolled_count, notEnrolled, g.new_count, acct]);
           if (up.rowCount > 0) companiesUpdated++;
         }
       }
