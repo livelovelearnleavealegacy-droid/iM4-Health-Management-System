@@ -1961,7 +1961,7 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
       xr.rows.forEach(function (r) {
         if (!r.tin_n || !r.acct) return;
         if (!acctByTin[r.tin_n]) acctByTin[r.tin_n] = [];
-        acctByTin[r.tin_n].push(String(r.acct).trim());
+        acctByTin[r.tin_n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
       });
       for (const g of groups) {
         const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
@@ -2029,8 +2029,9 @@ function parseXrefExport(buffer, fileName) {
   function txt(r, c) { return (c && r[c] !== null && r[c] !== undefined && String(r[c]).trim() !== '') ? String(r[c]).trim() : null; }
   const out = [];
   rows.forEach(function (r) {
-    const acct = txt(r, cAcct);
+    let acct = txt(r, cAcct);
     if (!acct) return;
+    acct = acct.replace(/^['"]+|['"]+$/g, '').trim();
     out.push({
       hop: txt(r, cHop), grp: txt(r, cGrp), acct: acct, tin: txt(r, cTin),
       acct_name: txt(r, cName), addr1: txt(r, cA1), addr2: txt(r, cA2),
