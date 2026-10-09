@@ -1717,11 +1717,13 @@ function payrollBool(v) {
 }
 
 function parsePayrollExport(buffer, fileName) {
-  // v5.34: one row per EIN — the latest case with Status='done' that has
-  // at least one IsFinal=true row. Per company: Total, Ineligible (incl.
-  // opt-outs), Enrolled. Headcounts dedupe by EmployeeId (one row per
-  // employee per payroll cycle in the export); flags are OR'd across an
-  // employee's rows and money comes from each employee's latest cycle row.
+  // v5.36: one row per EIN — the latest case with Status='done' that has at
+  // least one finalized employee. Headcounts come from the case's LATEST
+  // payroll cycle snapshot (distinct employees in that cycle), matching the
+  // case screenshots: Total, Ineligible (= Total - Eligible - OptedOut),
+  // OptedOut, Eligible, New Qualified (= New AND Final), Enrolled
+  // (= Final but not New Qualified), Not Enrolled (= Eligible - Enrolled
+  // - New Qualified). Money is summed from the snapshot rows.
   // No employee PII is stored.
   const XLSX = require('xlsx');
   const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
@@ -1764,11 +1766,8 @@ function parsePayrollExport(buffer, fileName) {
   const cMonth = col('updated_dt - month', 'updated_dt-month');
   const cDay = col('updated_dt - day', 'updated_dt-day');
   function txt(v) { return (v !== null && v !== undefined && String(v).trim() !== '') ? String(v).trim() : null; }
-  function cycNum(v) {
-    const n = parseInt(v, 10);
-    return isNaN(n) ? 0 : n;
-  }
-  // Pass 1: bucket rows by (ein, case), dedupe employees within.
+  function cycNum(v) { const n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
+  // Pass 1: bucket rows by (ein, case); remember each case's max cycle.
   const cases = {};
   rows.forEach(function (r) {
     const caseNum = txt(r[cCase]);
@@ -1778,65 +1777,62 @@ function parsePayrollExport(buffer, fileName) {
     if (!caseNum || !ein) return;
     const key = ein + '|' + caseNum;
     let c = cases[key];
-    if (!c) c = cases[key] = { ein: ein, case_number: caseNum, emps: {}, done: false, finals: 0 };
-    if (cStatus && String(r[cStatus]).trim().toLowerCase() === 'done') c.done = true;
-    const eid = cEmpId ? txt(r[cEmpId]) : null;
-    const empKey = eid || ('row#' + Object.keys(c.emps).length);
-    let e = c.emps[empKey];
-    if (!e) {
-      e = c.emps[empKey] = { elig: false, fin: false, opt: false, isnew: false,
-        cycle: -1, gross: 0, net: 0, prem: 0, admin: 0, ben: 0, claim: 0, fica: 0,
-        name: null, loc: null, state: null, zip: null, sched: null,
-        py: null, pm: null, pd: null };
-    }
-    if (cElig && payrollBool(r[cElig])) e.elig = true;
-    if (cFin && payrollBool(r[cFin])) e.fin = true;
-    if (cOpt && payrollBool(r[cOpt])) e.opt = true;
-    if (cNew && payrollBool(r[cNew])) e.isnew = true;
-    // Money + period from the employee's latest cycle row.
+    if (!c) c = cases[key] = { ein: ein, case_number: caseNum, maxCycle: -1, rows: [], done: false };
     const cy = cCycle ? cycNum(r[cCycle]) : 0;
-    if (cy >= e.cycle) {
-      e.cycle = cy;
-      if (cGross) e.gross = payrollNum(r[cGross]);
-      if (cNet) e.net = payrollNum(r[cNet]);
-      if (cPrem) e.prem = payrollNum(r[cPrem]);
-      if (cAdmin) e.admin = payrollNum(r[cAdmin]);
-      if (cBen) e.ben = payrollNum(r[cBen]);
-      if (cClaim) e.claim = payrollNum(r[cClaim]);
-      if (cFica) e.fica = payrollNum(r[cFica]);
-    }
-    if (!e.name) e.name = txt(r[cEmpName]);
-    if (!e.loc) e.loc = txt(r[cEmpLoc]);
-    if (!e.state) e.state = txt(r[cState]);
-    if (!e.zip) e.zip = txt(r[cZip]);
-    if (!e.sched && cPaySched) e.sched = txt(r[cPaySched]);
-    if (cYear && cMonth && cDay) {
-      const y = parseInt(r[cYear], 10), d = parseInt(r[cDay], 10);
-      if (!isNaN(y) && !isNaN(d)) {
-        const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
-        const mo = months[String(r[cMonth]).trim().toLowerCase()] || 1;
-        const cur = e.py ? e.py * 10000 + e.pm * 100 + e.pd : 0;
-        if (y * 10000 + mo * 100 + d > cur) { e.py = y; e.pm = mo; e.pd = d; }
-      }
-    }
+    if (cy > c.maxCycle) c.maxCycle = cy;
+    c.rows.push(r);
+    if (cStatus && String(r[cStatus]).trim().toLowerCase() === 'done') c.done = true;
   });
-  Object.keys(cases).forEach(function (key) {
-    const c = cases[key];
-    c.finals = Object.keys(c.emps).filter(function (k) { return c.emps[k].fin; }).length;
-  });
-  // Pass 2: per EIN, pick the latest done case that has finals.
+  // Pass 2: per (ein, case), take the latest-cycle snapshot; per EIN pick the
+  // latest done case with at least one finalized employee in its snapshot.
   const best = {};
+  const seenEin = {};
   Object.keys(cases).forEach(function (key) {
     const c = cases[key];
-    if (!c.done || c.finals === 0) return;
+    seenEin[c.ein] = true;
+    const snap = {};
+    c.rows.forEach(function (r) {
+      const cy = cCycle ? cycNum(r[cCycle]) : 0;
+      if (cy !== c.maxCycle) return;
+      const eid = cEmpId ? txt(r[cEmpId]) : null;
+      const empKey = eid || ('row#' + Object.keys(snap).length);
+      if (snap[empKey]) return;
+      snap[empKey] = {
+        elig: !!(cElig && payrollBool(r[cElig])),
+        fin: !!(cFin && payrollBool(r[cFin])),
+        opt: !!(cOpt && payrollBool(r[cOpt])),
+        isnew: !!(cNew && payrollBool(r[cNew])),
+        gross: cGross ? payrollNum(r[cGross]) : 0,
+        net: cNet ? payrollNum(r[cNet]) : 0,
+        prem: cPrem ? payrollNum(r[cPrem]) : 0,
+        admin: cAdmin ? payrollNum(r[cAdmin]) : 0,
+        ben: cBen ? payrollNum(r[cBen]) : 0,
+        claim: cClaim ? payrollNum(r[cClaim]) : 0,
+        fica: cFica ? payrollNum(r[cFica]) : 0,
+        name: txt(r[cEmpName]), loc: txt(r[cEmpLoc]),
+        state: txt(r[cState]), zip: txt(r[cZip]),
+        sched: cPaySched ? txt(r[cPaySched]) : null,
+        py: null, pm: null, pd: null
+      };
+      const e = snap[empKey];
+      if (cYear && cMonth && cDay) {
+        const y = parseInt(r[cYear], 10), d = parseInt(r[cDay], 10);
+        if (!isNaN(y) && !isNaN(d)) {
+          const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
+          const mo = months[String(r[cMonth]).trim().toLowerCase()] || 1;
+          e.py = y; e.pm = mo; e.pd = d;
+        }
+      }
+    });
+    const finals = Object.keys(snap).filter(function (k) { return snap[k].fin; }).length;
+    c.snapshot = snap;
+    if (!c.done || finals === 0) return;
     const cur = best[c.ein];
     if (!cur || c.case_number > cur.case_number) best[c.ein] = c;
   });
-  // Pass 3: aggregate the chosen case per EIN.
+  // Pass 3: aggregate the chosen case snapshot per EIN.
   const out = [];
   const skipped = { no_qualifying_case: 0 };
-  const seenEin = {};
-  Object.keys(cases).forEach(function (key) { seenEin[cases[key].ein] = true; });
   Object.keys(best).forEach(function (ein) {
     const c = best[ein];
     const g = {
@@ -1850,8 +1846,8 @@ function parsePayrollExport(buffer, fileName) {
       file_name: fileName || null
     };
     const schedCount = {};
-    Object.keys(c.emps).forEach(function (k) {
-      const e = c.emps[k];
+    Object.keys(c.snapshot).forEach(function (k) {
+      const e = c.snapshot[k];
       g.employee_count++;
       if (e.elig) g.eligible_count++;
       if (e.opt) g.opt_out_count++;
@@ -1874,7 +1870,7 @@ function parsePayrollExport(buffer, fileName) {
         if (e.py * 10000 + e.pm * 100 + e.pd > cur) { g.period_year = e.py; g.period_month = e.pm; g.period_day = e.pd; }
       }
     });
-    g.ineligible_count = g.employee_count - g.eligible_count;
+    g.ineligible_count = g.employee_count - g.eligible_count - g.opt_out_count;
     let topSched = null, topN = 0;
     Object.keys(schedCount).forEach(function (s) { if (schedCount[s] > topN) { topN = schedCount[s]; topSched = s; } });
     g.pay_schedule = topSched;
@@ -1884,6 +1880,7 @@ function parsePayrollExport(buffer, fileName) {
   out.sort(function (a, b) { return String(a.case_number).localeCompare(String(b.case_number)); });
   return { groups: out, skipped: skipped };
 }
+
 
 
 
@@ -1901,7 +1898,7 @@ app.post('/api/admin/jobs/payroll-preview', requireAdmin, handleUpload('file'), 
     let employees = 0, reconBad = 0;
     groups.forEach(function (g) {
       employees += g.employee_count;
-      if (g.ineligible_count + g.enrolled_count !== g.employee_count) reconBad++;
+      if (g.ineligible_count + g.opt_out_count + g.eligible_count !== g.employee_count) reconBad++;
     });
     // How many companies will match to iM4 company codes via the EIN cross-reference?
     const db = getPool();

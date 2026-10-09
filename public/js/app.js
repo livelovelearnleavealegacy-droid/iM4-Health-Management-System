@@ -1979,7 +1979,7 @@ function viewAdminJobs() {
         var html = '<p><b>' + s.companies + '</b> companies (latest done case each), <b>' + s.employees + '</b> employees ' +
           '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
         if (s.skipped_no_qualifying_case) html += '<p class="muted">' + s.skipped_no_qualifying_case + ' EINs skipped (no done case with finals).</p>';
-        if (s.recon_mismatch) html += '<p class="muted">' + s.recon_mismatch + ' companies where ineligible + enrolled \u2260 total (eligible but not yet finalized).</p>';
+        if (s.recon_mismatch) html += '<p class="muted">' + s.recon_mismatch + ' companies where the headcount buckets do not reconcile.</p>';
         html += '<p class="muted">' + s.xref_matched + ' of ' + s.companies + ' match an iM4 company code via the EIN cross-reference.</p>';
         html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Case</th><th>EIN</th><th>Employer</th><th>Total</th><th>Ineligible</th><th>Enrolled</th><th>Premium</th><th>Admin Fee</th></tr></thead><tbody>' +
           r.sample.map(function (g) {
