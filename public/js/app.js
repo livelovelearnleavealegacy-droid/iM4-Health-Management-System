@@ -1563,7 +1563,7 @@ function viewAdminJobs() {
       '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
       '<button class="btn btn-small" id="soldelexport">Export current S bills</button><div id="solout"></div></div>' +
       '<div class="card"><div class="card-title">Payroll company summary (Power BI)</div>' +
-      '<p class="muted">Upload the Power BI payroll export spreadsheet. It aggregates employee rows up to company level (case number + EIN + cycle) \u2014 no employee PII is stored. Preview first, then import to replace the summary table.</p>' +
+      '<p class="muted">Upload the Power BI payroll export spreadsheet. It takes the latest done case per company (EIN) and stores Total, Ineligible (incl. opt-outs) and Enrolled, then pushes those numbers to the Companies page via the EIN cross-reference \u2014 no employee PII is stored. Preview first, then import.</p>' +
       '<input type="file" id="payfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="paypreview">Upload &amp; preview</button><div id="payout"></div></div>' +
       '<div class="card"><div class="card-title">EIN \u2194 Account cross-reference</div>' +
@@ -1973,26 +1973,30 @@ function viewAdminJobs() {
       if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
       var fd = new FormData();
       fd.append('file', fi.files[0]);
-      out.innerHTML = '<p class="muted">Parsing the payroll export and aggregating to company level...</p>';
+      out.innerHTML = '<p class="muted">Parsing the payroll export — latest done case per company...</p>';
       uploadFile('/api/admin/jobs/payroll-preview', fd).then(function (r) {
         var s = r.stats;
-        var html = '<p><b>' + s.companies + '</b> companies, <b>' + s.employees + '</b> employees aggregated ' +
+        var html = '<p><b>' + s.companies + '</b> companies (latest done case each), <b>' + s.employees + '</b> employees ' +
           '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
-        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Case</th><th>EIN</th><th>Employer</th><th>Cycle</th><th>Employees</th><th>Gross</th><th>Premium</th><th>Admin Fee</th></tr></thead><tbody>' +
+        if (s.skipped_no_qualifying_case) html += '<p class="muted">' + s.skipped_no_qualifying_case + ' EINs skipped (no done case with finals).</p>';
+        if (s.recon_mismatch) html += '<p class="muted">' + s.recon_mismatch + ' companies where ineligible + enrolled \u2260 total (eligible but not yet finalized).</p>';
+        html += '<p class="muted">' + s.xref_matched + ' of ' + s.companies + ' match an iM4 company code via the EIN cross-reference.</p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Case</th><th>EIN</th><th>Employer</th><th>Total</th><th>Ineligible</th><th>Enrolled</th><th>Premium</th><th>Admin Fee</th></tr></thead><tbody>' +
           r.sample.map(function (g) {
-            return '<tr><td><b>' + esc(g.case_number) + '</b></td><td>' + esc(g.ein || '') + '</td><td>' + esc(g.employer_name || '') + '</td><td>' +
-              esc(g.cycle === null || g.cycle === undefined ? '' : g.cycle) + '</td><td>' + g.employee_count + '</td><td>' + fmtMoney(g.total_gross_wages) + '</td><td>' +
-              fmtMoney(g.total_premium) + '</td><td>' + fmtMoney(g.total_admin_fee) + '</td></tr>';
+            return '<tr><td><b>' + esc(g.case_number) + '</b></td><td>' + esc(g.ein || '') + '</td><td>' + esc(g.employer_location || g.employer_name || '') + '</td><td>' +
+              g.employee_count + '</td><td>' + g.ineligible_count + '</td><td>' + g.enrolled_count + '</td><td>' + fmtMoney(g.total_premium) + '</td><td>' +
+              fmtMoney(g.total_admin_fee) + '</td></tr>';
           }).join('') + '</tbody></table></div>';
         html += '<p><button class="btn btn-primary" id="payimport">Import ' + s.companies + ' companies</button> ' +
-          '<span class="muted">Replaces the payroll company summary table. No employee PII is stored.</span></p><div id="payimportout"></div>';
+          '<span class="muted">Replaces the summary table and updates the Companies page payroll numbers. No employee PII is stored.</span></p><div id="payimportout"></div>';
         out.innerHTML = html;
         document.getElementById('payimport').onclick = function () {
-          if (!window.confirm('Import payroll summary? This replaces the current company summary table.')) return;
+          if (!window.confirm('Import payroll summary? This replaces the company summary table and updates payroll numbers on the Companies page.')) return;
           var iout = document.getElementById('payimportout');
           iout.innerHTML = '<p class="muted">Importing...</p>';
           api.post('/api/admin/jobs/payroll-import', { preview_token: r.preview_token }).then(function (imp) {
-            iout.innerHTML = okHtml('Done: ' + imp.imported + ' company rows imported.');
+            iout.innerHTML = okHtml('Done: ' + imp.imported + ' company rows imported, ' + imp.companies_updated + ' company records updated' +
+              (imp.xref_missed ? ' (' + imp.xref_missed + ' EINs had no cross-reference match)' : '') + '.');
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
