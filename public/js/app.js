@@ -1562,6 +1562,10 @@ function viewAdminJobs() {
       '<button class="btn btn-primary" id="solpreview">Upload &amp; preview</button> ' +
       '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
       '<button class="btn btn-small" id="soldelexport">Export current S bills</button><div id="solout"></div></div>' +
+      '<div class="card"><div class="card-title">Payroll company summary (Power BI)</div>' +
+      '<p class="muted">Upload the Power BI payroll export spreadsheet. It aggregates employee rows up to company level (case number + EIN + cycle) \u2014 no employee PII is stored. Preview first, then import to replace the summary table.</p>' +
+      '<input type="file" id="payfile" accept=".xlsx,.xls"> ' +
+      '<button class="btn btn-primary" id="paypreview">Upload &amp; preview</button><div id="payout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
       '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
@@ -1926,6 +1930,36 @@ function viewAdminJobs() {
           iout.innerHTML = '<p class="muted">Importing...</p>';
           api.post('/api/admin/jobs/sol-import', { preview_token: r.preview_token }).then(function (imp) {
             iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
+          }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
+        };
+      }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+    };
+    document.getElementById('paypreview').onclick = function () {
+      var out = document.getElementById('payout');
+      var fi = document.getElementById('payfile');
+      if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
+      var fd = new FormData();
+      fd.append('file', fi.files[0]);
+      out.innerHTML = '<p class="muted">Parsing the payroll export and aggregating to company level...</p>';
+      uploadFile('/api/admin/jobs/payroll-preview', fd).then(function (r) {
+        var s = r.stats;
+        var html = '<p><b>' + s.companies + '</b> companies, <b>' + s.employees + '</b> employees aggregated ' +
+          '<span class="muted">(' + esc(s.file_name) + ')</span></p>';
+        html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Case</th><th>EIN</th><th>Employer</th><th>Cycle</th><th>Employees</th><th>Gross</th><th>Premium</th><th>Admin Fee</th></tr></thead><tbody>' +
+          r.sample.map(function (g) {
+            return '<tr><td><b>' + esc(g.case_number) + '</b></td><td>' + esc(g.ein || '') + '</td><td>' + esc(g.employer_name || '') + '</td><td>' +
+              esc(g.cycle === null || g.cycle === undefined ? '' : g.cycle) + '</td><td>' + g.employee_count + '</td><td>' + fmtMoney(g.total_gross_wages) + '</td><td>' +
+              fmtMoney(g.total_premium) + '</td><td>' + fmtMoney(g.total_admin_fee) + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+        html += '<p><button class="btn btn-primary" id="payimport">Import ' + s.companies + ' companies</button> ' +
+          '<span class="muted">Replaces the payroll company summary table. No employee PII is stored.</span></p><div id="payimportout"></div>';
+        out.innerHTML = html;
+        document.getElementById('payimport').onclick = function () {
+          if (!window.confirm('Import payroll summary? This replaces the current company summary table.')) return;
+          var iout = document.getElementById('payimportout');
+          iout.innerHTML = '<p class="muted">Importing...</p>';
+          api.post('/api/admin/jobs/payroll-import', { preview_token: r.preview_token }).then(function (imp) {
+            iout.innerHTML = okHtml('Done: ' + imp.imported + ' company rows imported.');
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });

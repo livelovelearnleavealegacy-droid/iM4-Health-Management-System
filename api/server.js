@@ -388,6 +388,34 @@ async function migrate() {
     'created_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_email TEXT');
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ar_hold BOOLEAN NOT NULL DEFAULT FALSE');
+  await db.query('CREATE TABLE IF NOT EXISTS payroll_company_summary (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'case_number TEXT, ' +
+    'ein TEXT, ' +
+    'employer_name TEXT, ' +
+    'employer_location TEXT, ' +
+    'state TEXT, ' +
+    'zip TEXT, ' +
+    'pay_schedule TEXT, ' +
+    'cycle INT, ' +
+    'period_year INT, ' +
+    'period_quarter TEXT, ' +
+    'period_month TEXT, ' +
+    'period_day INT, ' +
+    'employee_count INT NOT NULL DEFAULT 0, ' +
+    'eligible_count INT NOT NULL DEFAULT 0, ' +
+    'opt_out_count INT NOT NULL DEFAULT 0, ' +
+    'new_count INT NOT NULL DEFAULT 0, ' +
+    'total_gross_wages NUMERIC, ' +
+    'total_net_pay NUMERIC, ' +
+    'total_premium NUMERIC, ' +
+    'total_admin_fee NUMERIC, ' +
+    'total_benefit NUMERIC, ' +
+    'total_claim NUMERIC, ' +
+    'total_fica_savings NUMERIC, ' +
+    'file_name TEXT, ' +
+    'is_latest_case BOOLEAN, ' +
+    'imported_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -1652,6 +1680,151 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
     ftjPreviewCache.delete(previewToken);
     res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
   } catch (error) { console.error('FTJ import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+// ---------------------------------------------------------------- v5.32: payroll company summary (Power BI export)
+// Company-level aggregates only — no employee PII is stored.
+const payrollPreviewCache = new Map();
+
+function payrollNum(v) {
+  if (v === undefined || v === null || v === '') return 0;
+  const n = parseFloat(String(v).replace(/[$,]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+function payrollBool(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === 'true' || s === 'yes' || s === '1';
+}
+
+function parsePayrollExport(buffer, fileName) {
+  const XLSX = require('xlsx');
+  const wb = XLSX.read(buffer, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+  if (!rows.length) throw new Error('No data rows found in this file.');
+  const norm = {};
+  Object.keys(rows[0]).forEach(function (k) { norm[String(k).trim().toLowerCase()] = k; });
+  function col() {
+    for (let i = 0; i < arguments.length; i++) {
+      const k = norm[String(arguments[i]).trim().toLowerCase()];
+      if (k !== undefined) return k;
+    }
+    return null;
+  }
+  const cCase = col('case_number', 'case number', 'casenumber');
+  const cEin = col('ein');
+  const cCycle = col('cycle');
+  if (!cCase) throw new Error('Could not find a Case_Number column.');
+  const cEmpName = col('employername', 'employer name');
+  const cEmpLoc = col('employerlocation', 'employer location');
+  const cState = col('state');
+  const cZip = col('zip', 'zipcode', 'zip code');
+  const cPaySched = col('payschedule', 'pay schedule');
+  const cYear = col('updated_dt - year', 'updated_dt-year');
+  const cQtr = col('updated_dt - quarter', 'updated_dt-quarter');
+  const cMonth = col('updated_dt - month', 'updated_dt-month');
+  const cDay = col('updated_dt - day', 'updated_dt-day');
+  const cGross = col('grosswages', 'gross wages');
+  const cNet = col('netpay', 'net pay');
+  const cPrem = col('premium');
+  const cAdmin = col('adminfee', 'admin fee');
+  const cBen = col('benefitamount', 'benefit amount');
+  const cClaim = col('claim');
+  const cFica = col('ficasavings', 'fica savings');
+  const cElig = col('iseligible', 'is eligible');
+  const cOpt = col('isoptout', 'is optout', 'is opt out');
+  const cNew = col('isnew', 'is new');
+  const cLatest = col('is latest case', 'islatestcase');
+  const groups = {};
+  rows.forEach(function (r) {
+    const caseNum = r[cCase] !== null && r[cCase] !== undefined ? String(r[cCase]).trim() : '';
+    if (!caseNum) return;
+    const ein = cEin && r[cEin] !== null && r[cEin] !== undefined ? String(r[cEin]).trim() : null;
+    const cyc = cCycle && r[cCycle] !== null && r[cCycle] !== undefined && r[cCycle] !== '' ? parseInt(r[cCycle], 10) : null;
+    const key = caseNum + '|' + (ein || '') + '|' + (cyc === null || isNaN(cyc) ? '' : cyc);
+    let g = groups[key];
+    if (!g) {
+      g = groups[key] = {
+        case_number: caseNum, ein: ein, cycle: (cyc === null || isNaN(cyc)) ? null : cyc,
+        employer_name: cEmpName && r[cEmpName] ? String(r[cEmpName]).trim() : null,
+        employer_location: cEmpLoc && r[cEmpLoc] ? String(r[cEmpLoc]).trim() : null,
+        state: cState && r[cState] ? String(r[cState]).trim() : null,
+        zip: cZip && r[cZip] ? String(r[cZip]).trim() : null,
+        pay_schedule: cPaySched && r[cPaySched] ? String(r[cPaySched]).trim() : null,
+        period_year: cYear && r[cYear] !== null && r[cYear] !== '' ? parseInt(r[cYear], 10) : null,
+        period_quarter: cQtr && r[cQtr] ? String(r[cQtr]).trim() : null,
+        period_month: cMonth && r[cMonth] ? String(r[cMonth]).trim() : null,
+        period_day: cDay && r[cDay] !== null && r[cDay] !== '' ? parseInt(r[cDay], 10) : null,
+        employee_count: 0, eligible_count: 0, opt_out_count: 0, new_count: 0,
+        total_gross_wages: 0, total_net_pay: 0, total_premium: 0, total_admin_fee: 0,
+        total_benefit: 0, total_claim: 0, total_fica_savings: 0,
+        file_name: fileName || null, is_latest_case: false
+      };
+    }
+    g.employee_count++;
+    if (cElig && payrollBool(r[cElig])) g.eligible_count++;
+    if (cOpt && payrollBool(r[cOpt])) g.opt_out_count++;
+    if (cNew && payrollBool(r[cNew])) g.new_count++;
+    if (cGross) g.total_gross_wages += payrollNum(r[cGross]);
+    if (cNet) g.total_net_pay += payrollNum(r[cNet]);
+    if (cPrem) g.total_premium += payrollNum(r[cPrem]);
+    if (cAdmin) g.total_admin_fee += payrollNum(r[cAdmin]);
+    if (cBen) g.total_benefit += payrollNum(r[cBen]);
+    if (cClaim) g.total_claim += payrollNum(r[cClaim]);
+    if (cFica) g.total_fica_savings += payrollNum(r[cFica]);
+    if (cLatest && payrollBool(r[cLatest])) g.is_latest_case = true;
+  });
+  return Object.keys(groups).map(function (k) { return groups[k]; });
+}
+
+app.post('/api/admin/jobs/payroll-preview', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const groups = parsePayrollExport(req.file.buffer, req.file.originalname);
+    if (!groups.length) return res.status(400).json({ error: 'No company groups found in this file' });
+    const crypto = require('crypto');
+    const previewToken = crypto.randomBytes(16).toString('hex');
+    const now = Date.now();
+    for (const [tk, v] of payrollPreviewCache) { if (v.expires < now) payrollPreviewCache.delete(tk); }
+    payrollPreviewCache.set(previewToken, { groups: groups, expires: now + 30 * 60 * 1000, fileName: req.file.originalname });
+    let employees = 0;
+    groups.forEach(function (g) { employees += g.employee_count; });
+    res.json({
+      ok: true,
+      preview_token: previewToken,
+      stats: { companies: groups.length, employees: employees, file_name: req.file.originalname },
+      sample: groups.slice(0, 8)
+    });
+  } catch (error) { console.error('Payroll preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
+
+app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
+  try {
+    const previewToken = req.body && req.body.preview_token;
+    const cached = previewToken ? payrollPreviewCache.get(previewToken) : null;
+    if (!cached || cached.expires < Date.now()) {
+      if (previewToken) payrollPreviewCache.delete(previewToken);
+      return res.status(400).json({ error: 'Preview expired. Upload the file again.' });
+    }
+    const groups = cached.groups;
+    const db = getPool();
+    await db.query('DELETE FROM payroll_company_summary');
+    let imported = 0;
+    for (const g of groups) {
+      await db.query(
+        'INSERT INTO payroll_company_summary (case_number, ein, employer_name, employer_location, state, zip, pay_schedule, cycle, period_year, period_quarter, period_month, period_day, employee_count, eligible_count, opt_out_count, new_count, total_gross_wages, total_net_pay, total_premium, total_admin_fee, total_benefit, total_claim, total_fica_savings, file_name, is_latest_case) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)',
+        [g.case_number, g.ein, g.employer_name, g.employer_location, g.state, g.zip, g.pay_schedule, g.cycle,
+         g.period_year, g.period_quarter, g.period_month, g.period_day, g.employee_count, g.eligible_count,
+         g.opt_out_count, g.new_count, g.total_gross_wages, g.total_net_pay, g.total_premium, g.total_admin_fee,
+         g.total_benefit, g.total_claim, g.total_fica_savings, g.file_name, g.is_latest_case]);
+      imported++;
+    }
+    payrollPreviewCache.delete(previewToken);
+    res.json({ ok: true, imported: imported });
+  } catch (error) { console.error('Payroll import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
 // ---------------------------------------------------------------- v5.9: estimate unpaid F bills
