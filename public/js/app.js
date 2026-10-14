@@ -589,7 +589,7 @@ function viewBilling() {
               cell(fmtDate(r.paid_date)) +
               cell(r.lives_count) +
               '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-              '<td><span class="dot dot-green"></span></td></tr>';
+              '<td>Paid</td></tr>';
           }).join('');
           var boxes = codes.map(function (c) {
             var lbl = esc(c) + (codeMap[c] && codeMap[c] !== c ? ' — ' + esc(codeMap[c]) : '');
