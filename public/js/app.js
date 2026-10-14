@@ -565,10 +565,8 @@ function viewBilling() {
             });
             var lastPaid = paidByCo[code] ? latestOf(paidByCo[code]) : null;
             var paidTo = lastPaid ? (lastPaid.payroll_end_date || lastPaid.payroll_date || null) : null;
-            var status = (b61 > 0
-              ? '<span class="pill pill-red">61+ days</span>'
-              : (b3160 > 0 ? '<span class="pill pill-yellow">31-60 days</span>' : '<span class="pill pill-green">Current</span>')) +
-              (estCount > 0 ? ' <span class="muted">' + estCount + ' est.</span>' : '');
+            var status = '<span class="dot ' + (b61 > 0 ? 'dot-red' : (b3160 > 0 ? 'dot-yellow' : 'dot-green')) + '"></span>' +
+              (estCount > 0 ? ' est.' : '');
             return '<tr><td><b>' + esc(code) + '</b></td>' +
               cell(firstVal(all, 'company_name')) +
               cell(firstVal(all, 'ein')) +
@@ -591,7 +589,7 @@ function viewBilling() {
               cell(fmtDate(r.paid_date)) +
               cell(r.lives_count) +
               '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-              '<td>Paid</td></tr>';
+              '<td><span class="dot dot-green"></span></td></tr>';
           }).join('');
           var boxes = codes.map(function (c) {
             var lbl = esc(c) + (codeMap[c] && codeMap[c] !== c ? ' — ' + esc(codeMap[c]) : '');
