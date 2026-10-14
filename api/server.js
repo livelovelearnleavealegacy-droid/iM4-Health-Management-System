@@ -2546,6 +2546,58 @@ app.get('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
+app.get('/api/admin/stewards/next-id', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM stewards');
+    res.json({ next_id: parseInt(r.rows[0].next_id, 10) });
+  } catch (error) { console.error('Next steward id error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Create a steward from the Stewards page (admin + top dog). The ID is the
+// next number (MAX(id)+1) and the Steward role is assigned automatically.
+// Only an admin may request a specific ID instead of the next number.
+app.post('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const first = String(b.first_name || '').trim();
+    const last = String(b.last_name || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    const phone = b.phone && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
+    if (!first) return res.status(400).json({ error: 'First name is required' });
+    if (!last) return res.status(400).json({ error: 'Last name is required' });
+    if (!email || email.indexOf('@') === -1) return res.status(400).json({ error: 'A valid email is required' });
+    const db = getPool();
+    const dupe = await db.query('SELECT id FROM stewards WHERE LOWER(email) = $1', [email]);
+    if (dupe.rows.length) return res.status(400).json({ error: 'That email is already used by steward ' + dupe.rows[0].id });
+    const mx = await db.query('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM stewards');
+    let newId = parseInt(mx.rows[0].next_id, 10);
+    if (b.id !== undefined && b.id !== null && String(b.id).trim() !== '') {
+      const want = parseInt(b.id, 10);
+      if (isNaN(want) || want <= 0) return res.status(400).json({ error: 'Steward ID must be a positive number' });
+      if (want !== newId) {
+        if (req.user.activeRole !== 'admin') return res.status(403).json({ error: 'Only an admin can choose the Steward ID' });
+        const taken = await db.query('SELECT id FROM stewards WHERE id = $1', [want]);
+        if (taken.rows.length) return res.status(400).json({ error: 'Steward ID ' + want + ' is already in use' });
+        newId = want;
+      }
+    }
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        "INSERT INTO stewards (id, email, name, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, $6, 'steward')",
+        [newId, email, (first + ' ' + last).trim(), first, last, phone]);
+      await client.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'steward') ON CONFLICT DO NOTHING", [newId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (rb) { /* ignore */ }
+      throw e;
+    } finally { client.release(); }
+    await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
+    res.json({ success: true, id: newId });
+  } catch (error) { console.error('Admin create steward error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, res) => {
   try {
     const { password } = req.body || {};
@@ -2562,18 +2614,24 @@ app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, r
   }
 });
 
-// v5.2: edit a steward's profile (admin only).
+// Edit a steward's profile fields (admin + top dog). First name, last name,
+// and email are required; phone is optional.
 app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   try {
     const { first_name, last_name, email, phone } = req.body || {};
-    if (!email || String(email).trim() === '') {
-      return res.status(400).json({ error: 'Email is required' });
-    }
+    const first = String(first_name || '').trim();
+    const last = String(last_name || '').trim();
+    const em = String(email || '').trim().toLowerCase();
+    if (!first) return res.status(400).json({ error: 'First name is required' });
+    if (!last) return res.status(400).json({ error: 'Last name is required' });
+    if (!em || em.indexOf('@') === -1) return res.status(400).json({ error: 'A valid email is required' });
     const db = getPool();
+    const dupe = await db.query('SELECT id FROM stewards WHERE LOWER(email) = $1 AND id <> $2', [em, req.params.id]);
+    if (dupe.rows.length) return res.status(400).json({ error: 'That email is already used by steward ' + dupe.rows[0].id });
     const r = await db.query(
       'UPDATE stewards SET first_name = $1, last_name = $2, email = $3, phone = $4, ' +
       "name = TRIM(COALESCE($1,'') || ' ' || COALESCE($2,'')) WHERE id = $5 RETURNING id",
-      [first_name || null, last_name || null, String(email).trim(), phone || null, req.params.id]);
+      [first, last, em, phone && String(phone).trim() !== '' ? String(phone).trim() : null, req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch (error) {
@@ -2587,7 +2645,7 @@ app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
 // repoints all 8 referencing tables + commissions.steward_code, deletes the
 // old row, restores the email — one atomic transaction on a dedicated
 // client. If you renumber your own account, sign out and back in afterwards.
-app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, res) => {
+app.post('/api/admin/stewards/:id/renumber', requireAdmin, async (req, res) => {
   try {
     const db = getPool();
     const oldId = parseInt(req.params.id, 10);
@@ -2665,8 +2723,10 @@ app.post('/api/admin/stewards/:id/renumber', requireAdminOrTopDog, async (req, r
   }
 });
 
-// v5.2: delete a steward (admin only). Refuses to delete the last admin.
-app.delete('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
+// Delete a steward (admin only). Refuses to delete the last admin or
+// yourself. Assignments and roles are removed with the steward; messages,
+// documents, forms, and tickets keep their content but lose the author link.
+app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
   try {
     const db = getPool();
     const id = req.params.id;
@@ -2687,6 +2747,13 @@ app.delete('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => 
       await db.query('DELETE FROM user_roles WHERE steward_id = $1', [id]);
       await db.query('DELETE FROM assignments WHERE steward_id = $1', [id]);
       await db.query('UPDATE messages SET steward_id = NULL WHERE steward_id = $1', [id]);
+      await db.query('UPDATE onboarding_clients SET created_by = NULL WHERE created_by = $1', [id]);
+      await db.query('UPDATE onboarding_documents SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
+      await db.query('UPDATE forms SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
+      await db.query('UPDATE tickets SET created_by = NULL WHERE created_by = $1', [id]);
+      await db.query('UPDATE tickets SET assigned_to = NULL WHERE assigned_to = $1', [id]);
+      await db.query('UPDATE ticket_replies SET author_id = NULL WHERE author_id = $1', [id]);
+      await db.query('UPDATE ar_followups SET created_by = NULL WHERE created_by = $1', [id]);
       await db.query('DELETE FROM stewards WHERE id = $1', [id]);
       await db.query('COMMIT');
     } catch (e) {
@@ -2701,7 +2768,7 @@ app.delete('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => 
 });
 
 // v5: replace a steward's roles (admin only). Keeps at least one role.
-app.post('/api/admin/set-roles', requireAdminOrTopDog, async (req, res) => {
+app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
   try {
     const steward_id = req.body && req.body.steward_id;
     const roles = req.body && req.body.roles;
@@ -2715,6 +2782,15 @@ app.post('/api/admin/set-roles', requireAdminOrTopDog, async (req, res) => {
     const db = getPool();
     const s = await db.query('SELECT id FROM stewards WHERE id = $1', [steward_id]);
     if (s.rows.length === 0) return res.status(404).json({ error: 'Steward not found' });
+    if (roles.indexOf('admin') === -1) {
+      const cur = await db.query("SELECT role FROM user_roles WHERE steward_id = $1 AND role = 'admin'", [steward_id]);
+      if (cur.rows.length > 0) {
+        const cnt = await db.query("SELECT COUNT(*) AS c FROM user_roles WHERE role = 'admin'");
+        if (parseInt(cnt.rows[0].c, 10) <= 1) {
+          return res.status(400).json({ error: 'Cannot remove the admin role from the last admin' });
+        }
+      }
+    }
     await db.query('DELETE FROM user_roles WHERE steward_id = $1', [steward_id]);
     for (const r of roles) {
       await db.query('INSERT INTO user_roles (steward_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING', [steward_id, r]);

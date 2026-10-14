@@ -1015,19 +1015,148 @@ function viewAdminStewards() {
   requireUser(function () {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
-    api.get('/api/admin/stewards').then(function (list) {
-      var rows = list.map(function (s) {
-        var roles = (s.roles || []).map(roleLabel).join(', ');
-        return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
-          '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role) + '</td></tr>';
+    var isAdmin = ar === 'admin';
+    var ROLE_OPTS = ['admin', 'top_dog', 'onboarding', 'steward'];
+    var editId = null;
+    var adding = false;
+    var nextId = null;
+
+    function rolesOf(s) {
+      if (s.roles && s.roles.length) return s.roles;
+      return s.role ? [s.role] : [];
+    }
+    function roleChecks(selected) {
+      return ROLE_OPTS.map(function (r) {
+        var on = selected.indexOf(r) !== -1;
+        return '<label style="margin-right:10px;"><input type="checkbox" class="stw-role" value="' + r + '"' + (on ? ' checked' : '') + '> ' + roleLabel(r) + '</label>';
       }).join('');
-      render(shell(
-        '<h2>Stewards</h2>' +
-        '<p class="muted">Stewards are updated by CSV import only. To edit a steward, use the "Edit stewards" card on the Jobs page.</p>' +
-        '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table>',
-        '#/admin/stewards'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
+    }
+    function editorRow(idDisplay, s) {
+      var idCell = isAdmin
+        ? '<input id="stw-id" type="number" value="' + idDisplay + '" style="width:100px;">'
+        : '<b>' + idDisplay + '</b>';
+      var rolesCell = isAdmin
+        ? roleChecks(s ? rolesOf(s) : ['steward'])
+        : esc(s ? (rolesOf(s).map(roleLabel).join(', ') || 'Steward') : 'Steward');
+      return '<tr><td>' + idCell + '</td>' +
+        '<td><input id="stw-first" value="' + esc(s ? (s.first_name || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-last" value="' + esc(s ? (s.last_name || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-email" value="' + esc(s ? (s.email || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-phone" value="' + esc(s ? (s.phone || '') : '') + '" style="width:100%;"></td>' +
+        '<td>' + rolesCell + '</td>' +
+        '<td><button class="btn btn-small" id="stw-save">Save &amp; close</button> ' +
+        '<button class="btn btn-small" id="stw-cancel">Cancel</button></td></tr>';
+    }
+    function showErr(msg) { var e = document.getElementById('err'); if (e) e.innerHTML = errorHtml(msg); }
+    function pickedRoles() {
+      return Array.prototype.map.call(document.querySelectorAll('.stw-role:checked'), function (x) { return x.value; });
+    }
+    function load() {
+      api.get('/api/admin/stewards').then(function (list) {
+        var bodyRows = '';
+        if (adding) bodyRows += editorRow(nextId, null);
+        bodyRows += list.map(function (s) {
+          if (editId === s.id) return editorRow(s.id, s);
+          var roles = rolesOf(s).map(roleLabel).join(', ');
+          var actions = '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>';
+          if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
+          return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
+            '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
+            '<td>' + actions + '</td></tr>';
+        }).join('');
+        var note = isAdmin
+          ? '<p class="muted">Admins can add and edit stewards, change Steward IDs, assign roles, and delete stewards. First name, last name, and email are required; phone is optional. New stewards are assigned the next Steward ID and the Steward role automatically.</p>'
+          : '<p class="muted">You can add new stewards and edit their first name, last name, email, and phone. New stewards are assigned the next Steward ID automatically and given the Steward role. Changing Steward IDs, assigning other roles, and deleting stewards are admin-only. First name, last name, and email are required; phone is optional.</p>';
+        render(shell(
+          '<h2>Stewards</h2>' + note +
+          '<div id="err"></div>' +
+          '<p><button class="btn" id="stw-add">Add Steward</button></p>' +
+          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
+          '<tbody>' + bodyRows + '</tbody></table>',
+          '#/admin/stewards'));
+        wire();
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
+    }
+    function wire() {
+      document.getElementById('stw-add').onclick = function () {
+        api.get('/api/admin/stewards/next-id').then(function (r) {
+          nextId = r.next_id; adding = true; editId = null; load();
+        }).catch(function (err) { showErr(err.message); });
+      };
+      Array.prototype.forEach.call(document.querySelectorAll('[data-edit]'), function (b) {
+        b.onclick = function () { editId = parseInt(b.getAttribute('data-edit'), 10); adding = false; load(); };
+      });
+      Array.prototype.forEach.call(document.querySelectorAll('[data-del]'), function (b) {
+        b.onclick = function () {
+          var id = b.getAttribute('data-del');
+          var nm = b.getAttribute('data-name') || '';
+          var msg = 'Delete steward ' + id + (nm ? ' (' + nm + ')' : '') + '?' + NL + NL +
+            'Warning - this also removes:' + NL +
+            '- their login and all of their roles' + NL +
+            '- ALL of their company assignments' + NL +
+            'Messages, documents, forms, and tickets they created stay, but lose their name as the author. ' +
+            'Commissions keep the steward number but lose the name behind it. This cannot be undone.';
+          if (!window.confirm(msg)) return;
+          api.delete('/api/admin/stewards/' + id).then(function () { load(); })
+            .catch(function (err) { showErr(err.message); });
+        };
+      });
+      var cancel = document.getElementById('stw-cancel');
+      if (cancel) cancel.onclick = function () { adding = false; editId = null; load(); };
+      var save = document.getElementById('stw-save');
+      if (!save) return;
+      save.onclick = function () {
+        var first = document.getElementById('stw-first').value.trim();
+        var last = document.getElementById('stw-last').value.trim();
+        var email = document.getElementById('stw-email').value.trim();
+        var phone = document.getElementById('stw-phone').value.trim();
+        if (!first) { showErr('First name is required'); return; }
+        if (!last) { showErr('Last name is required'); return; }
+        if (!email || email.indexOf('@') === -1) { showErr('A valid email is required'); return; }
+        var fields = { first_name: first, last_name: last, email: email, phone: phone || null };
+        if (adding) {
+          var payload = { first_name: first, last_name: last, email: email, phone: phone || null };
+          if (isAdmin) {
+            var idEl = document.getElementById('stw-id');
+            var wantId = idEl ? parseInt(idEl.value, 10) : NaN;
+            if (wantId && wantId !== nextId) payload.id = wantId;
+          }
+          api.post('/api/admin/stewards', payload).then(function (res) {
+            if (isAdmin) {
+              var roles = pickedRoles();
+              if (roles.length > 1 || (roles.length === 1 && roles[0] !== 'steward')) {
+                return api.post('/api/admin/set-roles', { steward_id: res.id, roles: roles }).then(function () { adding = false; load(); });
+              }
+            }
+            adding = false; load();
+          }).catch(function (err) { showErr(err.message); });
+          return;
+        }
+        var curId = editId;
+        function after(id) {
+          if (isAdmin) {
+            var roles = pickedRoles();
+            if (roles.length === 0) { showErr('Pick at least one role'); return; }
+            api.post('/api/admin/set-roles', { steward_id: id, roles: roles }).then(function () { editId = null; load(); })
+              .catch(function (err) { showErr(err.message); });
+          } else { editId = null; load(); }
+        }
+        if (isAdmin) {
+          var idEl2 = document.getElementById('stw-id');
+          var wantId2 = idEl2 ? parseInt(idEl2.value, 10) : curId;
+          if (wantId2 && wantId2 !== curId) {
+            api.post('/api/admin/stewards/' + curId + '/renumber', { new_id: wantId2 })
+              .then(function () { return api.put('/api/admin/stewards/' + wantId2, fields); })
+              .then(function () { after(wantId2); })
+              .catch(function (err) { showErr(err.message); });
+            return;
+          }
+        }
+        api.put('/api/admin/stewards/' + curId, fields).then(function () { after(curId); })
+          .catch(function (err) { showErr(err.message); });
+      };
+    }
+    load();
   });
 }
 
