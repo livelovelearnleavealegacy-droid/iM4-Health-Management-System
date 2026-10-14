@@ -531,6 +531,24 @@ function requireAdminOrTopDog(req, res, next) {
   });
 }
 
+// Stewards page (v5.44): viewable by admin, top dog (view only), and
+// onboarding; maintenance (add/edit/password) is admin + onboarding only.
+function requireStewardsAccess(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding') return res.status(403).json({ error: 'Admin, Top Dog, or Onboarding only' });
+    next();
+  });
+}
+
+function requireAdminOrOnboarding(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'onboarding') return res.status(403).json({ error: 'Admin or Onboarding only' });
+    next();
+  });
+}
+
 function checkSyncSecret(req, res) {
   if (!SYNC_SECRET || req.headers['x-sync-secret'] !== SYNC_SECRET) {
     res.status(403).json({ error: 'Forbidden' });
@@ -2533,7 +2551,7 @@ app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)
-app.get('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
+app.get('/api/admin/stewards', requireStewardsAccess, async (req, res) => {
   try {
     const r = await getPool().query(
       "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.statement_email, s.role, s.created_at, " +
@@ -2547,17 +2565,17 @@ app.get('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
-app.get('/api/admin/stewards/next-id', requireAdminOrTopDog, async (req, res) => {
+app.get('/api/admin/stewards/next-id', requireAdminOrOnboarding, async (req, res) => {
   try {
     const r = await getPool().query('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM stewards');
     res.json({ next_id: parseInt(r.rows[0].next_id, 10) });
   } catch (error) { console.error('Next steward id error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Create a steward from the Stewards page (admin + top dog). The ID is the
+// Create a steward from the Stewards page (admin + onboarding). The ID is the
 // next number (MAX(id)+1) and the Steward role is assigned automatically.
 // Only an admin may request a specific ID instead of the next number.
-app.post('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
+app.post('/api/admin/stewards', requireAdminOrOnboarding, async (req, res) => {
   try {
     const b = req.body || {};
     const first = String(b.first_name || '').trim();
@@ -2606,7 +2624,7 @@ app.post('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
   } catch (error) { console.error('Admin create steward error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, res) => {
+app.post('/api/admin/stewards/:id/password', requireAdminOrOnboarding, async (req, res) => {
   try {
     const { password } = req.body || {};
     if (!password || String(password).length < 8) {
@@ -2624,7 +2642,7 @@ app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, r
 
 // Edit a steward's profile fields (admin + top dog). First name, last name,
 // and email are required; phone is optional.
-app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
+app.put('/api/admin/stewards/:id', requireAdminOrOnboarding, async (req, res) => {
   try {
     const { first_name, last_name, email, phone, statement_email, password } = req.body || {};
     const first = String(first_name || '').trim();

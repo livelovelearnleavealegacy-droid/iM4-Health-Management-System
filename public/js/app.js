@@ -201,8 +201,8 @@ function activeRole() {
 
 // Screens per role:
 // admin: everything
-// top_dog: everything except Jobs
-// onboarding: Onboarding and Implementation only
+// top_dog: everything except Jobs, Billing, Tickets (Stewards page is view-only)
+// onboarding: Onboarding, Implementation, and Stewards (with steward maintenance)
 // steward: Dashboard, Companies, Billing, Implementation, Tickets
 // service: Tickets, Companies, Implementation (support desk)
 // client: Tickets (own company only)
@@ -228,7 +228,11 @@ function navLinks() {
   }
   if (role === 'admin' || role === 'top_dog') {
     links.push(['#/forms', 'Forms']);
+  }
+  if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/stewards', 'Stewards']);
+  }
+  if (role === 'admin' || role === 'top_dog') {
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
     links.push(['#/admin/commissions', 'Commissions']);
@@ -1014,8 +1018,9 @@ function viewProject(id) {
 function viewAdminStewards() {
   requireUser(function () {
     var ar = activeRole();
-    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
+    if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
     var isAdmin = ar === 'admin';
+    var canEdit = ar === 'admin' || ar === 'onboarding';
     var ROLE_OPTS = ['admin', 'top_dog', 'onboarding', 'steward'];
     var editId = null;
     var adding = false;
@@ -1059,17 +1064,17 @@ function viewAdminStewards() {
         bodyRows += list.map(function (s) {
           if (editId === s.id) return editorRow(s.id, s);
           var roles = rolesOf(s).map(roleLabel).join(', ');
-          var actions = '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>';
+          var actions = canEdit ? '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>' : '';
           if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
             '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
             '<td>' + actions + '</td></tr>';
         }).join('');
-        var note = '<p class="muted">Top Dogs can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
+        var note = '<p class="muted">Onboarding can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
         render(shell(
           '<h2>Stewards</h2>' + note +
           '<div id="err"></div>' +
-          '<p><button class="btn" id="stw-add">Add Steward</button></p>' +
+          (canEdit ? '<p><button class="btn" id="stw-add">Add Steward</button></p>' : '') +
           '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th><th></th></tr></thead>' +
           '<tbody>' + bodyRows + '</tbody></table>',
           '#/admin/stewards'));
@@ -1077,7 +1082,8 @@ function viewAdminStewards() {
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
     }
     function wire() {
-      document.getElementById('stw-add').onclick = function () {
+      var addBtn = document.getElementById('stw-add');
+      if (addBtn) addBtn.onclick = function () {
         api.get('/api/admin/stewards/next-id').then(function (r) {
           nextId = r.next_id; adding = true; editId = null; load();
         }).catch(function (err) { showErr(err.message); });
