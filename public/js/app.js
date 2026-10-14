@@ -515,6 +515,12 @@ function viewBilling() {
             for (var i = 0; i < list.length; i++) { if (list[i][field]) return list[i][field]; }
             return '';
           }
+          var MODE_NAMES = { '1': 'Weekly', '2': 'Bi-weekly', '3': 'Semi-monthly', '4': 'Monthly', 'M': 'Monthly' };
+          function fmtMode(v) {
+            if (!v) return '';
+            var k = String(v).toUpperCase().trim();
+            return MODE_NAMES[k] || v;
+          }
           function latestOf(rows) {
             var best = null;
             rows.forEach(function (r) {
@@ -535,7 +541,6 @@ function viewBilling() {
           // Group bills by company.
           var openByCo = {}, paidByCo = {};
           openRows.forEach(function (r) {
-            if (r.is_estimate) return; // forecasts are not owed yet
             var k = String(r.company_code);
             if (!openByCo[k]) openByCo[k] = [];
             openByCo[k].push(r);
@@ -550,8 +555,9 @@ function viewBilling() {
           var topBody = topCodes.map(function (code) {
             var bills = openByCo[code];
             var all = bills.concat(paidByCo[code] || []);
-            var b030 = 0, b3160 = 0, b61 = 0, tot61 = 0;
+            var b030 = 0, b3160 = 0, b61 = 0, tot61 = 0, estCount = 0;
             bills.forEach(function (r) {
+              if (r.is_estimate) estCount++;
               var n = daysPast(r.payroll_date);
               if (n <= 30) b030++;
               else if (n <= 60) b3160++;
@@ -559,13 +565,14 @@ function viewBilling() {
             });
             var lastPaid = paidByCo[code] ? latestOf(paidByCo[code]) : null;
             var paidTo = lastPaid ? (lastPaid.payroll_end_date || lastPaid.payroll_date || null) : null;
-            var status = b61 > 0
+            var status = (b61 > 0
               ? '<span class="pill pill-red">61+ days</span>'
-              : (b3160 > 0 ? '<span class="pill pill-yellow">31-60 days</span>' : '<span class="pill pill-green">Current</span>');
+              : (b3160 > 0 ? '<span class="pill pill-yellow">31-60 days</span>' : '<span class="pill pill-green">Current</span>')) +
+              (estCount > 0 ? ' <span class="muted">' + estCount + ' est.</span>' : '');
             return '<tr><td><b>' + esc(code) + '</b></td>' +
               cell(firstVal(all, 'company_name')) +
               cell(firstVal(all, 'ein')) +
-              cell(firstVal(all, 'bill_mode')) +
+              cell(fmtMode(firstVal(all, 'bill_mode'))) +
               '<td>' + (paidTo ? fmtDate(paidTo) : '&mdash;') + '</td>' +
               '<td>' + b030 + '</td><td>' + b3160 + '</td><td>' + b61 + '</td>' +
               '<td><b>' + fmtMoney(tot61) + '</b></td>' +
@@ -578,7 +585,7 @@ function viewBilling() {
             return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
               cell(r.company_name) +
               cell(r.ein) +
-              cell(r.bill_mode) +
+              cell(fmtMode(r.bill_mode)) +
               cell(fmtDate(r.payroll_date)) +
               cell(fmtDate(r.payroll_end_date)) +
               cell(fmtDate(r.paid_date)) +

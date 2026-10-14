@@ -1339,7 +1339,29 @@ app.get('/api/billing', requireAdmin, async (req, res) => {
     }
     const r = await getPool().query(
       'SELECT * FROM invoices ' + where + ' ORDER BY payroll_date DESC NULLS LAST, company_code', params);
-    res.json(r.rows);
+    const rows = r.rows;
+    // Fill missing EINs (F bills carry none) from, in order: the EIN
+    // cross-reference, another bill for the same company, the company's
+    // payroll EIN. Best-effort: any failure just leaves EIN blank.
+    try {
+      const need = {};
+      rows.forEach(function (row) { if (!row.ein) need[String(row.company_code)] = true; });
+      const needCodes = Object.keys(need);
+      if (needCodes.length) {
+        const found = {};
+        const x = await getPool().query(
+          'SELECT acct::text AS code, tin AS ein FROM ein_account_xref WHERE acct::text = ANY($1) AND tin IS NOT NULL', [needCodes]);
+        x.rows.forEach(function (m) { if (m.ein) found[m.code] = m.ein; });
+        const o = await getPool().query(
+          'SELECT company_code AS code, MAX(ein) AS ein FROM invoices WHERE company_code = ANY($1) AND ein IS NOT NULL GROUP BY company_code', [needCodes]);
+        o.rows.forEach(function (m) { if (m.ein && !found[m.code]) found[m.code] = m.ein; });
+        const c = await getPool().query(
+          'SELECT company_code AS code, payroll_ein AS ein FROM companies WHERE company_code = ANY($1) AND payroll_ein IS NOT NULL', [needCodes]);
+        c.rows.forEach(function (m) { if (m.ein && !found[m.code]) found[m.code] = m.ein; });
+        rows.forEach(function (row) { if (!row.ein && found[String(row.company_code)]) row.ein = found[String(row.company_code)]; });
+      }
+    } catch (einErr) { console.error('Billing EIN fill skipped:', einErr.message); }
+    res.json(rows);
   } catch (error) {
     console.error('Billing error:', error);
     res.status(500).json({ error: 'Internal server error' });
