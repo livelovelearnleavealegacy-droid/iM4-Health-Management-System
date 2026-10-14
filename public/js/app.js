@@ -503,41 +503,79 @@ function viewBilling() {
   requireUser(function () {
     if (activeRole() !== 'admin') { location.hash = '#/dashboard'; return; }
     var acctFilter = null;
-    var statusFilter = '';
     function load() {
       api.get('/api/billing?status=open').then(function (openRows) {
         api.get('/api/billing?status=paid').then(function (paidRows) {
-          var allRows = openRows.concat(paidRows);
           var codeMap = {};
-          allRows.forEach(function (r) { codeMap[String(r.company_code)] = r.company_name; });
+          openRows.concat(paidRows).forEach(function (r) { codeMap[String(r.company_code)] = r.company_name; });
           var codes = Object.keys(codeMap).sort();
           if (acctFilter === null) acctFilter = codes.slice();
-          function matches(r) {
-            if (statusFilter) {
-              var st = r.is_estimate ? 'estimated' : r.status;
-              if (st !== statusFilter) return false;
-            }
-            if (acctFilter.indexOf(String(r.company_code)) === -1) return false;
-            return true;
+          function inFilter(code) { return acctFilter.indexOf(String(code)) !== -1; }
+          function firstVal(list, field) {
+            for (var i = 0; i < list.length; i++) { if (list[i][field]) return list[i][field]; }
+            return '';
           }
-          var rows = allRows.filter(matches);
-          rows.sort(function (a, b) {
-            var ad = a.payroll_date || '', bd = b.payroll_date || '';
-            if (ad !== bd) return ad < bd ? 1 : -1;
-            return String(a.company_code) < String(b.company_code) ? -1 : 1;
-          });
+          function latestOf(rows) {
+            var best = null;
+            rows.forEach(function (r) {
+              if (!best) { best = r; return; }
+              var rk = String(r.paid_date || r.payroll_date || ''), bk = String(best.paid_date || best.payroll_date || '');
+              if (rk > bk) best = r;
+            });
+            return best;
+          }
+          var today = new Date(); today.setHours(0, 0, 0, 0);
+          function daysPast(dstr) {
+            if (!dstr) return 0;
+            var d = new Date(String(dstr).slice(0, 10) + 'T00:00:00');
+            var n = Math.round((today - d) / 86400000);
+            return n < 0 ? 0 : n;
+          }
           function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-          function statusLabel(r) {
-            if (r.is_estimate) return '<span class="badge">Estimated</span>';
-            if (r.status === 'paid') return 'Paid';
-            // Same arrears criteria as the Companies page cards:
-            // yellow at 30+ days past the payroll date, red at 60+.
-            var ai = arrearsInfo(r.payroll_date);
-            return 'Open' + (ai.level ? ' <span class="badge ' + (ai.level === 'red' ? 'badge-overdue' : 'badge-warn') + '">' + ai.days + 'd overdue</span>' : '');
-          }
-          var body = rows.map(function (r) {
-            var ai = (!r.is_estimate && r.status === 'open') ? arrearsInfo(r.payroll_date) : { days: 0, level: '' };
-            return '<tr' + (ai.level ? ' class="arrears-' + ai.level + '"' : '') + '><td><b>' + esc(r.company_code) + '</b></td>' +
+          // Group bills by company.
+          var openByCo = {}, paidByCo = {};
+          openRows.forEach(function (r) {
+            if (r.is_estimate) return; // forecasts are not owed yet
+            var k = String(r.company_code);
+            if (!openByCo[k]) openByCo[k] = [];
+            openByCo[k].push(r);
+          });
+          paidRows.forEach(function (r) {
+            var k = String(r.company_code);
+            if (!paidByCo[k]) paidByCo[k] = [];
+            paidByCo[k].push(r);
+          });
+          // ---- Top box: one row per company with open bills, aged in buckets.
+          var topCodes = Object.keys(openByCo).filter(inFilter).sort();
+          var topBody = topCodes.map(function (code) {
+            var bills = openByCo[code];
+            var all = bills.concat(paidByCo[code] || []);
+            var b030 = 0, b3160 = 0, b61 = 0, tot61 = 0;
+            bills.forEach(function (r) {
+              var n = daysPast(r.payroll_date);
+              if (n <= 30) b030++;
+              else if (n <= 60) b3160++;
+              else { b61++; tot61 += Number(r.total_invoice) || 0; }
+            });
+            var lastPaid = paidByCo[code] ? latestOf(paidByCo[code]) : null;
+            var paidTo = lastPaid ? (lastPaid.payroll_end_date || lastPaid.payroll_date || null) : null;
+            var status = b61 > 0
+              ? '<span class="pill pill-red">61+ days</span>'
+              : (b3160 > 0 ? '<span class="pill pill-yellow">31-60 days</span>' : '<span class="pill pill-green">Current</span>');
+            return '<tr><td><b>' + esc(code) + '</b></td>' +
+              cell(firstVal(all, 'company_name')) +
+              cell(firstVal(all, 'ein')) +
+              cell(firstVal(all, 'bill_mode')) +
+              '<td>' + (paidTo ? fmtDate(paidTo) : '&mdash;') + '</td>' +
+              '<td>' + b030 + '</td><td>' + b3160 + '</td><td>' + b61 + '</td>' +
+              '<td><b>' + fmtMoney(tot61) + '</b></td>' +
+              '<td>' + status + '</td></tr>';
+          }).join('');
+          // ---- Bottom box: each company's last invoice paid, full bill data.
+          var botCodes = Object.keys(paidByCo).filter(inFilter).sort();
+          var botBody = botCodes.map(function (code) {
+            var r = latestOf(paidByCo[code]);
+            return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
               cell(r.company_name) +
               cell(r.ein) +
               cell(r.bill_mode) +
@@ -546,7 +584,7 @@ function viewBilling() {
               cell(fmtDate(r.paid_date)) +
               cell(r.lives_count) +
               '<td><b>' + fmtMoney(r.total_invoice) + '</b></td>' +
-              '<td>' + statusLabel(r) + '</td></tr>';
+              '<td>Paid</td></tr>';
           }).join('');
           var boxes = codes.map(function (c) {
             var lbl = esc(c) + (codeMap[c] && codeMap[c] !== c ? ' — ' + esc(codeMap[c]) : '');
@@ -555,24 +593,26 @@ function viewBilling() {
           }).join('');
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
-            '<h3>All Bills (' + rows.length + ')</h3>' +
-            (rows.length === 0
-              ? '<p class="muted">No bills match the filters.</p>'
-              : '<div class="table-scroll" style="max-height:920px;overflow-y:auto;"><table class="data-table"><thead>' +
+            '<h3>Open Bills (' + topCodes.length + ' companies)</h3>' +
+            (topCodes.length === 0
+              ? '<p class="muted">No open bills match the filters.</p>'
+              : '<div class="table-scroll" style="max-height:430px;overflow-y:auto;"><table class="data-table"><thead>' +
+                '<tr><th>Company Code</th><th>Company Name</th><th>EIN</th><th>Pay Frequency</th>' +
+                '<th>Paid-to-Date</th><th># Bills 0-30 days</th><th># Bills 31-60 days</th>' +
+                '<th># Bills 61+ days</th><th>Total $ 61+ days</th><th>Status</th></tr>' +
+                '</thead><tbody>' + topBody + '</tbody></table></div>') +
+            '<h3 style="margin-top:22px;">Paid Bills — Last Invoice Paid (' + botCodes.length + ' companies)</h3>' +
+            (botCodes.length === 0
+              ? '<p class="muted">No paid bills match the filters.</p>'
+              : '<div class="table-scroll" style="max-height:340px;overflow-y:auto;"><table class="data-table"><thead>' +
                 '<tr><th>Company Code</th><th>Company Name</th><th>EIN</th><th>Pay Frequency</th>' +
                 '<th>Payroll Begin Date</th><th>Payroll End Date</th><th>Check Date</th>' +
                 '<th>Lives</th><th>Total $</th><th>Status</th></tr>' +
-                '</thead><tbody>' + body + '</tbody></table></div>') +
+                '</thead><tbody>' + botBody + '</tbody></table></div>') +
             '<div class="card" style="margin-top:16px;"><div class="card-title">Filters</div>' +
             '<div class="form-inline" style="align-items:flex-start;">' +
             '<div><b>Accounts</b><br>' +
             '<div id="bacctboxes" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);padding:6px 10px;min-width:220px;">' + boxes + '</div></div> ' +
-            '<div><label>Status:<br><select id="bstatus">' +
-            '<option value="">All statuses</option>' +
-            '<option value="paid"' + (statusFilter === 'paid' ? ' selected' : '') + '>Paid</option>' +
-            '<option value="open"' + (statusFilter === 'open' ? ' selected' : '') + '>Open</option>' +
-            '<option value="estimated"' + (statusFilter === 'estimated' ? ' selected' : '') + '>Estimated</option>' +
-            '</select></label></div> ' +
             '<div><br><button class="btn btn-small" id="bcodeclear">Reset filters</button></div>' +
             '</div></div>',
             '#/billing'));
@@ -584,8 +624,7 @@ function viewBilling() {
               load();
             };
           });
-          document.getElementById('bstatus').onchange = function () { statusFilter = this.value; load(); };
-          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; statusFilter = ''; load(); };
+          document.getElementById('bcodeclear').onclick = function () { acctFilter = null; load(); };
         }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/billing')); });
     }

@@ -343,6 +343,10 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .data-table tr:nth-child(even) td { background: #f7fbff; }
 .data-table tr.arrears-yellow td { background: #fff6d8; }
 .data-table tr.arrears-red td { background: #ffe0e8; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: 11px; white-space: nowrap; }
+.pill-green { background: #cdeeda; color: #0b6e3c; }
+.pill-yellow { background: var(--accent); color: #003366; }
+.pill-red { background: var(--secondary); color: #fff; }
 .row-actions { white-space: nowrap; }
 .table-scroll { overflow-x: auto; }
 
