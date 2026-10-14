@@ -3657,6 +3657,10 @@ app.get('/api/ar/summary', requireAuth, async (req, res) => {
 // Daily cron: send tier emails for newly-overdue bills, escalate tier 3 to tickets.
 app.post('/api/admin/run-ar-followup-cron', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
+  // A/R module retired 2026-10-13 (Leroy): no follow-up emails, no
+  // auto-created tickets. The handler below is kept in place but
+  // unreachable; the daily trigger cron has been removed.
+  return res.json({ success: true, disabled: true, emailed: 0, tickets: 0, skipped_no_email: 0, errors: [] });
   const db = getPool();
   const out = { emailed: 0, tickets: 0, skipped_no_email: 0, errors: [] };
   try {
@@ -3723,6 +3727,30 @@ app.post('/api/admin/run-ar-followup-cron', async (req, res) => {
     res.json(Object.assign({ success: true }, out));
   } catch (error) {
     console.error('AR followup cron error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ONE-TIME (2026-10-13): wipe ALL tickets + replies (Leroy: ticket system
+// restarts empty, for site-opened tickets only). Body {dry:true} reports
+// counts without deleting. Remove this endpoint after the run.
+app.post('/api/admin/wipe-all-tickets', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  const db = getPool();
+  const dry = !!(req.body && req.body.dry);
+  try {
+    const t = await db.query('SELECT COUNT(*) AS n FROM tickets');
+    const r = await db.query('SELECT COUNT(*) AS n FROM ticket_replies');
+    const report = { tickets: parseInt(t.rows[0].n, 10), replies: parseInt(r.rows[0].n, 10), deleted_tickets: 0, deleted_replies: 0, dry: dry };
+    if (!dry) {
+      const dr = await db.query('DELETE FROM ticket_replies');
+      const dt = await db.query('DELETE FROM tickets');
+      report.deleted_replies = dr.rowCount;
+      report.deleted_tickets = dt.rowCount;
+    }
+    res.json(Object.assign({ success: true }, report));
+  } catch (error) {
+    console.error('Wipe-all-tickets error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

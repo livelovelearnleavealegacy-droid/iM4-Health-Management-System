@@ -212,14 +212,12 @@ function navLinks() {
   if (role === 'admin' || role === 'top_dog' || role === 'steward') {
     links.push(['#/dashboard', 'Dashboard']);
     links.push(['#/clients', 'Companies']);
-    links.push(['#/ar', 'A/R']);
   }
   if (role === 'admin') {
     links.push(['#/billing', 'Billing']);
   }
   if (role === 'service') {
     links.push(['#/clients', 'Companies']);
-    links.push(['#/ar', 'A/R']);
   }
   links.push(['#/implementations', 'Implementation']);
   if (role === 'admin') {
@@ -486,7 +484,6 @@ function viewDashboard() {
         '<h3>My Accountability</h3>' +
         '<div class="card-grid">' +
         '<div class="card"><div class="card-title">My Open Tickets</div><div class="stat-big">' + (a.my_open_tickets || 0) + '</div></div>' +
-        '<div class="card"><div class="card-title">My Overdue Bills</div><div class="stat-big">' + (a.my_overdue_bills || 0) + '</div></div>' +
         '<div class="card"><div class="card-title">Resolved (30d)</div><div class="stat-big">' + (a.my_resolved_30d || 0) + '</div></div>' +
         '</div>' +
         (a.team && a.team.length ? '<h3>Team Accountability</h3><div class="card"><table class="data-table"><thead><tr><th>Person</th><th>Open Tickets</th><th>Resolved (30d)</th></tr></thead><tbody>' +
@@ -532,10 +529,15 @@ function viewBilling() {
           function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
           function statusLabel(r) {
             if (r.is_estimate) return '<span class="badge">Estimated</span>';
-            return r.status === 'paid' ? 'Paid' : 'Open';
+            if (r.status === 'paid') return 'Paid';
+            // Same arrears criteria as the Companies page cards:
+            // yellow at 30+ days past the payroll date, red at 60+.
+            var ai = arrearsInfo(r.payroll_date);
+            return 'Open' + (ai.level ? ' <span class="badge ' + (ai.level === 'red' ? 'badge-overdue' : 'badge-warn') + '">' + ai.days + 'd overdue</span>' : '');
           }
           var body = rows.map(function (r) {
-            return '<tr><td><b>' + esc(r.company_code) + '</b></td>' +
+            var ai = (!r.is_estimate && r.status === 'open') ? arrearsInfo(r.payroll_date) : { days: 0, level: '' };
+            return '<tr' + (ai.level ? ' class="arrears-' + ai.level + '"' : '') + '><td><b>' + esc(r.company_code) + '</b></td>' +
               cell(r.company_name) +
               cell(r.ein) +
               cell(r.bill_mode) +
@@ -2913,7 +2915,7 @@ function route() {
     if (pathParts[1]) return viewTicketDetail(pathParts[1]);
     return viewTickets();
   }
-  if (pathParts[0] === 'ar') return viewAR();
+  if (pathParts[0] === 'ar') { location.hash = '#/dashboard'; return; } // A/R retired 2026-10-13
   location.hash = '#/login';
 }
 
