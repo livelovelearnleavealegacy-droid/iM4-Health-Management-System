@@ -3727,54 +3727,6 @@ app.post('/api/admin/run-ar-followup-cron', async (req, res) => {
   }
 });
 
-// ONE-TIME (2026-10-13): remove duplicate auto-created A/R tier-3 tickets
-// produced by the case-sensitive LIKE dedup bug fixed above (guard searched
-// '%invoice #' while created descriptions start 'Invoice #'). Keeps the
-// oldest ticket per invoice; deletes only later duplicates that are still
-// 'open' with zero replies. Body {dry:true} reports without deleting.
-// Remove this endpoint after the cleanup run.
-app.post('/api/admin/cleanup-ar-ticket-dupes', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  const db = getPool();
-  const dry = !!(req.body && req.body.dry);
-  try {
-    const rows = (await db.query(
-      'SELECT t.id, t.status, t.created_at, ' +
-      "substring(t.description from '^Invoice #([0-9]+)') AS invoice_id, " +
-      '(SELECT COUNT(*) FROM ticket_replies r WHERE r.ticket_id = t.id) AS reply_count ' +
-      'FROM tickets t ' +
-      "WHERE t.category = 'billing' AND t.title LIKE 'Overdue bill:%' AND t.description LIKE 'Invoice #%' " +
-      'ORDER BY t.created_at ASC, t.id ASC')).rows;
-    const groups = {};
-    for (const r of rows) {
-      if (!r.invoice_id) continue;
-      (groups[r.invoice_id] = groups[r.invoice_id] || []).push(r);
-    }
-    const report = { invoices_with_tickets: 0, duplicate_groups: 0, would_delete: 0, deleted: 0, kept_with_activity: [], dry: dry };
-    for (const inv of Object.keys(groups)) {
-      const g = groups[inv];
-      report.invoices_with_tickets++;
-      if (g.length < 2) continue;
-      report.duplicate_groups++;
-      for (let i = 1; i < g.length; i++) {
-        const t = g[i];
-        if (t.status !== 'open' || parseInt(t.reply_count, 10) > 0) {
-          report.kept_with_activity.push(t.id);
-          continue;
-        }
-        report.would_delete++;
-        if (!dry) {
-          await db.query('DELETE FROM tickets WHERE id = $1', [t.id]);
-          report.deleted++;
-        }
-      }
-    }
-    res.json(Object.assign({ success: true }, report));
-  } catch (error) {
-    console.error('AR ticket dupe cleanup error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
 // Current commission table, for the admin view on the Jobs page.
 app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
