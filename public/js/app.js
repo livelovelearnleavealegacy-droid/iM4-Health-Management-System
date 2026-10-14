@@ -1041,8 +1041,9 @@ function viewAdminStewards() {
       return '<tr><td>' + idCell + '</td>' +
         '<td><input id="stw-first" value="' + esc(s ? (s.first_name || '') : '') + '" style="width:100%;"></td>' +
         '<td><input id="stw-last" value="' + esc(s ? (s.last_name || '') : '') + '" style="width:100%;"></td>' +
-        '<td><input id="stw-email" value="' + esc(s ? (s.email || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-email" value="' + esc(s ? (s.email || '') : '') + '" style="width:100%;"><input id="stw-password" type="password" placeholder="' + (s ? 'New password (blank = keep current)' : 'Password (optional)') + '" style="width:100%;margin-top:4px;"></td>' +
         '<td><input id="stw-phone" value="' + esc(s ? (s.phone || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-stmt" value="' + esc(s ? (s.statement_email || '') : '') + '" style="width:100%;"></td>' +
         '<td>' + rolesCell + '</td>' +
         '<td><button class="btn btn-small" id="stw-save">Save &amp; close</button> ' +
         '<button class="btn btn-small" id="stw-cancel">Cancel</button></td></tr>';
@@ -1061,17 +1062,15 @@ function viewAdminStewards() {
           var actions = '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>';
           if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
-            '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
+            '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
             '<td>' + actions + '</td></tr>';
         }).join('');
-        var note = isAdmin
-          ? '<p class="muted">Admins can add and edit stewards, change Steward IDs, assign roles, and delete stewards. First name, last name, and email are required; phone is optional. New stewards are assigned the next Steward ID and the Steward role automatically.</p>'
-          : '<p class="muted">You can add new stewards and edit their first name, last name, email, and phone. New stewards are assigned the next Steward ID automatically and given the Steward role. Changing Steward IDs, assigning other roles, and deleting stewards are admin-only. First name, last name, and email are required; phone is optional.</p>';
+        var note = '<p class="muted">Top Dogs can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
         render(shell(
           '<h2>Stewards</h2>' + note +
           '<div id="err"></div>' +
           '<p><button class="btn" id="stw-add">Add Steward</button></p>' +
-          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Roles</th><th></th></tr></thead>' +
+          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th><th></th></tr></thead>' +
           '<tbody>' + bodyRows + '</tbody></table>',
           '#/admin/stewards'));
         wire();
@@ -1110,12 +1109,17 @@ function viewAdminStewards() {
         var last = document.getElementById('stw-last').value.trim();
         var email = document.getElementById('stw-email').value.trim();
         var phone = document.getElementById('stw-phone').value.trim();
+        var stmtEmail = document.getElementById('stw-stmt').value.trim();
+        var pw = document.getElementById('stw-password').value;
         if (!first) { showErr('First name is required'); return; }
         if (!last) { showErr('Last name is required'); return; }
         if (!email || email.indexOf('@') === -1) { showErr('A valid email is required'); return; }
-        var fields = { first_name: first, last_name: last, email: email, phone: phone || null };
+        if (stmtEmail && stmtEmail.indexOf('@') === -1) { showErr('Statement Email must be a valid email address'); return; }
+        if (pw && pw.length < 8) { showErr('Password must be at least 8 characters'); return; }
+        var fields = { first_name: first, last_name: last, email: email, phone: phone || null, statement_email: stmtEmail || null };
+        if (pw) fields.password = pw;
         if (adding) {
-          var payload = { first_name: first, last_name: last, email: email, phone: phone || null };
+          var payload = fields;
           if (isAdmin) {
             var idEl = document.getElementById('stw-id');
             var wantId = idEl ? parseInt(idEl.value, 10) : NaN;

@@ -256,6 +256,7 @@ async function migrate() {
     ['stewards', 'first_name', 'TEXT'],
     ['stewards', 'last_name', 'TEXT'],
     ['stewards', 'phone', 'TEXT'],
+    ['stewards', 'statement_email', 'TEXT'],
     ['stewards', 'reset_token', 'TEXT'],
     ['stewards', 'reset_expires', 'TIMESTAMPTZ'],
     ['stewards', 'two_factor_enabled', 'BOOLEAN NOT NULL DEFAULT FALSE'],
@@ -2535,7 +2536,7 @@ app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
 app.get('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
-      "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.role, s.created_at, " +
+      "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.statement_email, s.role, s.created_at, " +
       "COALESCE(array_agg(ur.role) FILTER (WHERE ur.role IS NOT NULL), '{}') AS roles " +
       "FROM stewards s LEFT JOIN user_roles ur ON ur.steward_id = s.id " +
       "GROUP BY s.id ORDER BY CASE WHEN s.role = 'admin' THEN 0 ELSE 1 END, s.id");
@@ -2563,6 +2564,13 @@ app.post('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
     const last = String(b.last_name || '').trim();
     const email = String(b.email || '').trim().toLowerCase();
     const phone = b.phone && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
+    const stmtEmail = b.statement_email && String(b.statement_email).trim() !== '' ? String(b.statement_email).trim().toLowerCase() : null;
+    if (stmtEmail && stmtEmail.indexOf('@') === -1) return res.status(400).json({ error: 'Statement Email must be a valid email address' });
+    let pwHash = null;
+    if (b.password && String(b.password) !== '') {
+      if (String(b.password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      pwHash = await bcrypt.hash(String(b.password), 10);
+    }
     if (!first) return res.status(400).json({ error: 'First name is required' });
     if (!last) return res.status(400).json({ error: 'Last name is required' });
     if (!email || email.indexOf('@') === -1) return res.status(400).json({ error: 'A valid email is required' });
@@ -2585,8 +2593,8 @@ app.post('/api/admin/stewards', requireAdminOrTopDog, async (req, res) => {
     try {
       await client.query('BEGIN');
       await client.query(
-        "INSERT INTO stewards (id, email, name, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, $6, 'steward')",
-        [newId, email, (first + ' ' + last).trim(), first, last, phone]);
+        "INSERT INTO stewards (id, email, name, first_name, last_name, phone, statement_email, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'steward')",
+        [newId, email, (first + ' ' + last).trim(), first, last, phone, stmtEmail, pwHash]);
       await client.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'steward') ON CONFLICT DO NOTHING", [newId]);
       await client.query('COMMIT');
     } catch (e) {
@@ -2618,20 +2626,30 @@ app.post('/api/admin/stewards/:id/password', requireAdminOrTopDog, async (req, r
 // and email are required; phone is optional.
 app.put('/api/admin/stewards/:id', requireAdminOrTopDog, async (req, res) => {
   try {
-    const { first_name, last_name, email, phone } = req.body || {};
+    const { first_name, last_name, email, phone, statement_email, password } = req.body || {};
     const first = String(first_name || '').trim();
     const last = String(last_name || '').trim();
     const em = String(email || '').trim().toLowerCase();
     if (!first) return res.status(400).json({ error: 'First name is required' });
     if (!last) return res.status(400).json({ error: 'Last name is required' });
     if (!em || em.indexOf('@') === -1) return res.status(400).json({ error: 'A valid email is required' });
+    const stmtEmail = statement_email && String(statement_email).trim() !== '' ? String(statement_email).trim().toLowerCase() : null;
+    if (stmtEmail && stmtEmail.indexOf('@') === -1) return res.status(400).json({ error: 'Statement Email must be a valid email address' });
+    let pwHash = null;
+    if (password && String(password) !== '') {
+      if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      pwHash = await bcrypt.hash(String(password), 10);
+    }
     const db = getPool();
     const dupe = await db.query('SELECT id FROM stewards WHERE LOWER(email) = $1 AND id <> $2', [em, req.params.id]);
     if (dupe.rows.length) return res.status(400).json({ error: 'That email is already used by steward ' + dupe.rows[0].id });
+    const sets = ['first_name = $1', 'last_name = $2', 'email = $3', 'phone = $4', 'statement_email = $5',
+      "name = TRIM(COALESCE($1,'') || ' ' || COALESCE($2,''))"];
+    const params = [first, last, em, phone && String(phone).trim() !== '' ? String(phone).trim() : null, stmtEmail];
+    if (pwHash) { params.push(pwHash); sets.push('password_hash = $' + params.length); }
+    params.push(req.params.id);
     const r = await db.query(
-      'UPDATE stewards SET first_name = $1, last_name = $2, email = $3, phone = $4, ' +
-      "name = TRIM(COALESCE($1,'') || ' ' || COALESCE($2,'')) WHERE id = $5 RETURNING id",
-      [first, last, em, phone && String(phone).trim() !== '' ? String(phone).trim() : null, req.params.id]);
+      'UPDATE stewards SET ' + sets.join(', ') + ' WHERE id = $' + params.length + ' RETURNING id', params);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch (error) {
@@ -2679,9 +2697,9 @@ app.post('/api/admin/stewards/:id/renumber', requireAdmin, async (req, res) => {
       if (!reuseGhost) {
         step = 'INSERT copy';
         await client.query(
-          'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, ' +
+          'INSERT INTO stewards (id, email, name, created_at, role, password_hash, first_name, last_name, phone, statement_email, ' +
           'reset_token, reset_expires, two_factor_enabled) ' +
-          "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, " +
+          "SELECT $1, email || '.renumber-tmp', name, created_at, role, password_hash, first_name, last_name, phone, statement_email, " +
           'reset_token, reset_expires, two_factor_enabled FROM stewards WHERE id = $2',
           [newId, oldId]);
       }
