@@ -1383,7 +1383,10 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- v5: billing
-app.get('/api/billing', requireAdmin, async (req, res) => {
+// v6.1 (Leroy): Billing page open to every role. Scoping is enforced
+// inside via getVisibleCodes: full-visibility roles see all companies;
+// stewards/service/client see only their assigned companies.
+app.get('/api/billing', requireAuth, async (req, res) => {
   try {
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);

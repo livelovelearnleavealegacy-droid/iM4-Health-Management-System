@@ -201,11 +201,12 @@ function activeRole() {
 
 // Screens per role:
 // admin: everything
-// top_dog: everything except Jobs, Billing, Tickets (Stewards page is view-only)
-// onboarding: Onboarding, Implementation, Stewards (with steward maintenance), and Companies (with company maintenance)
+// top_dog: everything except Jobs, Tickets (Stewards page is view-only)
+// onboarding: Onboarding, Implementation, Stewards (with steward maintenance), Companies (with company maintenance), Billing
 // steward: Dashboard, Companies, Billing, Implementation, Tickets
-// service: Tickets, Companies, Implementation (support desk)
-// client: Tickets (own company only)
+// service: Tickets, Companies, Implementation, Billing (assigned companies only)
+// client: Tickets (own company only), Billing (own company only)
+// Billing (v6.1, Leroy): every role; scoped roles see only their assigned companies (server-enforced)
 function navLinks() {
   var role = activeRole();
   var links = [];
@@ -213,9 +214,7 @@ function navLinks() {
     links.push(['#/dashboard', 'Dashboard']);
     links.push(['#/clients', 'Companies']);
   }
-  if (role === 'admin') {
-    links.push(['#/billing', 'Billing']);
-  }
+  links.push(['#/billing', 'Billing']);
   if (role === 'service') {
     links.push(['#/clients', 'Companies']);
   }
@@ -507,7 +506,6 @@ function viewDashboard() {
 // ---------------------------------------------------------------- billing
 function viewBilling() {
   requireUser(function () {
-    if (activeRole() !== 'admin') { location.hash = '#/dashboard'; return; }
     function load() {
       api.get('/api/billing?status=open').then(function (openRows) {
         api.get('/api/billing?status=paid').then(function (paidRows) {
