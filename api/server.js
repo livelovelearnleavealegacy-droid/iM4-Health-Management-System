@@ -262,6 +262,7 @@ async function migrate() {
     ['stewards', 'two_factor_enabled', 'BOOLEAN NOT NULL DEFAULT FALSE'],
     ['stewards', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
+    ['companies', 'company_status', "TEXT NOT NULL DEFAULT 'ACTIVE'"],
     ['companies', 'github_issue_number', 'INT'],
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
@@ -297,6 +298,11 @@ async function migrate() {
   for (const [table, col, def] of cols) {
     await db.query('ALTER TABLE ' + table + ' ADD COLUMN IF NOT EXISTS ' + col + ' ' + def);
   }
+  // v5.46: company_status backfill - termed companies (active = FALSE) are
+  // TERMED; everything else stays ACTIVE. All write paths keep the two in
+  // sync (company_status is the source of truth at the edges; the boolean
+  // keeps driving the existing visibility/billing filters).
+  await db.query("UPDATE companies SET company_status = 'TERMED' WHERE active = FALSE AND company_status <> 'TERMED'");
   // v5: "parent" renamed to "ee" on import headings; carry existing values over.
   await db.query('UPDATE companies SET ee_company_code = parent_company_code WHERE (ee_company_code IS NULL OR ee_company_code = ' + "''" + ') AND parent_company_code IS NOT NULL AND parent_company_code <> ' + "''");
   await db.query('UPDATE companies SET ee_company_name = parent_company_name WHERE (ee_company_name IS NULL OR ee_company_name = ' + "''" + ') AND parent_company_name IS NOT NULL AND parent_company_name <> ' + "''");
@@ -2866,21 +2872,33 @@ app.get('/api/admin/companies', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
-// Set a company's active flag (admin/top dog). Termed companies keep all
-// their data but are hidden from steward views and billing.
+// Set a company's status (admin/top dog). Accepts { company_status:
+// 'ACTIVE' | 'TERMED' | 'PENDING' } or the legacy { active: true/false }.
+// Termed companies keep all their data but are hidden from steward views
+// and billing; the boolean stays in sync (active = status is not TERMED).
 app.post('/api/admin/companies/:code/active', requireAdminOrTopDog, async (req, res) => {
   try {
     const code = String(req.params.code || '').trim();
-    const active = req.body && req.body.active;
     if (!code) return res.status(400).json({ error: 'Company code is required' });
-    if (active !== true && active !== false) return res.status(400).json({ error: 'active must be true or false' });
+    let status = null;
+    const rawStatus = req.body && req.body.company_status;
+    if (rawStatus !== undefined && rawStatus !== null && String(rawStatus).trim() !== '') {
+      const sv = String(rawStatus).trim().toUpperCase();
+      if (sv === 'ACTIVE' || sv === 'PENDING') status = sv;
+      else if (sv === 'TERMED' || sv === 'TERMINATED') status = 'TERMED';
+      else return res.status(400).json({ error: 'company_status must be ACTIVE, TERMED, or PENDING' });
+    } else {
+      const active = req.body && req.body.active;
+      if (active !== true && active !== false) return res.status(400).json({ error: 'Provide company_status (ACTIVE, TERMED, or PENDING) or active (true/false)' });
+      status = active ? 'ACTIVE' : 'TERMED';
+    }
     const r = await getPool().query(
-      'UPDATE companies SET active = $1 WHERE company_code = $2 RETURNING company_code, active',
-      [active, code]);
+      'UPDATE companies SET company_status = $1, active = $2 WHERE company_code = $3 RETURNING company_code, company_status, active',
+      [status, status !== 'TERMED', code]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Company not found' });
-    res.json({ success: true, company_code: r.rows[0].company_code, active: r.rows[0].active });
+    res.json({ success: true, company_code: r.rows[0].company_code, company_status: r.rows[0].company_status, active: r.rows[0].active });
   } catch (error) {
-    console.error('Admin set company active error:', error);
+    console.error('Admin set company status error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2986,18 +3004,27 @@ function validateImport(type, rows) {
       seen[key] = true;
       const parentCode = row.parent_code || row.ee_company_code || row.parent_company_code;
       const parentName = row.parent_name || row.ee_company_name || row.parent_company_name;
-      let active = null;
-      if (row.active !== undefined && row.active !== null && String(row.active).trim() !== '') {
+      let status = null;
+      const statusRaw = row.company_status !== undefined && row.company_status !== null ? String(row.company_status).trim() : '';
+      if (statusRaw !== '') {
+        const sv = statusRaw.toUpperCase();
+        if (sv === 'ACTIVE') status = 'ACTIVE';
+        else if (sv === 'TERMED' || sv === 'TERMINATED') status = 'TERMED';
+        else if (sv === 'PENDING') status = 'PENDING';
+        else { e('company_status must be ACTIVE, TERMED, or PENDING (got "' + row.company_status + '")'); return; }
+      } else if (row.active !== undefined && row.active !== null && String(row.active).trim() !== '') {
         const av = String(row.active).trim().toLowerCase();
-        if (['yes', 'y', 'true', '1', 'active'].indexOf(av) !== -1) active = true;
-        else if (['no', 'n', 'false', '0', 'inactive', 'termed', 'terminated'].indexOf(av) !== -1) active = false;
+        if (['yes', 'y', 'true', '1', 'active'].indexOf(av) !== -1) status = 'ACTIVE';
+        else if (['no', 'n', 'false', '0', 'inactive', 'termed', 'terminated'].indexOf(av) !== -1) status = 'TERMED';
+        else if (av === 'pending') status = 'PENDING';
         else { e('active must be Yes/No (got "' + row.active + '")'); return; }
       }
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
         ee_company_code: parentCode ? String(parentCode).trim() : null,
         ee_company_name: parentName ? String(parentName).trim() : null,
-        active: active
+        company_status: status,
+        active: status === null ? null : (status !== 'TERMED')
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
@@ -3083,7 +3110,7 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     } else if (type === 'companies') {
       for (const c of v.valid) {
         try {
-          if (c.active === null || c.active === undefined) {
+          if (c.company_status === null || c.company_status === undefined) {
             await db.query(
               'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name) ' +
               'VALUES ($1,$2,$3,$4) ' +
@@ -3092,12 +3119,12 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
               [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name]);
           } else {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, active) ' +
-              'VALUES ($1,$2,$3,$4,$5) ' +
+              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, company_status, active) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
               'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
-              'active = EXCLUDED.active',
-              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.active]);
+              'company_status = EXCLUDED.company_status, active = EXCLUDED.active',
+              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.company_status, c.active]);
           }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
@@ -3146,10 +3173,10 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       headers = ['steward_id', 'email', 'first_name', 'last_name', 'phone'];
       rows = (await db.query('SELECT id AS steward_id, email, first_name, last_name, phone FROM stewards ORDER BY id')).rows;
     } else if (type === 'companies') {
-      headers = ['parent_code', 'parent_name', 'company_code', 'company_name', 'active'];
+      headers = ['parent_code', 'parent_name', 'company_code', 'company_name', 'company_status'];
       rows = (await db.query(
         "SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, company_name, " +
-        "CASE WHEN active = FALSE THEN 'No' ELSE 'Yes' END AS active " +
+        "COALESCE(company_status, CASE WHEN active = FALSE THEN 'TERMED' ELSE 'ACTIVE' END) AS company_status " +
         'FROM companies ORDER BY company_code')).rows;
     } else if (type === 'assignments') {
       headers = ['steward_id', 'company_code'];
