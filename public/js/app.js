@@ -1178,7 +1178,6 @@ function viewAdminCommissions() {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
     var canEdit = ar === 'admin' || ar === 'onboarding';
-    var q = '';
     var SLOTS = 7;
     function fmtDec(p) { return String(Math.round((Number(p) / 100) * 1000000) / 1000000); }
     function fmtTotal(sum) { return String(Math.round(sum * 100) / 100) + '%'; }
@@ -1188,20 +1187,10 @@ function viewAdminCommissions() {
         list.forEach(function (c) { byCode[c.company_code] = c; });
         var head = '<tr><th>COMPANY_CODE</th><th>COMPANY_NAME</th><th>EIN</th>';
         for (var i = 0; i < SLOTS; i++) {
-          head += '<th>' + (i === 0 ? 'WRITING AGENT #1' : 'AGENT #' + (i + 1)) + '</th><th>#' + (i + 1) + ' %</th>';
+          head += '<th>STEWARD #' + (i + 1) + '</th><th>#' + (i + 1) + ' %</th>';
         }
         head += '<th>Total %</th>' + (canEdit ? '<th></th>' : '') + '</tr>';
-        var ql = q.toLowerCase();
-        var rows = list.filter(function (c) {
-          if (!ql) return true;
-          if (String(c.company_code).toLowerCase().indexOf(ql) !== -1) return true;
-          if (String(c.company_name || '').toLowerCase().indexOf(ql) !== -1) return true;
-          for (var i = 0; i < c.stewards.length; i++) {
-            if (String(c.stewards[i].name).toLowerCase().indexOf(ql) !== -1) return true;
-            if (String(c.stewards[i].steward_code).indexOf(ql) !== -1) return true;
-          }
-          return false;
-        }).map(function (c) {
+        var rows = list.map(function (c) {
           var cells = '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td><td>' + esc(c.ein || '') + '</td>';
           for (var i = 0; i < SLOTS; i++) {
             var s = c.stewards[i];
@@ -1222,7 +1211,7 @@ function viewAdminCommissions() {
         }).join('');
         var slotRow = function (i) {
           return '<div class="form-inline" style="margin-bottom:6px;">' +
-            '<label>Agent #' + (i + 1) + ' Steward ID<br><input id="cm-s-' + i + '" type="text" size="10"></label> ' +
+            '<label>Steward #' + (i + 1) + ' ID<br><input id="cm-s-' + i + '" type="text" size="10"></label> ' +
             '<span id="cm-n-' + i + '" class="muted" style="min-width:180px;"></span> ' +
             '<label>% (decimal)<br><input id="cm-p-' + i + '" type="text" size="8" placeholder="0.125"></label></div>';
         };
@@ -1236,15 +1225,12 @@ function viewAdminCommissions() {
           '<button class="btn btn-primary" id="cm-save">Save</button> ' +
           '<button class="btn" id="cm-cancel">Cancel</button></div>';
         render(shell(
-          '<h2>Commissions</h2>' + filterBar(q, '') +
+          '<h2>Commissions</h2>' +
+          '<p class="muted">Companies appear as they are added to the Company table. Onboarding and Admin can edit Steward IDs and Percentages. No one can delete a company from this page.</p>' +
           (canEdit ? editor : '') +
-          '<div class="table-scroll"><table class="data-table"><thead>' + head + '</thead>' +
+          '<div class="fullwidth"><table class="data-table commissions-table"><thead>' + head + '</thead>' +
           '<tbody>' + rows + '</tbody></table></div>',
           '#/admin/commissions'));
-        var fq = document.getElementById('fq');
-        fq.onchange = function () { q = fq.value; load(); };
-        fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
-        fq.oninput = function () { q = fq.value; load(); };
         if (canEdit) {
           var stewardNames = {};
           api.get('/api/admin/stewards').then(function (sts) {
@@ -1319,7 +1305,7 @@ function viewAdminCommissions() {
               document.getElementById('cm-n-' + i).textContent = s.name || '';
             });
             document.getElementById('cm-title').textContent = 'Edit Commissions - ' + c.company_code;
-            document.getElementById('cm-co-line').textContent = c.company_name + (c.ein ? ' - EIN ' + c.ein : '') + ' (company code, name, and EIN come from the Companies page and are not editable here). Enter each agent\'s Steward ID and their % as a decimal (0.125 = 12.5%). The % column must add up to 100% before you can save; Cancel always works.';
+            document.getElementById('cm-co-line').textContent = c.company_name + (c.ein ? ' - EIN ' + c.ein : '') + ' (company code, name, and EIN come from the Companies page and are not editable here). Enter each steward\'s ID and their % as a decimal (0.125 = 12.5%). The % column must add up to 100% before you can save; Cancel always works.';
             document.getElementById('cm-out').innerHTML = '';
             editorEl.style.display = '';
             editorEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1897,9 +1883,9 @@ function parseCSV(text) {
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
   companies: 'parent_code, parent_name, company_code, ein, company_name, company_address_1, company_city, company_state, company_zip, company_status. Only company_code and company_name are required; blank cells leave the current values unchanged (company_status: ACTIVE, TERMED, or PENDING; the old active Yes/No column still works). Headers are case-insensitive.',
-  assignments: 'steward_id, company_code',
+  assignments: 'steward_id, company_code. The steward must already be on the Stewards table and the company on the Companies table, or the import is refused.',
   billing: 'company_code (required), company_name, ein, payroll_date (YYYY-MM-DD), payroll_end_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD), bill_type (F or S), bill_mode',
-  commissions: 'Excel sheet: COMPANY_CODE, WRITING AGENT #1, #1 %, AGENT #2, #2 %, and so on. Agent cells look like "155026 - RLJAT" (the number is the Steward ID). % cells are decimals (0.125 = 12.5%) and each company must add up to 1.0 (100%). A pasted CSV also works in the wide pair format (company_code, then steward_id,pct pairs with percents adding to 100). The import replaces the commissions for every company in the file.'
+  commissions: 'Excel sheet: COMPANY_CODE, STEWARD #1, #1 %, STEWARD #2, #2 %, and so on. Agent cells look like "155026 - RLJAT" (the number is the Steward ID). % cells are decimals (0.125 = 12.5%) and each company must add up to 1.0 (100%). Every company must already be on the Companies table and every steward on the Stewards table, or the import is refused. A pasted CSV also works in the wide pair format (company_code, then steward_id,pct pairs with percents adding to 100). The import replaces the commissions for every company in the file.'
 };
 
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
@@ -2594,9 +2580,6 @@ function viewAdminJobs() {
           }
           out.innerHTML = '<h3>Validation</h3>' +
             okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
-            (d.skipped_companies && d.skipped_companies.length
-              ? '<p class="muted">Skipped ' + d.skipped_companies.length + ' companies not on the company list: ' + d.skipped_companies.map(esc).join(', ') + '</p>'
-              : '') +
             '<button class="btn btn-primary" id="imp-commissions-fileconfirm">Confirm import of ' + d.valid_count + ' rows</button>';
           document.getElementById('imp-commissions-fileconfirm').onclick = function () {
             out.innerHTML = '<p class="muted">Importing...</p>';
@@ -2635,9 +2618,6 @@ function viewAdminJobs() {
             }
             out.innerHTML = '<h3>Validation</h3><p class="muted">' + fmtMsg + '</p>' +
               okHtml(d.valid_count + ' rows across ' + d.companies + ' companies. Every company adds up to 100%.') +
-              (d.skipped_companies && d.skipped_companies.length
-                ? '<p class="muted">Skipped ' + d.skipped_companies.length + ' companies not on the company list: ' + d.skipped_companies.map(esc).join(', ') + '</p>'
-                : '') +
               '<button class="btn btn-primary" id="imp-commissions-confirm">Confirm import of ' + d.valid_count + ' rows</button>';
             document.getElementById('imp-commissions-confirm').onclick = function () {
               out.innerHTML = '<p class="muted">Importing...</p>';

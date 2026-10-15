@@ -2505,7 +2505,7 @@ function parseCommissionSchedule(buffer) {
   const pairs = [];
   for (let i = 0; i < headers.length; i++) {
     const h = headers[i];
-    if ((h.indexOf('AGENT') !== -1 || h.indexOf('WRITING') !== -1) && i + 1 < headers.length) {
+    if ((h.indexOf('AGENT') !== -1 || h.indexOf('WRITING') !== -1 || h.indexOf('STEWARD') !== -1) && i + 1 < headers.length) {
       const nh = headers[i + 1];
       if (nh.indexOf('%') !== -1) pairs.push({ agent: i, pct: i + 1 });
     }
@@ -3216,6 +3216,32 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     }
     if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'rows array is required' });
     const v = validateImport(type, rows);
+    if (type === 'assignments' && v.valid.length > 0) {
+      // Predecessor rule (Leroy): an assignment can only be imported when
+      // its steward is already on the Stewards table AND its company is
+      // already on the Companies table. Missing either blocks the import.
+      const gateDb = getPool();
+      const stSet = {};
+      (await gateDb.query('SELECT id FROM stewards')).rows.forEach(function (x) { stSet[String(x.id)] = true; });
+      const coSet = {};
+      (await gateDb.query('SELECT company_code FROM companies')).rows.forEach(function (x) { coSet[String(x.company_code)] = true; });
+      const kept = [];
+      for (const a of v.valid) {
+        if (!stSet[String(a.steward_id)]) {
+          v.errors.push('Steward ' + a.steward_id + ' is not on the Stewards table - import the steward before assigning them (the assignment to company ' + a.company_code + ' was not imported).');
+          continue;
+        }
+        if (!coSet[String(a.company_code)]) {
+          v.errors.push('Company ' + a.company_code + ' is not on the Companies table - import the company before assigning stewards to it (steward ' + a.steward_id + ' was not assigned).');
+          continue;
+        }
+        kept.push(a);
+      }
+      v.valid = kept;
+      if (dry_run === false && v.errors.length > 0) {
+        return res.json({ success: false, errors: v.errors });
+      }
+    }
     if (dry_run !== false) {
       return res.json({ success: true, dry_run: true, valid_count: v.valid.length, errors: v.errors, preview: v.valid.slice(0, 10) });
     }
@@ -3366,7 +3392,7 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
         'ORDER BY company_code, payroll_date')).rows;
     } else if (type === 'commissions') {
       // Leroy's sheet format, matching the Excel import exactly: COMPANY_CODE,
-      // then WRITING AGENT #1 / #1 %, AGENT #2 / #2 %, ... Agent cells are
+      // then STEWARD #1 / #1 %, STEWARD #2 / #2 %, ... Agent cells are
       // "155026 - NAME"; % cells are decimals (0.375 = 37.5%).
       const r = await db.query(
         'SELECT c.company_code, c.steward_code, c.pct, s.first_name, s.last_name, s.email ' +
@@ -3381,7 +3407,7 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       let maxPairs = 0;
       order.forEach(function (c) { maxPairs = Math.max(maxPairs, byCo[c].length); });
       const h = ['COMPANY_CODE'];
-      for (let pi = 0; pi < maxPairs; pi++) h.push(pi === 0 ? 'WRITING AGENT #1' : 'AGENT #' + (pi + 1), '#' + (pi + 1) + ' %');
+      for (let pi = 0; pi < maxPairs; pi++) h.push('STEWARD #' + (pi + 1), '#' + (pi + 1) + ' %');
       const lines = [h.join(',')];
       order.forEach(function (c) {
         const cells = [csvCell(c)];
@@ -3427,19 +3453,21 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
     const valid = [];
     const seen = {};
     const perCompany = {};
-    const skippedCompanies = {};
     rows.map(normalizeRow).forEach(function (row, idx) {
       const line = idx + 2;
       const e = function (msg) { errors.push('Row ' + line + ': ' + msg); };
       const code = row.company_code ? String(row.company_code).trim() : '';
       const scRaw = row.steward_code ? String(row.steward_code).trim() : '';
       if (!code) { e('company_code is required'); return; }
-      // Skip companies not on the company list — don't fail the whole import.
-      if (!coMap[code]) { skippedCompanies[code] = true; return; }
+      // Predecessor rule (Leroy): commissions can only be imported for a
+      // company that already exists on the Companies table, and a steward
+      // who already exists on the Stewards table. Anything missing blocks
+      // the whole import - nothing is skipped silently.
+      if (!coMap[code]) { e('company ' + code + ' is not on the Companies table - add or import the company before importing its commissions'); return; }
       if (!scRaw) { e('steward_code is required'); return; }
       const scId = parseInt(scRaw, 10);
       if (isNaN(scId) || scId <= 0) { e('steward_code "' + scRaw + '" must be a Steward ID number'); return; }
-      if (!stMap[String(scId)]) { e('steward ' + scId + ' is not on the steward list'); return; }
+      if (!stMap[String(scId)]) { e('steward ' + scId + ' is not on the Stewards table - add or import the steward before importing commissions for them'); return; }
       const key = code + '|' + scId;
       if (seen[key]) { e('duplicate steward ' + scId + ' for company ' + code + ' in this file'); return; }
       seen[key] = true;
@@ -3468,9 +3496,8 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
       return res.json({ success: false, errors: errors });
     }
     const companyCount = Object.keys(perCompany).length;
-    const skipped = Object.keys(skippedCompanies).sort();
     if (dry_run !== false) {
-      return res.json({ success: true, dry_run: true, valid_count: valid.length, companies: companyCount, errors: [], skipped_companies: skipped });
+      return res.json({ success: true, dry_run: true, valid_count: valid.length, companies: companyCount, errors: [] });
     }
     for (const code of Object.keys(perCompany)) {
       await db.query('DELETE FROM commissions WHERE company_code = $1', [code]);
@@ -3483,7 +3510,7 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
         [v.company_code, v.steward_code, v.pct]);
       imported++;
     }
-    res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [], skipped_companies: skipped });
+    res.json({ success: true, dry_run: false, imported: imported, companies: companyCount, errors: [] });
   } catch (error) {
     console.error('Commission import error:', error);
     res.status(500).json({ error: 'Internal server error' });

@@ -430,3 +430,8 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .reply-internal { border-left: 4px solid #FFCC66; background: #fffdf5; }
 .reply-head { margin-bottom: 6px; font-size: 13px; }
 .reply-body { font-size: 14px; line-height: 1.5; }
+
+/* v5.52: full-width breakout (Commissions table) - leave the 1180px column and use the whole window */
+.fullwidth { width: 100vw; margin-left: calc(50% - 50vw); padding: 0 10px; box-sizing: border-box; }
+.commissions-table { width: 100%; }
+.commissions-table th, .commissions-table td { padding: 5px 6px; }
