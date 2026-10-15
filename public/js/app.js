@@ -1570,10 +1570,9 @@ function viewAdminCompanies() {
         var status = c.company_status || (c.active === false ? 'TERMED' : 'ACTIVE');
         var statusHtml = status === 'TERMED' ? '<b>TERMED</b>' : esc(status);
         return '<tr data-status="' + status + '">' + cell(parentCode(c)) + cell(parentName(c)) +
-          '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
-          '<td>' + statusHtml + '</td>' +
-          cell(c.payroll_total) + cell(c.payroll_enrolled) +
-          '<td>' + (c.open_invoice_count || 0) + '</td><td><b>' + fmtMoney(c.open_invoice_total || 0) + '</b></td></tr>';
+          '<td><b>' + esc(c.company_code) + '</b></td>' + cell(c.ein) + '<td>' + esc(c.company_name) + '</td>' +
+          cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) +
+          '<td>' + statusHtml + '</td></tr>';
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
@@ -1583,10 +1582,8 @@ function viewAdminCompanies() {
         '<label><input type="radio" name="cfilter" value="termed"> Termed</label> ' +
         '<label><input type="radio" name="cfilter" value="all"> All</label></p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
-        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>Company Name</th><th>Status</th>' +
-        '<th colspan="2">Last Payroll</th><th colspan="2">Invoices outstanding</th></tr>' +
-        '<tr><th></th><th></th><th></th><th></th><th></th>' +
-        '<th>Total</th><th>Enrolled</th><th>Invoices</th><th>Total amount</th></tr></thead>' +
+        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>EIN</th><th>Company Name</th>' +
+        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th></tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>',
         '#/admin/companies'));
       function applyCompanyFilter() {
@@ -1689,7 +1686,7 @@ function parseCSV(text) {
 
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
-  companies: 'parent_code, parent_name, company_code, company_name, company_status (optional: ACTIVE, TERMED, or PENDING; blank leaves the current status unchanged; the old active Yes/No column still works). Headers are case-insensitive.',
+  companies: 'parent_code, parent_name, company_code, ein, company_name, company_address_1, company_city, company_state, company_zip, company_status. Only company_code and company_name are required; blank cells leave the current values unchanged (company_status: ACTIVE, TERMED, or PENDING; the old active Yes/No column still works). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code (required), company_name, ein, payroll_date (YYYY-MM-DD), payroll_end_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD), bill_type (F or S), bill_mode',
   commissions: 'One line per steward OR one line per company (auto-detected): steward_id then repeating company_code,pct pairs - or company_code then repeating steward_id,pct pairs (e.g. 1001,155026,37.5,153909,25). Percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'

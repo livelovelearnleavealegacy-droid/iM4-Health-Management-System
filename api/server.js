@@ -263,6 +263,11 @@ async function migrate() {
     ['stewards', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'company_status', "TEXT NOT NULL DEFAULT 'ACTIVE'"],
+    ['companies', 'ein', 'TEXT'],
+    ['companies', 'address_1', 'TEXT'],
+    ['companies', 'city', 'TEXT'],
+    ['companies', 'state', 'TEXT'],
+    ['companies', 'zip', 'TEXT'],
     ['companies', 'github_issue_number', 'INT'],
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
@@ -2919,7 +2924,9 @@ app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
 
 // ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
 // stewards:    steward_id, email, first_name, last_name, phone, password (everyone imported is a steward)
-// companies:   parent_code, parent_name, company_code, company_name
+// companies:   parent_code, parent_name, company_code, ein, company_name,
+//               company_address_1, company_city, company_state, company_zip,
+//               company_status
 // assignments: steward_id, company_code
 // Date values: accept YYYY-MM-DD or an Excel serial number (days since 1899-12-30).
 function toISODate(v) {
@@ -3019,12 +3026,18 @@ function validateImport(type, rows) {
         else if (av === 'pending') status = 'PENDING';
         else { e('active must be Yes/No (got "' + row.active + '")'); return; }
       }
+      const txt = function (v) { return v !== undefined && v !== null && String(v).trim() !== '' ? String(v).trim() : null; };
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
         ee_company_code: parentCode ? String(parentCode).trim() : null,
         ee_company_name: parentName ? String(parentName).trim() : null,
         company_status: status,
-        active: status === null ? null : (status !== 'TERMED')
+        active: status === null ? null : (status !== 'TERMED'),
+        ein: txt(row.ein),
+        address_1: txt(row.company_address_1 || row.address_1 || row['address 1'] || row['company address 1']),
+        city: txt(row.company_city || row.city),
+        state: txt(row.company_state || row.state),
+        zip: txt(row.company_zip || row.zip || row.zipcode)
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
@@ -3110,21 +3123,27 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     } else if (type === 'companies') {
       for (const c of v.valid) {
         try {
+          const detailSets =
+            'ein = COALESCE(EXCLUDED.ein, companies.ein), ' +
+            'address_1 = COALESCE(EXCLUDED.address_1, companies.address_1), ' +
+            'city = COALESCE(EXCLUDED.city, companies.city), ' +
+            'state = COALESCE(EXCLUDED.state, companies.state), ' +
+            'zip = COALESCE(EXCLUDED.zip, companies.zip)';
           if (c.company_status === null || c.company_status === undefined) {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name) ' +
-              'VALUES ($1,$2,$3,$4) ' +
+              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, ein, address_1, city, state, zip) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
-              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name',
-              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name]);
+              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' + detailSets,
+              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.ein, c.address_1, c.city, c.state, c.zip]);
           } else {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, company_status, active) ' +
-              'VALUES ($1,$2,$3,$4,$5,$6) ' +
+              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, company_status, active, ein, address_1, city, state, zip) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
               'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
-              'company_status = EXCLUDED.company_status, active = EXCLUDED.active',
-              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.company_status, c.active]);
+              'company_status = EXCLUDED.company_status, active = EXCLUDED.active, ' + detailSets,
+              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.company_status, c.active, c.ein, c.address_1, c.city, c.state, c.zip]);
           }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
@@ -3173,9 +3192,10 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       headers = ['steward_id', 'email', 'first_name', 'last_name', 'phone'];
       rows = (await db.query('SELECT id AS steward_id, email, first_name, last_name, phone FROM stewards ORDER BY id')).rows;
     } else if (type === 'companies') {
-      headers = ['parent_code', 'parent_name', 'company_code', 'company_name', 'company_status'];
+      headers = ['parent_code', 'parent_name', 'company_code', 'ein', 'company_name', 'company_address_1', 'company_city', 'company_state', 'company_zip', 'company_status'];
       rows = (await db.query(
-        "SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, company_name, " +
+        "SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, ein, company_name, " +
+        "address_1 AS company_address_1, city AS company_city, state AS company_state, zip AS company_zip, " +
         "COALESCE(company_status, CASE WHEN active = FALSE THEN 'TERMED' ELSE 'ACTIVE' END) AS company_status " +
         'FROM companies ORDER BY company_code')).rows;
     } else if (type === 'assignments') {
