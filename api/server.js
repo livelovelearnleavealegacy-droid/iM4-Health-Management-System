@@ -3491,10 +3491,10 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 });
 
 // Commissions page data: one entry per company with its stewards and percentages.
-app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, res) => {
+app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT co.company_code, co.company_name, c.steward_code, c.pct, ' +
+      'SELECT co.company_code, co.company_name, co.ein, c.steward_code, c.pct, ' +
       's.first_name, s.last_name, s.email ' +
       'FROM companies co ' +
       'LEFT JOIN commissions c ON c.company_code = co.company_code ' +
@@ -3508,6 +3508,7 @@ app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, r
         byCompany[code] = {
           company_code: code,
           company_name: row.company_name || code,
+          ein: row.ein || '',
           stewards: []
         };
         order.push(code);
@@ -3523,6 +3524,65 @@ app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, r
     res.json(order.map(function (code) { return byCompany[code]; }));
   } catch (error) {
     console.error('Commissions by company error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ------------------------------------------------- v5.51: save one company's commissions (Commissions page editor)
+// Admin + Onboarding only (Top Dog views only). Body: { entries:
+// [{ steward_code, pct }] } with pct as a DECIMAL (0.125 = 12.5%), the
+// sheet convention. The entries must total 100% (stored units) or the
+// save is refused; an empty entries list clears the company's
+// commissions. Company code, name, and EIN are NOT editable here - they
+// are driven by the Companies page.
+app.put('/api/admin/commissions/:code', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const db = getPool();
+    const co = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (!co.rows.length) return res.status(404).json({ error: 'Company not found' });
+    const entries = (req.body && Array.isArray(req.body.entries)) ? req.body.entries : null;
+    if (!entries) return res.status(400).json({ error: 'entries array is required' });
+    const cleaned = [];
+    const seenStewards = {};
+    for (const e of entries) {
+      const sid = parseInt(String(e && e.steward_code !== undefined ? e.steward_code : '').trim(), 10);
+      const dec = parseFloat(e && e.pct);
+      if (isNaN(sid) || sid <= 0) return res.status(400).json({ error: 'Every agent row needs a valid Steward ID.' });
+      if (isNaN(dec) || dec <= 0 || dec > 1) return res.status(400).json({ error: 'Every % must be a decimal above 0 and at most 1 (for example 0.125 for 12.5%).' });
+      if (seenStewards[sid]) return res.status(400).json({ error: 'Steward ' + sid + ' is listed twice - combine their share into one row.' });
+      seenStewards[sid] = true;
+      cleaned.push({ steward_code: sid, pct: Math.round(dec * 100 * 10000) / 10000 });
+    }
+    if (cleaned.length > 0) {
+      const total = cleaned.reduce(function (a, x) { return a + x.pct; }, 0);
+      if (Math.abs(total - 100) > 0.01) {
+        return res.status(400).json({ error: 'The % column must add up to 100% before this can be saved. It currently adds up to ' + (Math.round(total * 100) / 100) + '%.' });
+      }
+      const ids = cleaned.map(function (x) { return x.steward_code; });
+      const found = await db.query('SELECT id FROM stewards WHERE id = ANY($1)', [ids]);
+      const foundSet = {};
+      found.rows.forEach(function (r) { foundSet[r.id] = true; });
+      const missing = ids.filter(function (id) { return !foundSet[id]; });
+      if (missing.length) return res.status(400).json({ error: 'Steward ID(s) not on the steward list: ' + missing.join(', ') + '.' });
+    }
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM commissions WHERE company_code = $1', [code]);
+      for (const x of cleaned) {
+        await client.query('INSERT INTO commissions (company_code, steward_code, pct) VALUES ($1, $2, $3)', [code, x.steward_code, x.pct]);
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, company_code: code, entries: cleaned.length });
+  } catch (error) {
+    console.error('Save commissions error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

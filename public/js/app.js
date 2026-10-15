@@ -234,10 +234,10 @@ function navLinks() {
   }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/companies', 'Companies']);
+    links.push(['#/admin/commissions', 'Commissions']);
   }
   if (role === 'admin' || role === 'top_dog') {
     links.push(['#/admin/assignments', 'Assignments']);
-    links.push(['#/admin/commissions', 'Commissions']);
   }
   if (role === 'admin') {
     links.push(['#/admin/jobs', 'Jobs']);
@@ -1176,18 +1176,21 @@ function viewAdminStewards() {
 function viewAdminCommissions() {
   requireUser(function () {
     var ar = activeRole();
-    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
+    if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
+    var canEdit = ar === 'admin' || ar === 'onboarding';
     var q = '';
+    var SLOTS = 7;
     function fmtDec(p) { return String(Math.round((Number(p) / 100) * 1000000) / 1000000); }
+    function fmtTotal(sum) { return String(Math.round(sum * 100) / 100) + '%'; }
     function load() {
       api.get('/api/admin/commissions-by-company').then(function (list) {
-        var maxPairs = 0;
-        list.forEach(function (c) { maxPairs = Math.max(maxPairs, c.stewards.length); });
-        var head = '<tr><th>COMPANY_CODE</th>';
-        for (var i = 0; i < maxPairs; i++) {
+        var byCode = {};
+        list.forEach(function (c) { byCode[c.company_code] = c; });
+        var head = '<tr><th>COMPANY_CODE</th><th>COMPANY_NAME</th><th>EIN</th>';
+        for (var i = 0; i < SLOTS; i++) {
           head += '<th>' + (i === 0 ? 'WRITING AGENT #1' : 'AGENT #' + (i + 1)) + '</th><th>#' + (i + 1) + ' %</th>';
         }
-        head += '</tr>';
+        head += '<th>Total %</th>' + (canEdit ? '<th></th>' : '') + '</tr>';
         var ql = q.toLowerCase();
         var rows = list.filter(function (c) {
           if (!ql) return true;
@@ -1199,8 +1202,8 @@ function viewAdminCommissions() {
           }
           return false;
         }).map(function (c) {
-          var cells = '<td><b>' + esc(c.company_code) + '</b></td>';
-          for (var i = 0; i < maxPairs; i++) {
+          var cells = '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td><td>' + esc(c.ein || '') + '</td>';
+          for (var i = 0; i < SLOTS; i++) {
             var s = c.stewards[i];
             if (s) {
               cells += '<td>' + esc(s.steward_code + (s.name ? ' - ' + s.name : '')) + '</td><td>' + esc(fmtDec(s.pct)) + '</td>';
@@ -1208,10 +1211,33 @@ function viewAdminCommissions() {
               cells += '<td></td><td></td>';
             }
           }
+          var sum = c.stewards.reduce(function (a, s) { return a + Number(s.pct); }, 0);
+          var totalCell;
+          if (c.stewards.length === 0) totalCell = '<td class="muted">&mdash;</td>';
+          else if (Math.abs(sum - 100) <= 0.01) totalCell = '<td style="color:#137333;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
+          else totalCell = '<td style="color:#b3261e;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
+          cells += totalCell;
+          if (canEdit) cells += '<td><button class="btn btn-small" data-editcm="' + esc(c.company_code) + '">Edit</button></td>';
           return '<tr>' + cells + '</tr>';
         }).join('');
+        var slotRow = function (i) {
+          return '<div class="form-inline" style="margin-bottom:6px;">' +
+            '<label>Agent #' + (i + 1) + ' Steward ID<br><input id="cm-s-' + i + '" type="text" size="10"></label> ' +
+            '<span id="cm-n-' + i + '" class="muted" style="min-width:180px;"></span> ' +
+            '<label>% (decimal)<br><input id="cm-p-' + i + '" type="text" size="8" placeholder="0.125"></label></div>';
+        };
+        var slotRows = '';
+        for (var si2 = 0; si2 < SLOTS + 3; si2++) slotRows += slotRow(si2);
+        var editor =
+          '<div class="card" id="cm-editor" style="display:none;"><div class="card-title" id="cm-title">Edit Commissions</div>' +
+          '<p class="muted" id="cm-co-line"></p>' + slotRows +
+          '<p id="cm-total-line" style="font-weight:bold;"></p>' +
+          '<div id="cm-out"></div>' +
+          '<button class="btn btn-primary" id="cm-save">Save</button> ' +
+          '<button class="btn" id="cm-cancel">Cancel</button></div>';
         render(shell(
           '<h2>Commissions</h2>' + filterBar(q, '') +
+          (canEdit ? editor : '') +
           '<div class="table-scroll"><table class="data-table"><thead>' + head + '</thead>' +
           '<tbody>' + rows + '</tbody></table></div>',
           '#/admin/commissions'));
@@ -1219,6 +1245,104 @@ function viewAdminCommissions() {
         fq.onchange = function () { q = fq.value; load(); };
         fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
         fq.oninput = function () { q = fq.value; load(); };
+        if (canEdit) {
+          var stewardNames = {};
+          api.get('/api/admin/stewards').then(function (sts) {
+            sts.forEach(function (s) {
+              stewardNames[s.id] = ((s.first_name || '') + ' ' + (s.last_name || '')).trim() || s.email || '';
+            });
+          }).catch(function () {});
+          var editingCode = null;
+          var editorEl = document.getElementById('cm-editor');
+          var slotCount = SLOTS;
+          function readSlots() {
+            var entries = [];
+            var bad = [];
+            for (var i = 0; i < slotCount; i++) {
+              var sidRaw = document.getElementById('cm-s-' + i).value.trim();
+              var pctRaw = document.getElementById('cm-p-' + i).value.trim();
+              if (!sidRaw && !pctRaw) continue;
+              var sid = parseInt(sidRaw, 10);
+              var dec = parseFloat(pctRaw);
+              if (isNaN(sid) || sid <= 0 || isNaN(dec)) { bad.push(i + 1); continue; }
+              entries.push({ steward_code: sid, pct: dec, slot: i + 1 });
+            }
+            return { entries: entries, bad: bad };
+          }
+          function refreshTotal() {
+            var r = readSlots();
+            var totalLine = document.getElementById('cm-total-line');
+            var saveBtn = document.getElementById('cm-save');
+            var sumDec = r.entries.reduce(function (a, x) { return a + x.pct; }, 0);
+            var sumPct = Math.round(sumDec * 10000) / 100;
+            var seen = {};
+            var dup = false;
+            r.entries.forEach(function (x) { if (seen[x.steward_code]) dup = true; seen[x.steward_code] = true; });
+            r.entries.forEach(function (x) {
+              var hint = document.getElementById('cm-n-' + (x.slot - 1));
+              if (hint) {
+                if (stewardNames[x.steward_code]) { hint.textContent = stewardNames[x.steward_code]; hint.style.color = ''; }
+                else { hint.textContent = 'not on the steward list'; hint.style.color = '#b3261e'; }
+              }
+            });
+            if (r.entries.length === 0 && r.bad.length === 0) {
+              totalLine.textContent = 'All rows are blank - saving clears this company\'s commissions.';
+              totalLine.style.color = '';
+              saveBtn.disabled = false;
+            } else if (r.bad.length) {
+              totalLine.textContent = 'Row(s) ' + r.bad.join(', ') + ' need both a Steward ID and a %.';
+              totalLine.style.color = '#b3261e';
+              saveBtn.disabled = true;
+            } else if (dup) {
+              totalLine.textContent = 'The same steward is listed twice - combine their share into one row.';
+              totalLine.style.color = '#b3261e';
+              saveBtn.disabled = true;
+            } else {
+              totalLine.textContent = 'Total: ' + sumPct + '%' + (Math.abs(sumDec - 1) <= 0.0001 ? ' - ready to save.' : ' - must equal 100% to save.');
+              totalLine.style.color = Math.abs(sumDec - 1) <= 0.0001 ? '#137333' : '#b3261e';
+              saveBtn.disabled = Math.abs(sumDec - 1) > 0.0001;
+            }
+          }
+          function openEditor(c) {
+            editingCode = c.company_code;
+            slotCount = Math.min(SLOTS + 3, Math.max(SLOTS, c.stewards.length));
+            for (var i = 0; i < SLOTS + 3; i++) {
+              var rowEl = document.getElementById('cm-s-' + i).closest('.form-inline');
+              rowEl.style.display = i < slotCount ? '' : 'none';
+              document.getElementById('cm-s-' + i).value = '';
+              document.getElementById('cm-p-' + i).value = '';
+              document.getElementById('cm-n-' + i).textContent = '';
+            }
+            c.stewards.forEach(function (s, i) {
+              document.getElementById('cm-s-' + i).value = s.steward_code;
+              document.getElementById('cm-p-' + i).value = fmtDec(s.pct);
+              document.getElementById('cm-n-' + i).textContent = s.name || '';
+            });
+            document.getElementById('cm-title').textContent = 'Edit Commissions - ' + c.company_code;
+            document.getElementById('cm-co-line').textContent = c.company_name + (c.ein ? ' - EIN ' + c.ein : '') + ' (company code, name, and EIN come from the Companies page and are not editable here). Enter each agent\'s Steward ID and their % as a decimal (0.125 = 12.5%). The % column must add up to 100% before you can save; Cancel always works.';
+            document.getElementById('cm-out').innerHTML = '';
+            editorEl.style.display = '';
+            editorEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            refreshTotal();
+          }
+          document.querySelectorAll('[data-editcm]').forEach(function (b) {
+            b.onclick = function () { openEditor(byCode[b.getAttribute('data-editcm')]); };
+          });
+          for (var ii = 0; ii < SLOTS + 3; ii++) {
+            document.getElementById('cm-s-' + ii).oninput = refreshTotal;
+            document.getElementById('cm-p-' + ii).oninput = refreshTotal;
+          }
+          document.getElementById('cm-cancel').onclick = function () { editorEl.style.display = 'none'; };
+          document.getElementById('cm-save').onclick = function () {
+            var out = document.getElementById('cm-out');
+            var r = readSlots();
+            var entries = r.entries.map(function (x) { return { steward_code: x.steward_code, pct: x.pct }; });
+            out.innerHTML = '<p class="muted">Saving...</p>';
+            api.put('/api/admin/commissions/' + encodeURIComponent(editingCode), { entries: entries })
+              .then(function () { viewAdminCommissions(); })
+              .catch(function (err) { out.innerHTML = errorHtml(err.message); });
+          };
+        }
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/commissions')); });
     }
     load();
