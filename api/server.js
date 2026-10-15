@@ -3052,7 +3052,9 @@ app.delete('/api/admin/companies/:code', requireAdmin, async (req, res) => {
 app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT a.id, a.steward_id, c.company_code, s.email AS steward_email ' +
+      "SELECT a.id, a.steward_id, c.company_code, c.company_name, s.email AS steward_email, " +
+      "CASE WHEN COALESCE(s.first_name, '') <> '' OR COALESCE(s.last_name, '') <> '' " +
+      "THEN TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) ELSE COALESCE(s.name, '') END AS steward_name " +
       'FROM assignments a JOIN stewards s ON s.id = a.steward_id JOIN companies c ON c.id = a.company_id ' +
       'ORDER BY a.steward_id, c.company_code');
     res.json(r.rows);
@@ -3062,7 +3064,7 @@ app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
+// ---------------------------------------------------------------- admin: import (bulk updates; stewards and companies also have page maintenance)
 // stewards:    steward_id, email, first_name, last_name, phone, password (everyone imported is a steward)
 // companies:   parent_code, parent_name, company_code, ein, company_name,
 //               company_address_1, company_city, company_state, company_zip,

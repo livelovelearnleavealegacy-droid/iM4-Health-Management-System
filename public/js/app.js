@@ -1717,50 +1717,18 @@ function viewAdminAssignments() {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     api.get('/api/admin/assignments').then(function (list) {
-      api.get('/api/admin/stewards').then(function (stewards) {
-        var rows = list.map(function (a) {
-          return '<tr data-sid="' + a.steward_id + '"><td><b>' + a.steward_id + '</b><div class="muted">' + esc(a.steward_email || '') + '</div></td>' +
-            '<td><b>' + esc(a.company_code) + '</b></td></tr>';
-        }).join('');
-        var opts = stewards.map(function (s) {
-          var label = s.id + ' — ' + esc(s.email || '');
-          return '<label style="display:block;white-space:nowrap;">' +
-            '<input type="checkbox" class="sidpick" value="' + s.id + '" checked> ' + label + '</label>';
-        }).join('');
-        render(shell(
-          '<h2>Assignments</h2>' +
-          '<p class="muted">Assignments are updated by CSV import only.</p>' +
-          '<h3>All Assignments (' + list.length + ')</h3>' +
-          '<div class="table-scroll" style="max-height:920px;overflow-y:auto;"><table class="data-table"><thead><tr><th>Steward ID</th><th>Company Code</th></tr></thead>' +
-          '<tbody id="assignrows">' + rows + '</tbody></table></div>' +
-          '<div class="card" style="margin-top:16px;"><div class="card-title">Filters</div>' +
-          '<div class="form-inline" style="align-items:flex-start;">' +
-          '<div><b>Stewards</b><br>' +
-          '<div style="max-height:180px;overflow-y:auto;border:1px solid var(--line);padding:6px 10px;min-width:220px;">' + opts + '</div></div> ' +
-          '<div><br><button class="btn btn-small" id="sidall">All</button> <button class="btn btn-small" id="sidnone">None</button></div>' +
-          '</div></div>',
-          '#/admin/assignments'));
-        function applySidFilter() {
-          var sel = {};
-          document.querySelectorAll('.sidpick:checked').forEach(function (c) { sel[c.value] = true; });
-          document.querySelectorAll('#assignrows tr').forEach(function (tr) {
-            tr.style.display = sel[tr.getAttribute('data-sid')] ? '' : 'none';
-          });
-        }
-        document.querySelectorAll('.sidpick').forEach(function (c) { c.onchange = applySidFilter; });
-        document.getElementById('sidall').onclick = function () {
-          document.querySelectorAll('.sidpick').forEach(function (c) { c.checked = true; });
-          applySidFilter();
-        };
-        document.getElementById('sidnone').onclick = function () {
-          document.querySelectorAll('.sidpick').forEach(function (c) { c.checked = false; });
-          applySidFilter();
-        };
-      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/assignments')); });
+      var rows = list.map(function (a) {
+        return '<tr><td><b>' + a.steward_id + '</b></td><td>' + esc(a.steward_name || '') + '</td>' +
+          '<td><b>' + esc(a.company_code) + '</b></td><td>' + esc(a.company_name || '') + '</td></tr>';
+      }).join('');
+      render(shell(
+        '<h2>Assignments</h2>' +
+        '<div class="table-scroll"><table class="data-table"><thead><tr><th>Steward ID</th><th>Steward Name</th><th>Company Code</th><th>Company Name</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>',
+        '#/admin/assignments'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/assignments')); });
   });
 }
-
 // ---------------------------------------------------------------- admin: import
 function parseCSV(text) {
   var lines = String(text).split(String.fromCharCode(10));
