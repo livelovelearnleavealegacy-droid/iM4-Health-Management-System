@@ -334,7 +334,7 @@ async function migrate() {
   await db.query('CREATE TABLE IF NOT EXISTS onboarding_documents (' +
     'id SERIAL PRIMARY KEY, ' +
     'client_id INT NOT NULL REFERENCES onboarding_clients(id) ON DELETE CASCADE, ' +
-    "doc_type TEXT NOT NULL CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake')), " +
+    "doc_type TEXT NOT NULL CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake', 'docusign_package')), " +
     'file_name TEXT NOT NULL, ' +
     'mime_type TEXT, ' +
     'file_data BYTEA NOT NULL, ' +
@@ -368,9 +368,21 @@ async function migrate() {
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'PRIMARY KEY (steward_id, doc_type))');
+  await db.query('ALTER TABLE onboarding_clients ADD COLUMN IF NOT EXISTS parent_code TEXT');
+  await db.query('ALTER TABLE onboarding_clients ADD COLUMN IF NOT EXISTS parent_name TEXT');
+  await db.query('ALTER TABLE onboarding_clients ADD COLUMN IF NOT EXISTS wizard_step INT');
+  await db.query('ALTER TABLE onboarding_clients ADD COLUMN IF NOT EXISTS companies_json TEXT');
+  await db.query('CREATE TABLE IF NOT EXISTS company_documents (' +
+    'company_code TEXT PRIMARY KEY, ' +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query('ALTER TABLE onboarding_documents DROP CONSTRAINT IF EXISTS onboarding_documents_doc_type_check');
   await db.query("ALTER TABLE onboarding_documents ADD CONSTRAINT onboarding_documents_doc_type_check " +
-    "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake'))");
+    "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake', 'docusign_package'))");
   // v5.29: ticket system tables.
   await db.query('CREATE TABLE IF NOT EXISTS tickets (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -3035,7 +3047,7 @@ function companyFieldErrors(v) {
   return errs;
 }
 
-app.post('/api/admin/companies', requireAdminOrOnboarding, async (req, res) => {
+app.post('/api/admin/companies', requireAdmin, async (req, res) => {
   try {
     const v = companyFieldValues(req.body || {});
     const errs = companyFieldErrors(v);
@@ -3061,8 +3073,12 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
     const errs = companyFieldErrors(v);
     if (errs.length) return res.status(400).json({ error: errs.join(' ') });
     const db = getPool();
-    const cur = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    const cur = await db.query('SELECT company_code, parent_company_code, ee_company_code FROM companies WHERE company_code = $1', [code]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Company not found' });
+    const curParent = (cur.rows[0].parent_company_code || cur.rows[0].ee_company_code || '');
+    if (v.parent_code !== curParent && (!req.user || req.user.activeRole !== 'admin')) {
+      return res.status(403).json({ error: 'Only an Admin can change a Parent Code.' });
+    }
     const codeChange = v.company_code !== code;
     if (codeChange) {
       if (!req.user || req.user.activeRole !== 'admin') {
@@ -3129,6 +3145,81 @@ app.delete('/api/admin/companies/:code', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: assignments (read-only list; import only)
+// ------------------------------------------- commission schedule documents (v6.0)
+// One stored Commission Schedule per company (company_documents). Uploading
+// one reads it and pre-populates that company's stewards and percentages.
+// Admin + Onboarding only, matching the Commissions page editor.
+app.get('/api/admin/companies/commission-schedules-status', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT company_code, file_name FROM company_documents ORDER BY company_code');
+    const map = {};
+    r.rows.forEach(function (x) { map[x.company_code] = x.file_name; });
+    res.json(map);
+  } catch (error) { console.error('Schedule status error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/admin/companies/:code/commission-schedule', requireAdminOrOnboarding, handleUpload('file'), async (req, res) => {
+  const db = getPool();
+  const client = await db.connect();
+  try {
+    const code = String(req.params.code || '').trim();
+    const co = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (!co.rows.length) { client.release(); return res.status(404).json({ error: 'Company not found' }); }
+    if (!req.file) { client.release(); return res.status(400).json({ error: 'A file is required' }); }
+    let parsed;
+    try { parsed = parseCommissionSchedule(req.file.buffer); }
+    catch (e) { client.release(); return res.status(400).json({ error: 'Could not read that file as a Commission Schedule: ' + e.message }); }
+    const mine = parsed.rows.filter(function (r) { return String(r.company_code) === code; });
+    const fileCompanies = {};
+    parsed.rows.forEach(function (r) { fileCompanies[String(r.company_code)] = true; });
+    const blockers = parsed.errors.filter(function (e) {
+      if (e.indexOf('Company ' + code + ':') === 0) return true;
+      return Object.keys(fileCompanies).length <= 1;
+    });
+    if (blockers.length) { client.release(); return res.status(400).json({ error: blockers[0] }); }
+    if (!mine.length) { client.release(); return res.status(400).json({ error: 'That file has no commission rows for company ' + code + '. Nothing was changed.' }); }
+    const stMap = {};
+    (await db.query('SELECT id FROM stewards')).rows.forEach(function (x) { stMap[String(x.id)] = true; });
+    const unknown = mine.map(function (r) { return String(r.steward_code); }).filter(function (sid) { return !stMap[sid]; });
+    if (unknown.length) { client.release(); return res.status(400).json({ error: 'Steward ID(s) not on the Stewards table: ' + unknown.join(', ') + '. Add the steward first, then upload again.' }); }
+    await client.query('BEGIN');
+    await client.query(
+      'INSERT INTO company_documents (company_code, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5) ' +
+      'ON CONFLICT (company_code) DO UPDATE SET file_name = EXCLUDED.file_name, mime_type = EXCLUDED.mime_type, file_data = EXCLUDED.file_data, uploaded_by = EXCLUDED.uploaded_by, updated_at = NOW()',
+      [code, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    await client.query('DELETE FROM commissions WHERE company_code = $1', [code]);
+    for (const r of mine) {
+      await client.query('INSERT INTO commissions (company_code, steward_code, pct) VALUES ($1, $2, $3)', [code, parseInt(r.steward_code, 10), r.pct]);
+    }
+    await client.query('COMMIT');
+    client.release();
+    res.json({ ok: true, entries: mine.length, file_name: req.file.originalname });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    client.release();
+    console.error('Schedule upload error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/admin/companies/:code/commission-schedule/download', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT file_name, mime_type, file_data FROM company_documents WHERE company_code = $1', [String(req.params.code || '').trim()]);
+    if (!r.rows.length) return res.status(404).json({ error: 'No Commission Schedule on file for this company' });
+    const f = r.rows[0];
+    res.set('Content-Type', f.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="' + String(f.file_name).replace(/"/g, '') + '"');
+    res.send(f.file_data);
+  } catch (error) { console.error('Schedule download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/admin/companies/:code/commission-schedule', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM company_documents WHERE company_code = $1', [String(req.params.code || '').trim()]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Schedule delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
@@ -4841,14 +4932,15 @@ async function typicalDurations(db) {
 
 // ---------------------------------------------------------------- onboarding workflow (v5.6)
 const ONBOARDING_DOC_TYPES = ['master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach'];
-const SINGLE_DOC_TYPES = ['master_application', 'pre_implementation', 'commission_sheet'];
+const SINGLE_DOC_TYPES = ['master_application', 'pre_implementation', 'commission_sheet', 'docusign_package'];
 const DOC_LABELS = {
   master_application: 'Master Application',
   pre_implementation: 'Pre-Implementation Form',
   commission_sheet: 'Commission Sheet',
   w9: 'W-9',
   ach: 'ACH Authorization',
-  soluta_billing_intake: 'Soluta Billing Intake Form'
+  soluta_billing_intake: 'Soluta Billing Intake Form',
+  docusign_package: 'DocuSign Package'
 };
 const GITHUB_ISSUES_OWNER = process.env.GITHUB_ISSUES_OWNER || 'im4health-implementation';
 const GITHUB_ISSUES_REPO = process.env.GITHUB_ISSUES_REPO || 'Implementation';
@@ -5546,6 +5638,260 @@ async function ghBoardAddCard(issueNodeId, statusName) {
 }
 
 // List clients with document and open-critical-issue counts.
+// ------------------------------------------- v6.0: onboarding process (Leroy's 5-step flow)
+// Step 1/2: a DocuSign package is uploaded and validated before anything
+// else can happen. Step 3: the Pre-Implementation Form yields the child
+// companies. Step 4: Submit writes the Companies table, then a Verify
+// pass checks commissions + stewards. Step 5: a GitHub card is opened.
+const US_STATES = { AL: 'ALABAMA', AK: 'ALASKA', AZ: 'ARIZONA', AR: 'ARKANSAS', CA: 'CALIFORNIA', CO: 'COLORADO', CT: 'CONNECTICUT', DE: 'DELAWARE', FL: 'FLORIDA', GA: 'GEORGIA', HI: 'HAWAII', ID: 'IDAHO', IL: 'ILLINOIS', IN: 'INDIANA', IA: 'IOWA', KS: 'KANSAS', KY: 'KENTUCKY', LA: 'LOUISIANA', ME: 'MAINE', MD: 'MARYLAND', MA: 'MASSACHUSETTS', MI: 'MICHIGAN', MN: 'MINNESOTA', MS: 'MISSISSIPPI', MO: 'MISSOURI', MT: 'MONTANA', NE: 'NEBRASKA', NV: 'NEVADA', NH: 'NEW HAMPSHIRE', NJ: 'NEW JERSEY', NM: 'NEW MEXICO', NY: 'NEW YORK', NC: 'NORTH CAROLINA', ND: 'NORTH DAKOTA', OH: 'OHIO', OK: 'OKLAHOMA', OR: 'OREGON', PA: 'PENNSYLVANIA', RI: 'RHODE ISLAND', SC: 'SOUTH CAROLINA', SD: 'SOUTH DAKOTA', TN: 'TENNESSEE', TX: 'TEXAS', UT: 'UTAH', VT: 'VERMONT', VA: 'VIRGINIA', WA: 'WASHINGTON', WV: 'WEST VIRGINIA', WI: 'WISCONSIN', WY: 'WYOMING', DC: 'DISTRICT OF COLUMBIA' };
+
+function dsNorm(s) { return String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+function dsHas(hay, needle) { const n = dsNorm(needle); return n.length >= 2 && dsNorm(hay).indexOf(n) !== -1; }
+function stateVariants(stateRaw) {
+  const up = String(stateRaw || '').toUpperCase().trim();
+  const out = [];
+  if (!up) return out;
+  if (US_STATES[up]) { out.push(up, US_STATES[up]); return out; }
+  Object.keys(US_STATES).forEach(function (abbr) { if (US_STATES[abbr] === up) out.push(abbr, up); });
+  if (!out.length) out.push(up);
+  return out;
+}
+
+// Value printed after a form label on the same extracted line, cut at the
+// next label so "City: X State: Y" style rows split correctly.
+const DS_NEXT_LABEL = /\s+(Address|City|State|Zip|ZIP Code|Phone|Telephone|Fax|Email|Signature|Date|Name|Number|Representative|Bank|Routing|Account|Client|Grantee|Tax ID)\s*:.*$/i;
+function dsField(lines, labelRe) {
+  for (const line of lines) {
+    const m = line.match(labelRe);
+    if (m) {
+      let v = line.slice(m.index + m[0].length).replace(/^[\s:\-–]+/, '').trim();
+      const cut = v.replace(DS_NEXT_LABEL, '').trim();
+      if (cut) v = cut;
+      if (v) return v;
+    }
+  }
+  return '';
+}
+
+function dsSigEvidence(pagesArr) {
+  const dateRe = /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b/i;
+  let sig = 0, dates = 0;
+  pagesArr.forEach(function (pg) {
+    pg.lines.forEach(function (l) {
+      if (/signature|signed by/i.test(l) && !/^(signature|signed|date)\s*:?\s*$/i.test(l.trim())) sig++;
+      if (dateRe.test(l)) dates++;
+    });
+  });
+  return { sig: sig, dates: dates };
+}
+
+// Validate one uploaded DocuSign package. pages = extractPdfLines output;
+// policyName = applicant name from the POLICYHOLDER INFORMATION block
+// (extractApplicantName) used as a cross-check source. Returns itemized
+// checks; passed = every check ok (Leroy: submission is blocked until
+// the verifications are confirmed).
+function validateDocusignPackage(pages, policyName) {
+  const checks = [];
+  const add = function (id, label, ok, detail) { checks.push({ id: id, label: label, ok: !!ok, detail: detail || '' }); };
+  const pageText = function (pg) { return pg.lines.join('\n'); };
+  const findStart = function (needles) {
+    for (let i = 0; i < pages.length; i++) {
+      const t = pageText(pages[i]);
+      for (const n of needles) if (dsHas(t, n)) return i;
+    }
+    return -1;
+  };
+  const fiaStart = findStart(['Fixed Indemnity']);
+  const msaStart = findStart(['Master Services Agreement']);
+  const achStart = findStart(['Authorization Agreement for Direct Payments', 'Direct Payments ACH']);
+  const starts = [fiaStart, msaStart, achStart].filter(function (x) { return x >= 0; }).sort(function (a, b) { return a - b; });
+  const section = function (start) {
+    if (start < 0) return [];
+    let end = pages.length;
+    starts.forEach(function (s) { if (s > start && s < end) end = s; });
+    return pages.slice(start, Math.min(end, start + 10));
+  };
+  add('includes_fia', 'Package includes the Group Benefits - Fixed Indemnity Application', fiaStart >= 0, fiaStart >= 0 ? 'Found on page ' + pages[fiaStart].page + '.' : 'No page mentions "Fixed Indemnity".');
+  add('includes_msa', 'Package includes the Master Services Agreement', msaStart >= 0, msaStart >= 0 ? 'Found on page ' + pages[msaStart].page + '.' : 'No page mentions "Master Services Agreement".');
+  add('includes_ach', 'Package includes the Authorization Agreement for Direct Payments (ACH)', achStart >= 0, achStart >= 0 ? 'Found on page ' + pages[achStart].page + '.' : 'No page mentions the Authorization Agreement for Direct Payments.');
+
+  // ---- Fixed Indemnity Application, first page
+  const applicant = { name: '', address: '', city: '', state: '', zip: '', phone: '' };
+  if (fiaStart >= 0) {
+    const first = pages[fiaStart].lines;
+    const sec = section(fiaStart);
+    applicant.name = dsField(first, /applicant\s*\/?\s*policyholder/i) || dsField(first, /policyholder/i) || policyName || '';
+    applicant.address = dsField(first, /(^|\s)address(?!\s*of)/i);
+    applicant.city = dsField(first, /\bcity\b/i);
+    applicant.state = dsField(first, /\bstate\b/i);
+    applicant.zip = dsField(first, /\bzip(\s*code)?\b/i);
+    if (!/\d{5}/.test(applicant.zip)) {
+      const zm = pageText(pages[fiaStart]).match(/\b\d{5}(-\d{4})?\b/);
+      applicant.zip = zm ? zm[0] : applicant.zip;
+    }
+    applicant.phone = dsField(first, /\b(phone|telephone)\b/i);
+    if (applicant.phone.replace(/\D/g, '').length < 7) {
+      const pm = pageText(pages[fiaStart]).match(/\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}/);
+      applicant.phone = pm ? pm[0] : applicant.phone;
+    }
+    add('fia_applicant', 'Application: Applicant/Policyholder is filled out', applicant.name.length >= 2, applicant.name ? 'Read: ' + applicant.name : 'No value found next to Applicant/Policyholder on the first page.');
+    add('fia_address', 'Application: Address is filled out', applicant.address.length >= 4, applicant.address ? 'Read: ' + applicant.address : 'No value found next to Address on the first page.');
+    add('fia_city', 'Application: City is filled out', applicant.city.length >= 2, applicant.city ? 'Read: ' + applicant.city : 'No value found next to City on the first page.');
+    add('fia_state', 'Application: State is filled out', applicant.state.length >= 2, applicant.state ? 'Read: ' + applicant.state : 'No value found next to State on the first page.');
+    add('fia_zip', 'Application: Zip Code is filled out', /\d{5}/.test(applicant.zip), applicant.zip ? 'Read: ' + applicant.zip : 'No 5-digit Zip Code found on the first page.');
+    add('fia_phone', 'Application: Phone Number is filled out', applicant.phone.replace(/\D/g, '').length >= 7, applicant.phone ? 'Read: ' + applicant.phone : 'No phone number found on the first page.');
+    const ev = dsSigEvidence(sec);
+    add('fia_signature', 'Application: signature and signature date present', ev.sig >= 1 && ev.dates >= 1, 'Found ' + ev.sig + ' signature line(s) and ' + ev.dates + ' date(s) in the Application section.');
+  }
+  // ---- Master Services Agreement
+  if (msaStart >= 0) {
+    const sec = section(msaStart);
+    const firstText = pageText(pages[msaStart]);
+    const titleAt = firstText.toUpperCase().indexOf('MASTER SERVICES AGREEMENT');
+    const preamble = titleAt >= 0 ? firstText.slice(titleAt, titleAt + 1800) : firstText.slice(0, 1800);
+    add('msa_blank1', 'Master Services Agreement: first blank matches the Applicant/Policyholder', applicant.name && dsHas(preamble, applicant.name), applicant.name ? (dsHas(preamble, applicant.name) ? 'The first paragraph names ' + applicant.name + '.' : applicant.name + ' does not appear in the first paragraph.') : 'No Applicant/Policyholder was read from the Application to compare against.');
+    const cityOk = applicant.city && dsHas(preamble, applicant.city);
+    const stateOk = stateVariants(applicant.state).some(function (v) { return dsHas(preamble, v); });
+    add('msa_blank2', 'Master Services Agreement: second blank at least matches the City and State', !!(cityOk && stateOk), 'City match: ' + (cityOk ? 'yes' : 'no') + '; State match: ' + (stateOk ? 'yes' : 'no') + ' (checked the first paragraph).');
+    const lastPage = sec.length ? [sec[sec.length - 1]] : [];
+    const ev2 = dsSigEvidence(lastPage);
+    add('msa_signatures', 'Master Services Agreement: signature and date in both signature blocks on the last page', ev2.sig >= 2 && ev2.dates >= 2, 'On the last page (page ' + (lastPage.length ? lastPage[0].page : '?') + '): ' + ev2.sig + ' signature line(s), ' + ev2.dates + ' date(s); two of each are required.');
+  }
+  // ---- Authorization Agreement for Direct Payments (ACH)
+  if (achStart >= 0) {
+    const sec = section(achStart);
+    const lines = [];
+    sec.forEach(function (pg) { pg.lines.forEach(function (l) { lines.push(l); }); });
+    const secText = sec.map(pageText).join('\n');
+    const gName = dsField(lines, /client\s*\/?\s*grantee\s*name/i) || dsField(lines, /grantee/i) || dsField(lines, /client\s*name/i);
+    add('ach_client', 'ACH Agreement: Client/Grantee Name is filled out', gName.length >= 2, gName ? 'Read: ' + gName : 'No value found next to Client/Grantee Name.');
+    let taxId = dsField(lines, /tax\s*id/i);
+    if (!/\d{2}-\d{7}|\d{9}/.test(taxId)) { const tm = secText.match(/\b\d{2}-\d{7}\b/); taxId = tm ? tm[0] : taxId; }
+    add('ach_taxid', 'ACH Agreement: Tax ID Number is filled out', /\d{2}-\d{7}/.test(taxId) || /\d{9}/.test(taxId.replace(/\D/g, '')), taxId ? 'Read: ' + taxId : 'No Tax ID Number found.');
+    const rep = dsField(lines, /authorized\s*representative/i);
+    add('ach_rep', 'ACH Agreement: Authorized Representative is filled out', rep.length >= 2, rep ? 'Read: ' + rep : 'No value found next to Authorized Representative.');
+    const bank = dsField(lines, /bank\s*name/i) || dsField(lines, /name\s*of\s*bank/i) || dsField(lines, /financial\s*institution/i);
+    add('ach_bank', 'ACH Agreement: Bank Name is filled out', bank.length >= 2, bank ? 'Read: ' + bank : 'No value found next to Bank Name.');
+    let routing = dsField(lines, /routing/i).replace(/\D/g, '');
+    if (routing.length !== 9) { const rm = secText.replace(/[^0-9\n]/g, ' ').match(/\b\d{9}\b/); routing = rm ? rm[0] : routing; }
+    add('ach_routing', 'ACH Agreement: Routing Number is filled out (9 digits)', routing.length === 9, routing ? 'Read: ' + routing : 'No 9-digit routing number found.');
+    const acct = dsField(lines, /account\s*number/i).replace(/\D/g, '');
+    add('ach_account', 'ACH Agreement: Bank Account Number is filled out', acct.length >= 4, acct ? 'Read: account ending ' + acct.slice(-4) : 'No value found next to Account Number.');
+    const ev3 = dsSigEvidence(sec);
+    add('ach_signature', 'ACH Agreement: signature and signature date present', ev3.sig >= 1 && ev3.dates >= 1, 'Found ' + ev3.sig + ' signature line(s) and ' + ev3.dates + ' date(s) in the ACH section.');
+  }
+  return { checks: checks, passed: checks.every(function (c) { return c.ok; }), applicant: applicant };
+}
+
+async function nextParentCode(db) {
+  const r = await db.query("SELECT COALESCE(NULLIF(parent_company_code, ''), ee_company_code) AS pc FROM companies");
+  let max = 1000;
+  r.rows.forEach(function (x) {
+    const m = String(x.pc || '').match(/^PC(\d+)$/);
+    if (m) { const n = parseInt(m[1], 10); if (!isNaN(n) && n > max) max = n; }
+  });
+  return 'PC' + String(max + 1).padStart(4, '0');
+}
+async function nextCompanyCode(db) {
+  const r = await db.query("SELECT company_code FROM companies WHERE company_code ~ '^[0-9]+$'");
+  let max = 1000;
+  r.rows.forEach(function (x) { const n = parseInt(String(x.company_code), 10); if (!isNaN(n) && n > max) max = n; });
+  return max + 1;
+}
+
+// "123 Main St, Springfield, IL 62701" -> parts; best-effort, the whole
+// string stays in address_1 when the tail does not parse.
+function splitAddress(raw) {
+  const out = { address_1: '', city: '', state: '', zip: '' };
+  const s = String(raw || '').replace(/\s*\n\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  if (!s) return out;
+  const m = s.match(/^(.*?)[, ]+([A-Za-z .]+?)[, ]+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$/);
+  if (m) {
+    out.address_1 = m[1].replace(/,+$/, '').trim();
+    out.city = m[2].trim();
+    out.state = m[3];
+    out.zip = m[4];
+    return out;
+  }
+  const z = s.match(/(\d{5}(?:-\d{4})?)\s*$/);
+  if (z) out.zip = z[1];
+  out.address_1 = s;
+  return out;
+}
+
+// Companies a client's Pre-Implementation Form will create (Step 3/4).
+async function preImplCompanies(db, clientId) {
+  const d = await db.query("SELECT file_data FROM onboarding_documents WHERE client_id = $1 AND doc_type = 'pre_implementation' ORDER BY uploaded_at DESC LIMIT 1", [clientId]);
+  if (!d.rows.length) return { error: 'No Pre-Implementation Form has been uploaded yet.' };
+  let blocks;
+  try { blocks = extractPreImplEins(d.rows[0].file_data); }
+  catch (e) { return { error: 'Could not read the Pre-Implementation Form: ' + e.message }; }
+  let next = await nextCompanyCode(db);
+  const companies = [];
+  let skipped = 0;
+  blocks.forEach(function (b) {
+    if (!b.legalName) { skipped++; return; }
+    const parts = splitAddress(b.address);
+    companies.push({
+      company_code: String(next++).padStart(4, '0'),
+      ein: String(b.taxId || '').trim(),
+      company_name: String(b.legalName || '').trim(),
+      company_address_1: parts.address_1,
+      company_city: parts.city,
+      company_state: parts.state,
+      company_zip: parts.zip,
+      company_status: 'PENDING',
+      missing: [
+        !b.address ? 'Employer Address' : null,
+        !b.taxId ? 'Employer Tax ID (EIN)' : null,
+        !parts.city ? 'City (could not be separated from the address)' : null,
+        !parts.state ? 'State (could not be separated from the address)' : null,
+        !parts.zip ? 'Zip (could not be separated from the address)' : null
+      ].filter(Boolean)
+    });
+  });
+  const pp = blocks.map(function (b) { return b.payrollProvider; }).filter(Boolean)[0] || '';
+  return { companies: companies, skipped: skipped, payroll_provider: pp };
+}
+
+// Step 4 Verify: for each company created by this onboarding, the
+// commission schedule must be complete (100%) and every steward on it
+// must be on the Stewards table with required fields + W9 + ACH.
+async function runProcessVerify(db, client) {
+  const items = [];
+  let codes = [];
+  try { codes = JSON.parse(client.companies_json || '[]'); } catch (e) { codes = []; }
+  if (!codes.length) return { pass: false, items: [{ ok: false, text: 'No companies have been created yet - finish Step 3 and click Submit first.' }] };
+  let allOk = true;
+  for (const code of codes) {
+    const cr = await db.query('SELECT COALESCE(SUM(pct), 0) AS total, COUNT(*)::int AS n FROM commissions WHERE company_code = $1', [code]);
+    const total = parseFloat(cr.rows[0].total);
+    if (cr.rows[0].n === 0) { items.push({ ok: false, text: 'Company ' + code + ': no commission record yet - add it on the Commissions page.' }); allOk = false; continue; }
+    if (Math.abs(total - 100) > 0.01) { items.push({ ok: false, text: 'Company ' + code + ': commissions add up to ' + (Math.round(total * 100) / 100) + '%, not 100%.' }); allOk = false; continue; }
+    items.push({ ok: true, text: 'Company ' + code + ': commission schedule is complete (adds up to 100%).' });
+    const srs = await db.query('SELECT DISTINCT steward_code FROM commissions WHERE company_code = $1 ORDER BY steward_code', [code]);
+    for (const sr of srs.rows) {
+      const sid = sr.steward_code;
+      const st = await db.query('SELECT first_name, last_name, email FROM stewards WHERE id = $1', [sid]);
+      if (!st.rows.length) { items.push({ ok: false, text: 'Steward ' + sid + ' (company ' + code + ') is not on the Stewards table.' }); allOk = false; continue; }
+      const s = st.rows[0];
+      const missF = [];
+      if (!s.first_name) missF.push('First Name');
+      if (!s.last_name) missF.push('Last Name');
+      if (!s.email) missF.push('Email');
+      if (missF.length) { items.push({ ok: false, text: 'Steward ' + sid + ' is missing required field(s) on the Stewards page: ' + missF.join(', ') + '.' }); allOk = false; continue; }
+      const docs = await db.query('SELECT doc_type FROM steward_documents WHERE steward_id = $1', [sid]);
+      const have = docs.rows.map(function (x) { return x.doc_type; });
+      const missD = [];
+      if (have.indexOf('w9') === -1) missD.push('W9');
+      if (have.indexOf('ach') === -1) missD.push('ACH');
+      if (missD.length) { items.push({ ok: false, text: 'Steward ' + sid + ' (' + s.first_name + ' ' + s.last_name + ') is missing document(s): ' + missD.join(' and ') + ' - upload them on the Stewards page.' }); allOk = false; continue; }
+      items.push({ ok: true, text: 'Steward ' + sid + ' (' + s.first_name + ' ' + s.last_name + '): on the Stewards table, required fields filled, W9 and ACH uploaded.' });
+    }
+  }
+  return { pass: allOk, items: items };
+}
+
 app.get('/api/onboarding', requireOnboarder, async (req, res) => {
   try {
     const r = await getPool().query(
@@ -5606,7 +5952,7 @@ app.get('/api/onboarding/:id', requireOnboarder, async (req, res) => {
 app.post('/api/onboarding/:id/documents', requireOnboarder, handleUpload('file'), async (req, res) => {
   try {
     const docType = String(req.body.docType || '');
-    if (ONBOARDING_DOC_TYPES.indexOf(docType) === -1) return res.status(400).json({ error: 'Unknown document type' });
+    if (ONBOARDING_DOC_TYPES.indexOf(docType) === -1 && docType !== 'docusign_package') return res.status(400).json({ error: 'Unknown document type' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const db = getPool();
     const c = await db.query('SELECT id, status FROM onboarding_clients WHERE id = $1', [req.params.id]);
@@ -5712,6 +6058,154 @@ app.post('/api/admin/onboarding/:id/reopen', requireAdmin, async (req, res) => {
   } catch (error) { console.error('Onboarding reopen error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+
+// ------------------------------------------- onboarding process endpoints (v6.0)
+// Step 1: start a process (creates the onboarding record the wizard drives).
+app.post('/api/onboarding/process-start', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const ins = await db.query(
+      "INSERT INTO onboarding_clients (client_name, status, created_by, wizard_step) VALUES ('New Onboarding (DocuSign pending)', 'in_progress', $1, 1) RETURNING id",
+      [req.user.id]);
+    res.json({ ok: true, id: ins.rows[0].id });
+  } catch (error) { console.error('Process start error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Step 2: validate the uploaded DocuSign package. On a full pass the
+// Parent Code (highest + 1) and Parent Name (the Applicant/Policyholder)
+// are assigned and the process opens Step 3.
+app.post('/api/onboarding/:id/docusign-check', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ error: 'Not found' });
+    const client = c.rows[0];
+    const d = await db.query("SELECT file_data FROM onboarding_documents WHERE client_id = $1 AND doc_type = 'docusign_package' ORDER BY uploaded_at DESC LIMIT 1", [req.params.id]);
+    if (!d.rows.length) return res.status(400).json({ error: 'No DocuSign package has been uploaded yet.' });
+    let pages, policy;
+    try {
+      pages = await extractPdfLines(d.rows[0].file_data);
+      policy = await extractApplicantName(d.rows[0].file_data);
+    } catch (e) {
+      return res.status(400).json({ error: 'Could not read the uploaded PDF: ' + e.message });
+    }
+    const result = validateDocusignPackage(pages, policy.name);
+    if (result.passed) {
+      const parentCode = client.parent_code || await nextParentCode(db);
+      const parentName = result.applicant.name || client.parent_name || client.client_name;
+      await db.query('UPDATE onboarding_clients SET parent_code = $1, parent_name = $2, client_name = $2, wizard_step = CASE WHEN wizard_step IS NULL OR wizard_step < 3 THEN 3 ELSE wizard_step END WHERE id = $3',
+        [parentCode, parentName, req.params.id]);
+      return res.json({ ok: true, passed: true, checks: result.checks, applicant: result.applicant, parent_code: parentCode, parent_name: parentName });
+    }
+    res.json({ ok: true, passed: false, checks: result.checks, applicant: result.applicant });
+  } catch (error) { console.error('DocuSign check error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Step 3: preview the companies the Pre-Implementation Form will create.
+app.post('/api/onboarding/:id/preimpl-preview', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const out = await preImplCompanies(db, req.params.id);
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json({ ok: true, companies: out.companies, skipped: out.skipped });
+  } catch (error) { console.error('Pre-impl preview error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Step 4 Submit: write the companies to the Companies table (status
+// PENDING, under the assigned Parent Code/Name). Runs once.
+app.post('/api/onboarding/:id/process-submit-companies', requireOnboarder, async (req, res) => {
+  const db = getPool();
+  const client = await db.connect();
+  try {
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (!c.rows.length) { client.release(); return res.status(404).json({ error: 'Not found' }); }
+    const record = c.rows[0];
+    if (!record.parent_code || !record.parent_name) { client.release(); return res.status(400).json({ error: 'The DocuSign package has not been verified yet (Step 2).' }); }
+    if (record.companies_json) { client.release(); return res.status(400).json({ error: 'The companies for this onboarding were already submitted.' }); }
+    const out = await preImplCompanies(db, req.params.id);
+    if (out.error) { client.release(); return res.status(400).json({ error: out.error }); }
+    if (!out.companies.length) { client.release(); return res.status(400).json({ error: 'No EIN columns with a Legal Name of the Company were found in the Pre-Implementation Form.' }); }
+    const blocking = [];
+    out.companies.forEach(function (co) {
+      co.missing.forEach(function (m) {
+        if (m === 'Employer Address' || m === 'Employer Tax ID (EIN)') blocking.push(co.company_name + ': ' + m + ' is missing.');
+      });
+    });
+    if (blocking.length) { client.release(); return res.status(400).json({ error: 'Cannot submit yet. ' + blocking.join(' ') }); }
+    await client.query('BEGIN');
+    for (const co of out.companies) {
+      await client.query(
+        'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
+        'VALUES ($3, $4, $1, $2, $1, $2, $5, $6, $7, $8, $9, $10, TRUE)',
+        [record.parent_code, record.parent_name, co.company_code, co.company_name, co.ein, co.company_address_1, co.company_city, co.company_state, co.company_zip, co.company_status]);
+    }
+    await client.query('UPDATE onboarding_clients SET companies_json = $1, wizard_step = 4, payroll_provider = COALESCE(NULLIF($2, \'\'), payroll_provider) WHERE id = $3',
+      [JSON.stringify(out.companies.map(function (x) { return x.company_code; })), out.payroll_provider || '', req.params.id]);
+    await client.query('COMMIT');
+    client.release();
+    res.json({ ok: true, companies: out.companies });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    client.release();
+    console.error('Process submit companies error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Step 4 Verify button.
+app.post('/api/onboarding/:id/process-verify', requireOnboarder, async (req, res) => {
+  try {
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ error: 'Not found' });
+    const out = await runProcessVerify(db, c.rows[0]);
+    res.json({ ok: true, pass: out.pass, items: out.items });
+  } catch (error) { console.error('Process verify error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Step 5 Submit: open the GitHub Kanban card under Onboarding, named
+// for the Parent, with a summary of the account as a comment.
+app.post('/api/onboarding/:id/process-finish', requireOnboarder, async (req, res) => {
+  try {
+    const nl = String.fromCharCode(10);
+    const db = getPool();
+    const c = await db.query('SELECT * FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (!c.rows.length) return res.status(404).json({ error: 'Not found' });
+    const record = c.rows[0];
+    if (record.status !== 'in_progress') return res.status(400).json({ error: 'This onboarding has already been submitted.' });
+    const verify = await runProcessVerify(db, record);
+    if (!verify.pass) return res.status(400).json({ error: 'Verification has not passed yet.', items: verify.items });
+    if (!GITHUB_TOKEN) return res.status(500).json({ error: 'GitHub is not connected on the server' });
+    let codes = [];
+    try { codes = JSON.parse(record.companies_json || '[]'); } catch (e) { codes = []; }
+    const lines = [];
+    lines.push('Onboarding summary for ' + (record.parent_name || record.client_name));
+    lines.push('Parent Code: ' + (record.parent_code || ''));
+    lines.push('Parent Name: ' + (record.parent_name || record.client_name));
+    lines.push('Payroll provider: ' + (record.payroll_provider || 'TBD'));
+    lines.push('');
+    lines.push('Companies created (' + codes.length + '):');
+    for (const code of codes) {
+      const co = await db.query('SELECT company_name, ein FROM companies WHERE company_code = $1', [code]);
+      const name = co.rows.length ? co.rows[0].company_name : '';
+      const ein = co.rows.length ? (co.rows[0].ein || '') : '';
+      lines.push('- ' + code + ' - ' + name + (ein ? ' (EIN ' + ein + ')' : '') + ' - status PENDING');
+      const cm = await db.query('SELECT steward_code, pct FROM commissions WHERE company_code = $1 ORDER BY steward_code', [code]);
+      cm.rows.forEach(function (x) { lines.push('    Steward ' + x.steward_code + ': ' + x.pct + '%'); });
+    }
+    const summary = lines.join(nl);
+    const title = (record.parent_name || record.client_name) + '; ' + (record.payroll_provider || 'TBD') + '; Onboarding';
+    const issue = await ghCreateIssue(title, summary);
+    let commentOk = false, boardOk = false, boardError = '';
+    try { await postIssueComment(GITHUB_ISSUES_OWNER + '/' + GITHUB_ISSUES_REPO, issue.number, summary); commentOk = true; }
+    catch (e) { console.error('Summary comment failed:', e.message); }
+    try { await ghBoardAddCard(issue.node_id, 'Onboarding (IHIA)'); boardOk = true; }
+    catch (e) { boardError = e.message; console.error('Board add failed:', e.message); }
+    await db.query("UPDATE onboarding_clients SET status = 'complete', wizard_step = 5, initiated_at = NOW(), github_issue_number = $1, github_repo = $2 WHERE id = $3",
+      [issue.number, GITHUB_ISSUES_OWNER + '/' + GITHUB_ISSUES_REPO, req.params.id]);
+    res.json({ ok: true, issueNumber: issue.number, issueUrl: issue.html_url, boardOk: boardOk, boardError: boardError, commentOk: commentOk });
+  } catch (error) { console.error('Process finish error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+});
 
 // ---------------------------------------------------------------- blank forms library
 // The Forms tab stores blank forms (e.g. the Soluta Billing Intake Form)

@@ -1246,15 +1246,27 @@ function viewAdminCommissions() {
     var SLOTS = 7;
     function fmtDec(p) { return String(Math.round((Number(p) / 100) * 1000000) / 1000000); }
     function fmtTotal(sum) { return String(Math.round(sum * 100) / 100) + '%'; }
+    var schedStatus = {};
     function load() {
       api.get('/api/admin/commissions-by-company').then(function (list) {
+        if (canEdit) {
+          api.get('/api/admin/companies/commission-schedules-status').then(function (st) {
+            schedStatus = st || {};
+            renderList(list);
+          }).catch(function () { schedStatus = {}; renderList(list); });
+        } else {
+          renderList(list);
+        }
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/commissions')); });
+    }
+    function renderList(list) {
         var byCode = {};
         list.forEach(function (c) { byCode[c.company_code] = c; });
         var head = '<tr><th>COMPANY_CODE</th><th>COMPANY_NAME</th><th>EIN</th>';
         for (var i = 0; i < SLOTS; i++) {
           head += '<th>STEWARD #' + (i + 1) + '</th><th>#' + (i + 1) + ' %</th>';
         }
-        head += '<th>Total %</th>' + (canEdit ? '<th></th>' : '') + '</tr>';
+        head += '<th>Total %</th>' + (canEdit ? '<th>Commission Schedule</th><th>Edit</th>' : '') + '</tr>';
         var rows = list.map(function (c) {
           var cells = '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td><td>' + esc(c.ein || '') + '</td>';
           for (var i = 0; i < SLOTS; i++) {
@@ -1271,7 +1283,18 @@ function viewAdminCommissions() {
           else if (Math.abs(sum - 100) <= 0.01) totalCell = '<td style="color:#137333;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
           else totalCell = '<td style="color:#b3261e;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
           cells += totalCell;
-          if (canEdit) cells += '<td><button class="btn btn-small" data-editcm="' + esc(c.company_code) + '">Edit</button></td>';
+          if (canEdit) {
+            var sfn = schedStatus[c.company_code];
+            var sc = '<span style="white-space:nowrap;"><button class="btn btn-small" data-sched-up="' + esc(c.company_code) + '">' + (sfn ? 'Replace' : 'Upload') + '</button>';
+            if (sfn) {
+              sc += ' <button class="btn btn-small" data-sched-dl="' + esc(c.company_code) + '" data-fn="' + esc(sfn) + '">Download</button>' +
+                ' <button class="btn btn-small btn-danger" data-sched-del="' + esc(c.company_code) + '">Delete</button>';
+            }
+            sc += '</span>';
+            if (sfn) sc += '<div class="muted" style="font-size:11px;">' + esc(sfn) + '</div>';
+            cells += '<td>' + sc + '</td>';
+            cells += '<td><button class="btn btn-small" data-editcm="' + esc(c.company_code) + '">Edit</button></td>';
+          }
           return '<tr>' + cells + '</tr>';
         }).join('');
         var slotRow = function (i) {
@@ -1293,6 +1316,7 @@ function viewAdminCommissions() {
           '<h2>Commissions</h2>' +
           '<p class="muted">Companies appear as they are added to the Company table. Onboarding and Admin can edit Steward IDs and Percentages. No one can delete a company from this page.</p>' +
           (canEdit ? editor : '') +
+          '<div id="cm-sched-out"></div>' +
           '<div class="fullwidth"><table class="data-table commissions-table"><thead>' + head + '</thead>' +
           '<tbody>' + rows + '</tbody></table></div>',
           '#/admin/commissions'));
@@ -1379,6 +1403,52 @@ function viewAdminCommissions() {
           document.querySelectorAll('[data-editcm]').forEach(function (b) {
             b.onclick = function () { openEditor(byCode[b.getAttribute('data-editcm')]); };
           });
+          document.querySelectorAll('[data-sched-up]').forEach(function (b) {
+            b.onclick = function () {
+              var code = b.getAttribute('data-sched-up');
+              var out = document.getElementById('cm-sched-out');
+              var inp = document.createElement('input');
+              inp.type = 'file';
+              inp.onchange = function () {
+                if (!inp.files || !inp.files[0]) return;
+                out.innerHTML = '<p class="muted">Reading the Commission Schedule for ' + esc(code) + '...</p>';
+                var fd = new FormData();
+                fd.append('file', inp.files[0]);
+                uploadFile('/api/admin/companies/' + encodeURIComponent(code) + '/commission-schedule', fd).then(function (r) {
+                  out.innerHTML = '<p style="color:#137333;">Commission Schedule saved for ' + esc(code) + ' - ' + r.entries + ' steward(s) loaded from the file. Check the row, and use Edit if anything needs fixing.</p>';
+                  load();
+                }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+              };
+              inp.click();
+            };
+          });
+          document.querySelectorAll('[data-sched-dl]').forEach(function (b) {
+            b.onclick = function () {
+              var headers = {};
+              if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+              fetch('/api/admin/companies/' + encodeURIComponent(b.getAttribute('data-sched-dl')) + '/commission-schedule/download', { headers: headers }).then(function (resp) {
+                if (!resp.ok) throw new Error('Download failed');
+                return resp.blob();
+              }).then(function (blob) {
+                var url = URL.createObjectURL(blob);
+                var aEl = document.createElement('a');
+                aEl.href = url;
+                aEl.download = b.getAttribute('data-fn');
+                document.body.appendChild(aEl);
+                aEl.click();
+                setTimeout(function () { URL.revokeObjectURL(url); aEl.remove(); }, 500);
+              }).catch(function (err) { document.getElementById('cm-sched-out').innerHTML = errorHtml(err.message); });
+            };
+          });
+          document.querySelectorAll('[data-sched-del]').forEach(function (b) {
+            b.onclick = function () {
+              var code = b.getAttribute('data-sched-del');
+              if (!confirm('Delete the Commission Schedule file for company ' + code + '? The commission percentages in the row stay as they are.')) return;
+              api.delete('/api/admin/companies/' + encodeURIComponent(code) + '/commission-schedule')
+                .then(function () { load(); })
+                .catch(function (err) { document.getElementById('cm-sched-out').innerHTML = errorHtml(err.message); });
+            };
+          });
           for (var ii = 0; ii < SLOTS + 3; ii++) {
             document.getElementById('cm-s-' + ii).oninput = refreshTotal;
             document.getElementById('cm-p-' + ii).oninput = refreshTotal;
@@ -1394,7 +1464,6 @@ function viewAdminCommissions() {
               .catch(function (err) { out.innerHTML = errorHtml(err.message); });
           };
         }
-      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/commissions')); });
     }
     load();
   });
@@ -1744,9 +1813,9 @@ function viewAR() {
 // ---------------------------------------------------------------- admin: on-call schedule
 
 // ---------------------------------------------------------------- admin: companies (the 10 values, with maintenance)
-// Access (Leroy's instructions): Onboarding can add a Company and add (or
-// later update) all the fields (all fields required). Only an Admin can
-// delete a company. Top Dog views only.
+// Access (Leroy, v6.0): only an Admin can add a company, change a Parent
+// Code or Company Code, or delete a company. Onboarding edits the other
+// fields. Top Dog views only. Companies also arrive from Onboarding.
 function viewAdminCompanies() {
   requireUser(function () {
     var ar = activeRole();
@@ -1799,8 +1868,8 @@ function viewAdminCompanies() {
         '</div>';
       render(shell(
         '<h2>Companies</h2>' +
-        '<p class="muted">Onboarding can add a Company and add (or later update) all the fields (all fields required). Only an Admin can delete a company.</p>' +
-        (canMaintain ? '<p><button class="btn btn-primary" id="co-add">Add Company</button></p>' + editor : '') +
+        '<p class="muted">Only an Admin can add a company, change a Parent Code or Company Code, or delete a company. Onboarding can edit the other fields. Top Dog can view only. New accounts also arrive automatically from the Onboarding process, with Parent and Company Codes assigned.</p>' +
+        (isAdmin ? '<p><button class="btn btn-primary" id="co-add">Add Company</button></p>' : '') + (canMaintain ? editor : '') +
         '<p class="muted">' +
         'Show: <label><input type="radio" name="cfilter" value="active"> Active</label> ' +
         '<label><input type="radio" name="cfilter" value="pending"> Pending</label> ' +
@@ -1842,11 +1911,16 @@ function viewAdminCompanies() {
           document.getElementById('co-f-state').value = c ? (c.state || '') : '';
           document.getElementById('co-f-zip').value = c ? (c.zip || '') : '';
           document.getElementById('co-f-status').value = statusOf(c || {});
+          if (!isAdmin) {
+            document.getElementById('co-f-parent-code').disabled = true;
+            document.getElementById('co-f-code').disabled = true;
+          }
           document.getElementById('co-editor-out').innerHTML = '';
           editorEl.style.display = '';
           editorEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
-        document.getElementById('co-add').onclick = function () { openEditor(null); };
+        var coAddBtn = document.getElementById('co-add');
+        if (coAddBtn) coAddBtn.onclick = function () { openEditor(null); };
         document.getElementById('co-cancel').onclick = function () { editorEl.style.display = 'none'; };
         document.querySelectorAll('[data-edit]').forEach(function (b) {
           b.onclick = function () { openEditor(byCode[b.getAttribute('data-edit')]); };
@@ -3046,7 +3120,7 @@ function viewOnboarding() {
         return '<div class="ob-card"><div class="ob-card-head"><b>' + esc(c.client_name) + '</b>' + badge + '</div>' +
           '<div class="muted">' + c.doc_count + ' document(s) &middot; started ' + fmtDate(c.created_at) +
           (c.github_issue_number ? ' &middot; GitHub #' + c.github_issue_number : '') + '</div>' +
-          '<p><a class="btn btn-primary" href="#/onboarding/' + c.id + '">Open</a></p></div>';
+          '<p><a class="btn btn-primary" href="#/onboarding/' + (c.wizard_step ? 'process/' : '') + c.id + '">Open</a></p></div>';
       }
       render(shell(
         '<h2>Onboarding</h2><div id="err"></div>' +
@@ -3060,52 +3134,184 @@ function viewOnboarding() {
   });
 }
 
+function obCheckList(items) {
+  return '<ul style="list-style:none;padding-left:2px;">' + items.map(function (c) {
+    var label = c.label || c.text || '';
+    return '<li style="margin:4px 0;">' + (c.ok ? '<b style="color:#137333;">&#10003;</b>' : '<b style="color:#b3261e;">&#10007;</b>') + ' ' + esc(label) +
+      (c.detail ? '<br><span class="muted" style="margin-left:20px;">' + esc(c.detail) + '</span>' : '') + '</li>';
+  }).join('') + '</ul>';
+}
+
 function viewOnboardingNew() {
   requireUser(function () {
     if (!canOnboard()) { location.hash = '#/dashboard'; return; }
-    var masterFile = null;
+    var processId = null;
     render(shell(
       '<p><a href="#/onboarding">&larr; Onboarding</a></p>' +
-      '<h2>Add client</h2><div id="err"></div>' +
-      '<div class="card"><h3>Step 1: Upload the Master Application</h3>' +
-      '<p class="muted">Upload the signed Master Application PDF. We will read the Applicant/Policy Holder name from the POLICYHOLDER INFORMATION page.</p>' +
-      '<p><input type="file" id="obmaster" accept=".pdf"></p><div id="obparse"></div></div>' +
-      '<div class="card" id="obconfirm" style="display:none"><h3>Step 2: Confirm the client name</h3>' +
-      '<p><label>Client name<br><input type="text" id="obname" style="width:100%;max-width:420px"></label></p>' +
-      '<p><button class="btn btn-primary" id="obcreate">Lock in and create client</button></p><div id="obcerr"></div></div>',
-      '#/onboarding'));
-    document.getElementById('obmaster').onchange = function (e) {
-      var f = e.target.files[0];
-      if (!f) return;
-      masterFile = f;
-      document.getElementById('obparse').innerHTML = '<p class="muted">Reading the application...</p>';
-      var fd = new FormData();
-      fd.append('file', f);
-      uploadFile('/api/onboarding/parse-master', fd).then(function (d) {
-        var box = document.getElementById('obconfirm');
-        box.style.display = 'block';
-        document.getElementById('obname').value = d.suggestedName || '';
-        document.getElementById('obparse').innerHTML = d.suggestedName
-          ? '<p>Found client name' + (d.page ? ' on page ' + d.page : '') + ': <b>' + esc(d.suggestedName) + '</b>. Confirm or correct it below.</p>'
-          : '<p class="rag rag-yellow">Could not find the applicant name automatically. Type it below.</p>';
-      }).catch(function (err) {
-        document.getElementById('obparse').innerHTML = errorHtml(err.message);
-      });
+      '<h2>New Onboarding</h2><div id="err"></div>' +
+      '<div class="card"><h3>Step 1: Upload the DocuSign package</h3>' +
+      '<p class="muted">Upload the completed DocuSign package (PDF). It must contain the Group Benefits - Fixed Indemnity Application, the Master Services Agreement, and the Authorization Agreement for Direct Payments (ACH).</p>' +
+      '<p><input type="file" id="obpkg" accept=".pdf"></p>' +
+      '<p><button class="btn btn-primary" id="obgo">Upload and verify</button></p><div id="obout"></div></div>' +
+      '<div class="card" id="obstep2" style="display:none;"><h3>Step 2: Verification</h3><div id="obchecks"></div><div id="obparent"></div></div>',
+      '#/onboarding/new'));
+    function showErr(m) { document.getElementById('err').innerHTML = errorHtml(m); }
+    function runCheck() {
+      var out = document.getElementById('obout');
+      out.innerHTML = '<p class="muted">Verifying the package...</p>';
+      api.post('/api/onboarding/' + processId + '/docusign-check', {}).then(function (r) {
+        out.innerHTML = '';
+        var card = document.getElementById('obstep2');
+        card.style.display = '';
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        document.getElementById('obchecks').innerHTML = obCheckList(r.checks);
+        var p = document.getElementById('obparent');
+        if (r.passed) {
+          p.innerHTML = '<p style="color:#137333;"><b>All verifications passed.</b></p>' +
+            '<p>Parent Code: <b>' + esc(r.parent_code) + '</b><br>Parent Name: <b>' + esc(r.parent_name) + '</b> (the Applicant/Policyholder)</p>' +
+            '<p><button class="btn btn-primary" id="obcontinue">Continue to Step 3</button></p>';
+          document.getElementById('obcontinue').onclick = function () { location.hash = '#/onboarding/process/' + processId; };
+        } else {
+          p.innerHTML = '<p style="color:#b3261e;"><b>Submission is blocked until every check passes.</b> Delete this package and upload a corrected one.</p>' +
+            '<p><button class="btn btn-danger" id="obdelpkg">Delete this package</button></p>';
+          document.getElementById('obdelpkg').onclick = function () {
+            api.get('/api/onboarding/' + processId).then(function (c) {
+              var doc = (c.documents || []).filter(function (d) { return d.doc_type === 'docusign_package'; })[0];
+              if (!doc) { showErr('No package found to delete.'); return; }
+              api.delete('/api/onboarding/' + processId + '/documents/' + doc.id).then(function () {
+                document.getElementById('obstep2').style.display = 'none';
+                document.getElementById('obout').innerHTML = '<p class="muted">Package deleted. Choose the corrected DocuSign package above and upload again.</p>';
+              }).catch(function (e) { showErr(e.message); });
+            }).catch(function (e) { showErr(e.message); });
+          };
+        }
+      }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
+    }
+    document.getElementById('obgo').onclick = function () {
+      var f = document.getElementById('obpkg').files[0];
+      if (!f) { showErr('Choose the DocuSign package PDF first.'); return; }
+      var out = document.getElementById('obout');
+      out.innerHTML = '<p class="muted">Uploading...</p>';
+      function uploadAndCheck() {
+        var fd = new FormData();
+        fd.append('docType', 'docusign_package');
+        fd.append('file', f);
+        uploadFile('/api/onboarding/' + processId + '/documents', fd).then(runCheck)
+          .catch(function (e) { out.innerHTML = errorHtml(e.message); });
+      }
+      if (processId) { uploadAndCheck(); return; }
+      api.post('/api/onboarding/process-start', {}).then(function (r) {
+        processId = r.id;
+        uploadAndCheck();
+      }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
     };
-    document.getElementById('obcreate').onclick = function () {
-      var name = document.getElementById('obname').value.trim();
-      if (!name) { document.getElementById('obcerr').innerHTML = errorHtml('Client name is required.'); return; }
-      if (!masterFile) { document.getElementById('obcerr').innerHTML = errorHtml('Upload the Master Application first.'); return; }
-      var fd = new FormData();
-      fd.append('clientName', name);
-      fd.append('masterApp', masterFile);
-      document.getElementById('obcerr').innerHTML = '<p class="muted">Creating...</p>';
-      uploadFile('/api/onboarding', fd).then(function (c) {
-        location.hash = '#/onboarding/' + c.id;
-      }).catch(function (err) {
-        document.getElementById('obcerr').innerHTML = errorHtml(err.message);
-      });
-    };
+  });
+}
+
+function viewOnboardingProcess(id) {
+  requireUser(function () {
+    if (!canOnboard()) { location.hash = '#/dashboard'; return; }
+    function load() {
+      api.get('/api/onboarding/' + id).then(function (c) {
+        var parentLine = c.parent_code
+          ? '<p>Parent Code: <b>' + esc(c.parent_code) + '</b> &middot; Parent Name: <b>' + esc(c.parent_name || c.client_name) + '</b></p>'
+          : '<p class="muted">Parent not assigned yet - the DocuSign package has not passed verification.</p>';
+        var step2 = '<div class="card"><h3>Steps 1-2: DocuSign package</h3>' +
+          (c.wizard_step >= 3
+            ? '<p style="color:#137333;"><b>&#10003; Verified.</b> The package contains the Application, the Master Services Agreement, and the ACH Authorization, and the required fields, signatures, and dates checked out.</p>'
+            : '<p style="color:#b3261e;">Not verified yet. The package on file has not passed - delete it there and upload a corrected package from the <a href="#/onboarding/new">New Onboarding</a> page.</p>') + '</div>';
+        var codes = [];
+        try { codes = JSON.parse(c.companies_json || '[]'); } catch (e) { codes = []; }
+        var step3 = '';
+        if (c.wizard_step >= 3 && !codes.length && c.status === 'in_progress') {
+          step3 = '<div class="card"><h3>Step 3: Upload the Pre-Implementation Form</h3>' +
+            '<p class="muted">Upload the Pre-Implementation Form (Excel). Each EIN column with a Legal Name of the Company becomes a company under this Parent: Legal Name becomes the Company Name, the Employer Address becomes the Address, City, State, and Zip, and the Employer Tax ID becomes the EIN. Company Codes are assigned automatically - the highest existing code + 1.</p>' +
+            '<p><input type="file" id="obpre" accept=".xlsx,.xls,.csv"> <button class="btn" id="obpreup">Upload</button></p><div id="obpreout"></div>' +
+            '<p><button class="btn btn-primary" id="obanalyze">Analyze the form</button></p><div id="obpreview"></div></div>';
+        }
+        var step4 = '';
+        if (codes.length && c.status === 'in_progress') {
+          step4 = '<div class="card"><h3>Step 4: Steward Update and Commission Update</h3>' +
+            '<p>The companies are now on the Companies table with status PENDING: <b>' + codes.map(esc).join(', ') + '</b>. Complete both updates, in either order:</p>' +
+            '<p><b>Steward Update:</b> go to the <a href="#/admin/stewards">Stewards page</a> and confirm every steward on the commission schedule is on the Stewards table, with all required fields filled out and their W9 and ACH uploaded.</p>' +
+            '<p><b>Commission Update:</b> go to the <a href="#/admin/commissions">Commissions page</a> and add the commission record for each new company - upload the Commission Schedule on the company\'s row (it fills in the stewards and percentages for you), or click Edit and type them in. Each company must add up to 100%.</p>' +
+            '<p><button class="btn btn-primary" id="obverify">Verify</button></p><div id="obverifyout"></div></div>' +
+            '<div class="card" id="obstep5" style="display:none;"><h3>Step 5: Submit</h3>' +
+            '<p class="muted">Verification passed. Submitting opens a Kanban card in GitHub under Onboarding, named for the Parent, with a summary of the account in the comments.</p>' +
+            '<p><button class="btn btn-primary" id="obfinish">Submit</button></p><div id="obfinishout"></div></div>';
+        }
+        var done = '';
+        if (c.status === 'complete') {
+          done = '<div class="card"><h3>Submitted</h3><p>This onboarding is complete.' +
+            (c.github_issue_number ? ' GitHub card: <b>#' + c.github_issue_number + '</b> (' + esc(c.github_repo || '') + ').' : '') + '</p></div>';
+        }
+        render(shell(
+          '<p><a href="#/onboarding">&larr; Onboarding</a></p>' +
+          '<h2>Onboarding: ' + esc(c.parent_name || c.client_name) + '</h2><div id="err"></div>' +
+          parentLine + step2 + step3 + step4 + done,
+          '#/onboarding'));
+        var preUp = document.getElementById('obpreup');
+        if (preUp) preUp.onclick = function () {
+          var f = document.getElementById('obpre').files[0];
+          var out = document.getElementById('obpreout');
+          if (!f) { out.innerHTML = errorHtml('Choose the Pre-Implementation Form file first.'); return; }
+          var fd = new FormData();
+          fd.append('docType', 'pre_implementation');
+          fd.append('file', f);
+          out.innerHTML = '<p class="muted">Uploading...</p>';
+          uploadFile('/api/onboarding/' + id + '/documents', fd).then(function () {
+            out.innerHTML = '<p style="color:#137333;">Uploaded. Now click Analyze the form.</p>';
+          }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
+        };
+        var anBtn = document.getElementById('obanalyze');
+        if (anBtn) anBtn.onclick = function () {
+          var pv = document.getElementById('obpreview');
+          pv.innerHTML = '<p class="muted">Analyzing...</p>';
+          api.post('/api/onboarding/' + id + '/preimpl-preview', {}).then(function (r) {
+            if (!r.companies.length) { pv.innerHTML = errorHtml('No EIN columns with a Legal Name of the Company were found in that form.'); return; }
+            var rows = r.companies.map(function (co) {
+              return '<tr><td><b>' + esc(co.company_code) + '</b></td><td>' + esc(co.ein) + '</td><td>' + esc(co.company_name) + '</td><td>' + esc(co.company_address_1) + '</td><td>' + esc(co.company_city) + '</td><td>' + esc(co.company_state) + '</td><td>' + esc(co.company_zip) + '</td><td>' + esc(co.company_status) + '</td>' +
+                '<td>' + (co.missing.length ? '<span style="color:#b3261e;">Missing: ' + co.missing.map(esc).join('; ') + '</span>' : '<span style="color:#137333;">&#10003;</span>') + '</td></tr>';
+            }).join('');
+            var blocked = r.companies.some(function (co) { return co.missing.indexOf('Employer Address') !== -1 || co.missing.indexOf('Employer Tax ID (EIN)') !== -1; });
+            pv.innerHTML = '<div class="table-scroll"><table class="data-table"><thead><tr><th>Company Code</th><th>EIN</th><th>Company Name</th><th>Address</th><th>City</th><th>State</th><th>Zip</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+              (r.skipped ? '<p class="muted">' + r.skipped + ' EIN column(s) had no Legal Name and were skipped.</p>' : '') +
+              '<p><button class="btn btn-primary" id="obsubmit3"' + (blocked ? ' disabled' : '') + '>Submit - create these companies</button></p><div id="obsubmitout"></div>' +
+              (blocked ? '<p style="color:#b3261e;">Submit is blocked: a company is missing its Employer Address or Employer Tax ID. Fix the form, upload it again, and re-analyze.</p>' : '');
+            var sb = document.getElementById('obsubmit3');
+            if (sb) sb.onclick = function () {
+              var out = document.getElementById('obsubmitout');
+              out.innerHTML = '<p class="muted">Creating the companies...</p>';
+              api.post('/api/onboarding/' + id + '/process-submit-companies', {}).then(function () { load(); })
+                .catch(function (e) { out.innerHTML = errorHtml(e.message); });
+            };
+          }).catch(function (e) { pv.innerHTML = errorHtml(e.message); });
+        };
+        var vBtn = document.getElementById('obverify');
+        if (vBtn) vBtn.onclick = function () {
+          var out = document.getElementById('obverifyout');
+          out.innerHTML = '<p class="muted">Checking...</p>';
+          api.post('/api/onboarding/' + id + '/process-verify', {}).then(function (r) {
+            out.innerHTML = obCheckList(r.items);
+            if (r.pass) {
+              var s5 = document.getElementById('obstep5');
+              s5.style.display = '';
+              s5.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+          }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
+        };
+        var fBtn = document.getElementById('obfinish');
+        if (fBtn) fBtn.onclick = function () {
+          var out = document.getElementById('obfinishout');
+          out.innerHTML = '<p class="muted">Opening the GitHub card...</p>';
+          api.post('/api/onboarding/' + id + '/process-finish', {}).then(function (r) {
+            out.innerHTML = '<p style="color:#137333;"><b>Submitted.</b> GitHub card <a href="' + esc(r.issueUrl) + '" target="_blank" rel="noopener">#' + r.issueNumber + '</a> is open under Onboarding.</p>';
+            load();
+          }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
+        };
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/onboarding')); });
+    }
+    load();
   });
 }
 
@@ -3313,6 +3519,7 @@ function route() {
   if (pathParts[0] === 'onboarding') {
     if (!pathParts[1]) return viewOnboarding();
     if (pathParts[1] === 'new') return viewOnboardingNew();
+    if (pathParts[1] === 'process' && pathParts[2]) return viewOnboardingProcess(pathParts[2]);
     return viewOnboardingDetail(pathParts[1]);
   }
   if (pathParts[0] === 'project' && pathParts[1]) return viewProject(pathParts[1]);
