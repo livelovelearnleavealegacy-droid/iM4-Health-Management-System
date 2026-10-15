@@ -358,6 +358,16 @@ async function migrate() {
     'uploaded_by INT REFERENCES stewards(id), ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS steward_documents (' +
+    'steward_id INT NOT NULL REFERENCES stewards(id) ON DELETE CASCADE, ' +
+    "doc_type TEXT NOT NULL CHECK (doc_type IN ('w9', 'ach')), " +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'PRIMARY KEY (steward_id, doc_type))');
   await db.query('ALTER TABLE onboarding_documents DROP CONSTRAINT IF EXISTS onboarding_documents_doc_type_check');
   await db.query("ALTER TABLE onboarding_documents ADD CONSTRAINT onboarding_documents_doc_type_check " +
     "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake'))");
@@ -2602,6 +2612,63 @@ app.get('/api/admin/stewards', requireStewardsAccess, async (req, res) => {
   }
 });
 
+// ------------------------------------------- steward W9 / ACH documents
+// One stored file per steward per type, kept in steward_documents.
+// Admin + Onboarding only: Top Dog does not see these at all (the
+// Stewards page hides the columns for top_dog, and these endpoints
+// refuse the role too). Uploading replaces the file on file.
+app.get('/api/admin/stewards/documents-status', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT steward_id, doc_type, file_name FROM steward_documents ORDER BY steward_id, doc_type');
+    const map = {};
+    r.rows.forEach(function (x) {
+      if (!map[x.steward_id]) map[x.steward_id] = { w9: null, ach: null };
+      map[x.steward_id][x.doc_type] = x.file_name;
+    });
+    res.json(map);
+  } catch (error) { console.error('Steward documents status error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/admin/stewards/:id/documents/:type', requireAdminOrOnboarding, handleUpload('file'), async (req, res) => {
+  try {
+    const type = String(req.params.type || '');
+    if (type !== 'w9' && type !== 'ach') return res.status(400).json({ error: 'Document type must be w9 or ach' });
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: 'Invalid steward id' });
+    if (!req.file) return res.status(400).json({ error: 'A file is required' });
+    const db = getPool();
+    const st = await db.query('SELECT id FROM stewards WHERE id = $1', [id]);
+    if (!st.rows.length) return res.status(404).json({ error: 'Steward not found' });
+    await db.query(
+      'INSERT INTO steward_documents (steward_id, doc_type, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6) ' +
+      'ON CONFLICT (steward_id, doc_type) DO UPDATE SET file_name = EXCLUDED.file_name, mime_type = EXCLUDED.mime_type, file_data = EXCLUDED.file_data, uploaded_by = EXCLUDED.uploaded_by, updated_at = NOW()',
+      [id, type, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Steward document upload error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/admin/stewards/:id/documents/:type/download', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const type = String(req.params.type || '');
+    if (type !== 'w9' && type !== 'ach') return res.status(400).json({ error: 'Document type must be w9 or ach' });
+    const r = await getPool().query('SELECT file_name, mime_type, file_data FROM steward_documents WHERE steward_id = $1 AND doc_type = $2', [parseInt(req.params.id, 10), type]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'No document on file' });
+    const f = r.rows[0];
+    res.set('Content-Type', f.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="' + String(f.file_name).replace(/"/g, '') + '"');
+    res.send(f.file_data);
+  } catch (error) { console.error('Steward document download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/admin/stewards/:id/documents/:type', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const type = String(req.params.type || '');
+    if (type !== 'w9' && type !== 'ach') return res.status(400).json({ error: 'Document type must be w9 or ach' });
+    await getPool().query('DELETE FROM steward_documents WHERE steward_id = $1 AND doc_type = $2', [parseInt(req.params.id, 10), type]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Steward document delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.get('/api/admin/stewards/next-id', requireAdminOrOnboarding, async (req, res) => {
   try {
     const r = await getPool().query('SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM stewards');
@@ -2823,6 +2890,7 @@ app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
       await db.query('UPDATE onboarding_clients SET created_by = NULL WHERE created_by = $1', [id]);
       await db.query('UPDATE onboarding_documents SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
       await db.query('UPDATE forms SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
+      await db.query('UPDATE steward_documents SET uploaded_by = NULL WHERE uploaded_by = $1', [id]);
       await db.query('UPDATE tickets SET created_by = NULL WHERE created_by = $1', [id]);
       await db.query('UPDATE tickets SET assigned_to = NULL WHERE assigned_to = $1', [id]);
       await db.query('UPDATE ticket_replies SET author_id = NULL WHERE author_id = $1', [id]);

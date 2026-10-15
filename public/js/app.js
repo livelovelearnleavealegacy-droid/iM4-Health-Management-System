@@ -1023,6 +1023,8 @@ function viewAdminStewards() {
     if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
     var isAdmin = ar === 'admin';
     var canEdit = ar === 'admin' || ar === 'onboarding';
+    var canDocs = canEdit; // W9/ACH columns: admin + onboarding only; top_dog never sees them
+    var docStatus = {};
     var ROLE_OPTS = ['admin', 'top_dog', 'onboarding', 'steward'];
     var editId = null;
     var adding = false;
@@ -1052,15 +1054,34 @@ function viewAdminStewards() {
         '<td><input id="stw-phone" value="' + esc(s ? (s.phone || '') : '') + '" style="width:100%;"></td>' +
         '<td><input id="stw-stmt" value="' + esc(s ? (s.statement_email || '') : '') + '" style="width:100%;"></td>' +
         '<td>' + rolesCell + '</td>' +
+        (canDocs ? '<td></td><td></td>' : '') +
         '<td><button class="btn btn-small" id="stw-save">Save &amp; close</button> ' +
         '<button class="btn btn-small" id="stw-cancel">Cancel</button></td></tr>';
     }
     function showErr(msg) { var e = document.getElementById('err'); if (e) e.innerHTML = errorHtml(msg); }
+    function docCell(s, type) {
+      var fn = docStatus[s.id] ? docStatus[s.id][type] : null;
+      var h = '<button class="btn btn-small" data-doc-up="' + type + '" data-id="' + s.id + '">' + (fn ? 'Replace' : 'Upload') + '</button>';
+      if (fn) {
+        h += ' <button class="btn btn-small" data-doc-dl="' + type + '" data-id="' + s.id + '" data-fn="' + esc(fn) + '">Download</button>' +
+          ' <button class="btn btn-small btn-danger" data-doc-del="' + type + '" data-id="' + s.id + '">Delete</button>' +
+          '<div class="muted" style="font-size:11px;">' + esc(fn) + '</div>';
+      }
+      return '<td>' + h + '</td>';
+    }
     function pickedRoles() {
       return Array.prototype.map.call(document.querySelectorAll('.stw-role:checked'), function (x) { return x.value; });
     }
     function load() {
       api.get('/api/admin/stewards').then(function (list) {
+        if (!canDocs) { renderList(list); return; }
+        api.get('/api/admin/stewards/documents-status').then(function (st) {
+          docStatus = st || {};
+          renderList(list);
+        }).catch(function () { docStatus = {}; renderList(list); });
+      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
+    }
+    function renderList(list) {
         var bodyRows = '';
         if (adding) bodyRows += editorRow(nextId, null);
         bodyRows += list.map(function (s) {
@@ -1070,6 +1091,7 @@ function viewAdminStewards() {
           if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
             '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
+            (canDocs ? docCell(s, 'w9') + docCell(s, 'ach') : '') +
             '<td>' + actions + '</td></tr>';
         }).join('');
         var note = '<p class="muted">Onboarding can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
@@ -1077,11 +1099,10 @@ function viewAdminStewards() {
           '<h2>Stewards</h2>' + note +
           '<div id="err"></div>' +
           (canEdit ? '<p><button class="btn" id="stw-add">Add Steward</button></p>' : '') +
-          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th><th></th></tr></thead>' +
+          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th>' + (canDocs ? '<th>W9</th><th>ACH</th>' : '') + '<th></th></tr></thead>' +
           '<tbody>' + bodyRows + '</tbody></table>',
           '#/admin/stewards'));
         wire();
-      }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/stewards')); });
     }
     function wire() {
       var addBtn = document.getElementById('stw-add');
@@ -1105,6 +1126,49 @@ function viewAdminStewards() {
             'Commissions keep the steward number but lose the name behind it. This cannot be undone.';
           if (!window.confirm(msg)) return;
           api.delete('/api/admin/stewards/' + id).then(function () { load(); })
+            .catch(function (err) { showErr(err.message); });
+        };
+      });
+      document.querySelectorAll('[data-doc-up]').forEach(function (b) {
+        b.onclick = function () {
+          var id = b.getAttribute('data-id');
+          var type = b.getAttribute('data-doc-up');
+          var inp = document.createElement('input');
+          inp.type = 'file';
+          inp.onchange = function () {
+            if (!inp.files || !inp.files[0]) return;
+            var fd = new FormData();
+            fd.append('file', inp.files[0]);
+            uploadFile('/api/admin/stewards/' + id + '/documents/' + type, fd).then(function () { load(); })
+              .catch(function (err) { showErr(err.message); });
+          };
+          inp.click();
+        };
+      });
+      document.querySelectorAll('[data-doc-dl]').forEach(function (b) {
+        b.onclick = function () {
+          var headers = {};
+          if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+          fetch('/api/admin/stewards/' + b.getAttribute('data-id') + '/documents/' + b.getAttribute('data-doc-dl') + '/download', { headers: headers }).then(function (resp) {
+            if (!resp.ok) throw new Error('Download failed');
+            return resp.blob();
+          }).then(function (blob) {
+            var url = URL.createObjectURL(blob);
+            var aEl = document.createElement('a');
+            aEl.href = url;
+            aEl.download = b.getAttribute('data-fn');
+            document.body.appendChild(aEl);
+            aEl.click();
+            setTimeout(function () { URL.revokeObjectURL(url); aEl.remove(); }, 500);
+          }).catch(function (err) { showErr(err.message); });
+        };
+      });
+      document.querySelectorAll('[data-doc-del]').forEach(function (b) {
+        b.onclick = function () {
+          var label = b.getAttribute('data-doc-del') === 'w9' ? 'W9' : 'ACH';
+          if (!confirm('Delete the ' + label + ' document on file for this steward?')) return;
+          api.delete('/api/admin/stewards/' + b.getAttribute('data-id') + '/documents/' + b.getAttribute('data-doc-del'))
+            .then(function () { load(); })
             .catch(function (err) { showErr(err.message); });
         };
       });
