@@ -1399,6 +1399,7 @@ app.post('/api/admin/import-billing', requireAdmin, async (req, res) => {
     if (Array.isArray(body.rows)) rows = body.rows;
     else if (body.csv) rows = parseCsvServer(body.csv);
     else return res.status(400).json({ error: 'Provide { csv } text or { rows }' });
+    rows = rows.map(normalizeRow);
     const db = getPool();
     let imported = 0;
     let updated = 0;
