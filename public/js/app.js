@@ -1055,18 +1055,19 @@ function viewAdminStewards() {
         '<td><input id="stw-stmt" value="' + esc(s ? (s.statement_email || '') : '') + '" style="width:100%;"></td>' +
         '<td>' + rolesCell + '</td>' +
         (canDocs ? '<td></td><td></td>' : '') +
-        '<td><button class="btn btn-small" id="stw-save">Save &amp; close</button> ' +
+        '<td style="white-space:nowrap;"><button class="btn btn-small" id="stw-save">Save &amp; close</button> ' +
         '<button class="btn btn-small" id="stw-cancel">Cancel</button></td></tr>';
     }
     function showErr(msg) { var e = document.getElementById('err'); if (e) e.innerHTML = errorHtml(msg); }
     function docCell(s, type) {
       var fn = docStatus[s.id] ? docStatus[s.id][type] : null;
-      var h = '<button class="btn btn-small" data-doc-up="' + type + '" data-id="' + s.id + '">' + (fn ? 'Replace' : 'Upload') + '</button>';
+      var h = '<span style="white-space:nowrap;"><button class="btn btn-small" data-doc-up="' + type + '" data-id="' + s.id + '">' + (fn ? 'Replace' : 'Upload') + '</button>';
       if (fn) {
         h += ' <button class="btn btn-small" data-doc-dl="' + type + '" data-id="' + s.id + '" data-fn="' + esc(fn) + '">Download</button>' +
-          ' <button class="btn btn-small btn-danger" data-doc-del="' + type + '" data-id="' + s.id + '">Delete</button>' +
-          '<div class="muted" style="font-size:11px;">' + esc(fn) + '</div>';
+          ' <button class="btn btn-small btn-danger" data-doc-del="' + type + '" data-id="' + s.id + '">Delete</button>';
       }
+      h += '</span>';
+      if (fn) h += '<div class="muted" style="font-size:11px;">' + esc(fn) + '</div>';
       return '<td>' + h + '</td>';
     }
     function pickedRoles() {
@@ -1092,14 +1093,14 @@ function viewAdminStewards() {
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
             '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
             (canDocs ? docCell(s, 'w9') + docCell(s, 'ach') : '') +
-            '<td>' + actions + '</td></tr>';
+            '<td style="white-space:nowrap;">' + actions + '</td></tr>';
         }).join('');
         var note = '<p class="muted">Onboarding can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
         render(shell(
           '<h2>Stewards</h2>' + note +
           '<div id="err"></div>' +
           (canEdit ? '<p><button class="btn" id="stw-add">Add Steward</button></p>' : '') +
-          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th>' + (canDocs ? '<th>W9</th><th>ACH</th>' : '') + '<th></th></tr></thead>' +
+          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th>' + (canDocs ? '<th>W9</th><th>ACH</th>' : '') + '<th>Edit</th></tr></thead>' +
           '<tbody>' + bodyRows + '</tbody></table>',
           '#/admin/stewards'));
         wire();
