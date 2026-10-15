@@ -2462,8 +2462,9 @@ app.get('/api/admin/jobs/sol-export', requireAdmin, async (req, res) => {
 });
 
 // Parse a commission schedule XLSX (the IM4_COMM_SETUP format) into
-// { company_code, steward_code, pct } rows. Columns: ACCOUNT (company code),
-// ACCOUNT NAME, then repeating (AGENT, %) pairs where AGENT is
+// { company_code, steward_code, pct } rows. Columns: ACCOUNT (or
+// COMPANY_CODE) for the company code, ACCOUNT NAME, then repeating
+// (AGENT, %) pairs where AGENT is
 // "155026 - First Last" (steward ID + name) and % is a decimal
 // (0.375 = 37.5%). Duplicate steward IDs for the same company are summed.
 // Each company's percentages must add up to 100%.
@@ -2474,8 +2475,10 @@ function parseCommissionSchedule(buffer) {
   const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
   if (arr.length < 2) throw new Error('No data rows found in the spreadsheet.');
   const headers = (arr[0] || []).map(function (h) { return String(h || '').toUpperCase().trim(); });
-  const acctIdx = headers.indexOf('ACCOUNT');
-  if (acctIdx === -1) throw new Error('Could not find the ACCOUNT column.');
+  let acctIdx = headers.indexOf('ACCOUNT');
+  if (acctIdx === -1) acctIdx = headers.indexOf('COMPANY_CODE');
+  if (acctIdx === -1) acctIdx = headers.indexOf('COMPANY CODE');
+  if (acctIdx === -1) throw new Error('Could not find the ACCOUNT (or COMPANY_CODE) column.');
   // Find (AGENT, %) pairs: an AGENT column followed by a % column.
   const pairs = [];
   for (let i = 0; i < headers.length; i++) {
@@ -2927,6 +2930,10 @@ function normalizeRow(row) {
     n[key] = row[k];
   });
   const aliases = {
+    'account': 'company_code',
+    'account #': 'company_code',
+    'company code': 'company_code',
+    'acct': 'company_code',
     'ee_total': 'payroll_total',
     'ee_ineligible': 'payroll_ineligible',
     'ee_optedout': 'payroll_opted_out',
