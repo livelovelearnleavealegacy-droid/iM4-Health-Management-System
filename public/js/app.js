@@ -2905,13 +2905,13 @@ function viewForms() {
         var rows = list.length ? list.map(function (f) {
           return '<div class="ob-doc"><span><b>' + esc(f.name) + '</b></span> ' +
             '<span class="muted">' + esc(f.file_name) + '</span> ' +
-            '<button class="btn btn-link" data-fdl="' + f.id + '" data-fn="' + esc(f.file_name) + '">Download</button>' +
-            (isAdmin ? ' <button class="btn btn-danger" data-fdel="' + f.id + '">Delete</button>' : '') + '</div>';
+            '<button class="btn btn-small" data-fdl="' + f.id + '" data-fn="' + esc(f.file_name) + '">Download</button>' +
+            (isAdmin ? ' <button class="btn btn-small btn-danger" data-fdel="' + f.id + '">Delete</button>' : '') + '</div>';
         }).join('') : '<p class="muted">No blank forms stored yet.</p>';
         var up = isAdmin ?
           '<div class="card"><h4>Upload a blank form</h4>' +
           '<p class="muted">Stored as-is. Uploading a form with an existing name replaces it. The Soluta generator looks for a form named exactly "Soluta Billing Intake Form".</p>' +
-          '<p><label>Form name: <input id="formname" value="Soluta Billing Intake Form" style="width: 280px;"></label></p>' +
+          '<p><label>Form name: <input id="formname" style="width: 280px;"></label></p>' +
           '<p><label class="btn btn-primary">Choose file<input type="file" id="formfile" style="display:none"></label> <span id="formpick" class="muted"></span></p>' +
           '<p><button class="btn btn-primary" id="formupload">Upload form</button></p><div id="formmsg"></div></div>' : '';
         render(shell(
