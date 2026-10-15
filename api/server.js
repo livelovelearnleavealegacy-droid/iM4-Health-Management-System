@@ -4119,19 +4119,6 @@ async function runGithubSync() {
   }
 }
 
-// TEMPORARY one-time read (v5.45.1): distinct commission company codes for a
-// diff Leroy asked for. Remove immediately after use.
-app.get('/api/admin/commissions-codes-once', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const r = await getPool().query(
-      'SELECT c.company_code, co.company_name FROM commissions c ' +
-      'LEFT JOIN companies co ON co.company_code = c.company_code ' +
-      'GROUP BY c.company_code, co.company_name ORDER BY c.company_code');
-    res.json(r.rows);
-  } catch (error) { console.error('commissions-codes-once error:', error); res.status(500).json({ error: 'Internal server error' }); }
-});
-
 app.post('/api/admin/sync-github', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
