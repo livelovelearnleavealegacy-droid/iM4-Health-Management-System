@@ -3049,21 +3049,6 @@ app.delete('/api/admin/companies/:code', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: assignments (read-only list; import only)
-// TEMPORARY (2026-10-14, one-off diagnosis): raw vs joined assignment counts.
-app.get('/api/admin/assignments-count-once', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const raw = await db.query('SELECT COUNT(*) AS n FROM assignments');
-    const joined = await db.query('SELECT COUNT(*) AS n FROM assignments a JOIN stewards s ON s.id = a.steward_id JOIN companies c ON c.id = a.company_id');
-    const noCompany = await db.query('SELECT COUNT(*) AS n FROM assignments a LEFT JOIN companies c ON c.id = a.company_id WHERE c.id IS NULL');
-    const noSteward = await db.query('SELECT COUNT(*) AS n FROM assignments a LEFT JOIN stewards s ON s.id = a.steward_id WHERE s.id IS NULL');
-    res.json({ assignments_raw: Number(raw.rows[0].n), assignments_joined: Number(joined.rows[0].n), missing_company: Number(noCompany.rows[0].n), missing_steward: Number(noSteward.rows[0].n) });
-  } catch (error) {
-    res.status(500).json({ error: String(error && error.message || error) });
-  }
-});
-
 app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
