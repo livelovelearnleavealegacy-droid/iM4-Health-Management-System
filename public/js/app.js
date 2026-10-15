@@ -202,7 +202,7 @@ function activeRole() {
 // Screens per role:
 // admin: everything
 // top_dog: everything except Jobs, Billing, Tickets (Stewards page is view-only)
-// onboarding: Onboarding, Implementation, and Stewards (with steward maintenance)
+// onboarding: Onboarding, Implementation, Stewards (with steward maintenance), and Companies (with company maintenance)
 // steward: Dashboard, Companies, Billing, Implementation, Tickets
 // service: Tickets, Companies, Implementation (support desk)
 // client: Tickets (own company only)
@@ -232,8 +232,10 @@ function navLinks() {
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/stewards', 'Stewards']);
   }
-  if (role === 'admin' || role === 'top_dog') {
+  if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/companies', 'Companies']);
+  }
+  if (role === 'admin' || role === 'top_dog') {
     links.push(['#/admin/assignments', 'Assignments']);
     links.push(['#/admin/commissions', 'Commissions']);
   }
@@ -1557,40 +1559,82 @@ function viewAR() {
 
 // ---------------------------------------------------------------- admin: on-call schedule
 
-// ---------------------------------------------------------------- admin: companies (import only, with parent columns)
+// ---------------------------------------------------------------- admin: companies (the 10 values, with maintenance)
+// Access (Leroy's instructions): Onboarding can add a Company and add (or
+// later update) all the fields (all fields required). Only an Admin can
+// delete a company. Top Dog views only.
 function viewAdminCompanies() {
   requireUser(function () {
     var ar = activeRole();
-    if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
+    if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
+    var canMaintain = ar === 'admin' || ar === 'onboarding';
+    var isAdmin = ar === 'admin';
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
       function parentCode(c) { return c.ee_company_code || c.parent_company_code; }
       function parentName(c) { return c.ee_company_name || c.parent_company_name; }
+      function statusOf(c) { return c.company_status || (c.active === false ? 'TERMED' : 'ACTIVE'); }
+      var byCode = {};
+      list.forEach(function (c) { byCode[c.company_code] = c; });
       var rows = list.map(function (c) {
-        var status = c.company_status || (c.active === false ? 'TERMED' : 'ACTIVE');
+        var status = statusOf(c);
         var statusHtml = status === 'TERMED' ? '<b>TERMED</b>' : esc(status);
+        var actions = '';
+        if (canMaintain) {
+          actions = '<td style="white-space:nowrap;"><button class="btn btn-small" data-edit="' + esc(c.company_code) + '">Edit</button>' +
+            (isAdmin ? ' <button class="btn btn-small" data-del="' + esc(c.company_code) + '">Delete</button>' : '') + '</td>';
+        }
         return '<tr data-status="' + status + '">' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td>' + cell(c.ein) + '<td>' + esc(c.company_name) + '</td>' +
           cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) +
-          '<td>' + statusHtml + '</td></tr>';
+          '<td>' + statusHtml + '</td>' + actions + '</tr>';
       }).join('');
+      var fld = function (id, label, val, ph) {
+        return '<label style="display:block;margin:0 10px 8px 0;">' + label + '<br>' +
+          '<input id="' + id + '" type="text" value="' + esc(val || '') + '" placeholder="' + esc(ph || '') + '" style="min-width:170px;"></label>';
+      };
+      var editor =
+        '<div class="card" id="co-editor" style="display:none;"><div class="card-title" id="co-editor-title">Add Company</div>' +
+        '<div style="display:flex;flex-wrap:wrap;">' +
+        fld('co-f-parent-code', 'Parent Code', '', 'PC0007') +
+        fld('co-f-parent-name', 'Parent Name', '') +
+        fld('co-f-code', 'Company Code', '', 'four numbers') +
+        fld('co-f-ein', 'EIN', '', '47-5096437') +
+        fld('co-f-name', 'Company Name', '') +
+        fld('co-f-addr', 'Company Address 1', '') +
+        fld('co-f-city', 'Company City', '') +
+        fld('co-f-state', 'Company State', '') +
+        fld('co-f-zip', 'Company Zip', '') +
+        '<label style="display:block;margin:0 10px 8px 0;">Company Status<br>' +
+        '<select id="co-f-status"><option value="ACTIVE">ACTIVE</option><option value="PENDING">PENDING</option><option value="TERMED">TERMED</option></select></label>' +
+        '</div>' +
+        '<p class="muted">All fields are required. Parent Code is "PC" plus four numbers and can be shared by many companies. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
+        '<div id="co-editor-out"></div>' +
+        '<button class="btn btn-primary" id="co-save">Save</button> ' +
+        '<button class="btn" id="co-cancel">Cancel</button>' +
+        '</div>';
       render(shell(
         '<h2>Companies</h2>' +
-        '<p class="muted">Companies are updated by CSV import only. ' +
-        'Show: <label><input type="radio" name="cfilter" value="active" checked> Active &amp; Pending</label> ' +
+        '<p class="muted">Onboarding can add a Company and add (or later update) all the fields (all fields required). Only an Admin can delete a company.</p>' +
+        (canMaintain ? '<p><button class="btn btn-primary" id="co-add">Add Company</button></p>' + editor : '') +
+        '<p class="muted">' +
+        'Show: <label><input type="radio" name="cfilter" value="active"> Active</label> ' +
         '<label><input type="radio" name="cfilter" value="pending"> Pending</label> ' +
         '<label><input type="radio" name="cfilter" value="termed"> Termed</label> ' +
+        '<label><input type="radio" name="cfilter" value="actpend" checked> Active &amp; Pending</label> ' +
         '<label><input type="radio" name="cfilter" value="all"> All</label></p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>EIN</th><th>Company Name</th>' +
-        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th></tr></thead>' +
+        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th>' +
+        (canMaintain ? '<th>Actions</th>' : '') + '</tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>',
         '#/admin/companies'));
       function applyCompanyFilter() {
         var v = document.querySelector('input[name="cfilter"]:checked').value;
         document.querySelectorAll('#companyrows tr').forEach(function (tr) {
           var s = tr.getAttribute('data-status');
-          var show = v === 'all' || (v === 'active' && s !== 'TERMED') || (v === 'pending' && s === 'PENDING') || (v === 'termed' && s === 'TERMED');
+          var show = v === 'all' || (v === 'active' && s === 'ACTIVE') || (v === 'pending' && s === 'PENDING') ||
+            (v === 'termed' && s === 'TERMED') || (v === 'actpend' && s !== 'TERMED');
           tr.style.display = show ? '' : 'none';
         });
       }
@@ -1598,6 +1642,71 @@ function viewAdminCompanies() {
         r.onchange = applyCompanyFilter;
       });
       applyCompanyFilter();
+      if (canMaintain) {
+        var editingCode = null;
+        var editorEl = document.getElementById('co-editor');
+        function openEditor(c) {
+          editingCode = c ? c.company_code : null;
+          document.getElementById('co-editor-title').textContent = c ? ('Edit Company ' + c.company_code) : 'Add Company';
+          document.getElementById('co-f-parent-code').value = c ? (parentCode(c) || '') : '';
+          document.getElementById('co-f-parent-name').value = c ? (parentName(c) || '') : '';
+          document.getElementById('co-f-code').value = c ? c.company_code : '';
+          document.getElementById('co-f-ein').value = c ? (c.ein || '') : '';
+          document.getElementById('co-f-name').value = c ? c.company_name : '';
+          document.getElementById('co-f-addr').value = c ? (c.address_1 || '') : '';
+          document.getElementById('co-f-city').value = c ? (c.city || '') : '';
+          document.getElementById('co-f-state').value = c ? (c.state || '') : '';
+          document.getElementById('co-f-zip').value = c ? (c.zip || '') : '';
+          document.getElementById('co-f-status').value = statusOf(c || {});
+          document.getElementById('co-editor-out').innerHTML = '';
+          editorEl.style.display = '';
+          editorEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        document.getElementById('co-add').onclick = function () { openEditor(null); };
+        document.getElementById('co-cancel').onclick = function () { editorEl.style.display = 'none'; };
+        document.querySelectorAll('[data-edit]').forEach(function (b) {
+          b.onclick = function () { openEditor(byCode[b.getAttribute('data-edit')]); };
+        });
+        document.getElementById('co-save').onclick = function () {
+          var out = document.getElementById('co-editor-out');
+          var v = {
+            parent_code: document.getElementById('co-f-parent-code').value.trim(),
+            parent_name: document.getElementById('co-f-parent-name').value.trim(),
+            company_code: document.getElementById('co-f-code').value.trim(),
+            ein: document.getElementById('co-f-ein').value.trim(),
+            company_name: document.getElementById('co-f-name').value.trim(),
+            address_1: document.getElementById('co-f-addr').value.trim(),
+            city: document.getElementById('co-f-city').value.trim(),
+            state: document.getElementById('co-f-state').value.trim(),
+            zip: document.getElementById('co-f-zip').value.trim(),
+            company_status: document.getElementById('co-f-status').value
+          };
+          var missing = Object.keys(v).filter(function (k) { return !v[k]; });
+          if (missing.length) { out.innerHTML = errorHtml('All fields are required — some are still blank.'); return; }
+          if (!/^PC\d{4}$/i.test(v.parent_code)) { out.innerHTML = errorHtml('Parent Code must be "PC" plus four numbers (for example PC0007).'); return; }
+          if (!/^\d{4}$/.test(v.company_code)) { out.innerHTML = errorHtml('Company Code must be four numbers.'); return; }
+          if (!/^\d{2}-\d{7}$/.test(v.ein)) { out.innerHTML = errorHtml('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).'); return; }
+          out.innerHTML = '<p class="muted">Saving...</p>';
+          var call = editingCode ? api.put('/api/admin/companies/' + encodeURIComponent(editingCode), v)
+                                 : api.post('/api/admin/companies', v);
+          call.then(function () { viewAdminCompanies(); })
+            .catch(function (err) { out.innerHTML = errorHtml(err.message); });
+        };
+        if (isAdmin) {
+          document.querySelectorAll('[data-del]').forEach(function (b) {
+            b.onclick = function () {
+              var code = b.getAttribute('data-del');
+              var c = byCode[code] || {};
+              var msg = 'Delete company ' + code + ' — ' + (c.company_name || '') + '?\n\n' +
+                'This removes the company for good, along with its steward assignments, implementation record, commissions, and EIN cross-references. ' +
+                'A company with bills on file cannot be deleted (the delete will be refused). This cannot be undone.';
+              if (!confirm(msg)) return;
+              api.delete('/api/admin/companies/' + encodeURIComponent(code)).then(function () { viewAdminCompanies(); })
+                .catch(function (err) { alert(err.message); });
+            };
+          });
+        }
+      }
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/admin/companies')); });
   });
 }
@@ -1764,7 +1873,7 @@ function viewAdminJobs() {
       '<button class="btn btn-primary" id="xrefpreview">Upload &amp; preview</button><div id="xrefout"></div></div>' +
       '</div>' +
       '<h3>Imports</h3>' +
-      '<p class="muted">Paste CSV (first row = headers), validate, then confirm. This is the only way Stewards, Companies, Assignments, Billing, and Commissions are updated. Use "Download current" to get a CSV of what is on file now.</p>' +
+      '<p class="muted">Paste CSV (first row = headers), validate, then confirm. Stewards and Companies can also be maintained one at a time on their own pages. Use "Download current" to get a CSV of what is on file now.</p>' +
       '<div class="card-grid">' +
       '<div class="card"><div class="card-title">Import stewards</div>' +
       '<p class="muted">Columns: ' + esc(IMPORT_FORMATS.stewards) + '</p>' +

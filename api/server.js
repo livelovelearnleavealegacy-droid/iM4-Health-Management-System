@@ -552,6 +552,16 @@ function requireStewardsAccess(req, res, next) {
   });
 }
 
+// Companies page (v5.48): viewable by admin, top dog (view only), and
+// onboarding; add/edit is admin + onboarding; delete is admin only.
+function requireCompaniesAccess(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding') return res.status(403).json({ error: 'Admin, Top Dog, or Onboarding only' });
+    next();
+  });
+}
+
 function requireAdminOrOnboarding(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
@@ -2856,7 +2866,7 @@ app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: companies (read-only list; import only)
-app.get('/api/admin/companies', requireAdminOrTopDog, async (req, res) => {
+app.get('/api/admin/companies', requireCompaniesAccess, async (req, res) => {
   try {
     const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort('c'));
     const inv = await getPool().query(
@@ -2904,6 +2914,136 @@ app.post('/api/admin/companies/:code/active', requireAdminOrTopDog, async (req, 
     res.json({ success: true, company_code: r.rows[0].company_code, company_status: r.rows[0].company_status, active: r.rows[0].active });
   } catch (error) {
     console.error('Admin set company status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ------------------------------------------------- v5.48: company maintenance (Companies page)
+// Access, from Leroy's instructions: Onboarding can add a Company and add
+// (or later update) all the fields (all fields required). Only an Admin
+// can delete a company. Top Dog views only. Changing the Company Code
+// itself is admin-only (like changing a Steward ID) because bills,
+// commissions, and the EIN cross-reference key on it; a change cascades
+// to all of them in one transaction.
+function companyFieldValues(b) {
+  const t = function (v) { return v !== undefined && v !== null ? String(v).trim() : ''; };
+  return {
+    parent_code: t(b.parent_code).toUpperCase(),
+    parent_name: t(b.parent_name),
+    company_code: t(b.company_code),
+    ein: t(b.ein),
+    company_name: t(b.company_name),
+    address_1: t(b.address_1 || b.company_address_1),
+    city: t(b.city || b.company_city),
+    state: t(b.state || b.company_state).toUpperCase(),
+    zip: t(b.zip || b.company_zip),
+    company_status: t(b.company_status).toUpperCase()
+  };
+}
+function companyFieldErrors(v) {
+  const errs = [];
+  if (!/^PC\d{4}$/.test(v.parent_code)) errs.push('Parent Code must be "PC" plus four numbers (for example PC0007).');
+  if (!v.parent_name) errs.push('Parent Name is required.');
+  if (!/^\d{4}$/.test(v.company_code)) errs.push('Company Code must be four numbers.');
+  if (!/^\d{2}-\d{7}$/.test(v.ein)) errs.push('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).');
+  if (!v.company_name) errs.push('Company Name is required.');
+  if (!v.address_1) errs.push('Company Address 1 is required.');
+  if (!v.city) errs.push('Company City is required.');
+  if (!v.state) errs.push('Company State is required.');
+  if (!v.zip) errs.push('Company Zip is required.');
+  if (['ACTIVE', 'PENDING', 'TERMED'].indexOf(v.company_status) === -1) errs.push('Company Status must be ACTIVE, PENDING, or TERMED.');
+  return errs;
+}
+
+app.post('/api/admin/companies', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const v = companyFieldValues(req.body || {});
+    const errs = companyFieldErrors(v);
+    if (errs.length) return res.status(400).json({ error: errs.join(' ') });
+    const db = getPool();
+    const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
+    if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
+    const r = await db.query(
+      'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
+      'VALUES ($1,$2,$3,$4,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED']);
+    res.json({ success: true, company: r.rows[0] });
+  } catch (error) {
+    console.error('Admin create company error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const v = companyFieldValues(req.body || {});
+    const errs = companyFieldErrors(v);
+    if (errs.length) return res.status(400).json({ error: errs.join(' ') });
+    const db = getPool();
+    const cur = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Company not found' });
+    const codeChange = v.company_code !== code;
+    if (codeChange) {
+      if (!req.user || req.user.activeRole !== 'admin') {
+        return res.status(403).json({ error: 'Only an Admin can change a Company Code.' });
+      }
+      const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
+      if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
+    }
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      if (codeChange) {
+        await client.query('UPDATE invoices SET company_code = $1 WHERE company_code = $2', [v.company_code, code]);
+        await client.query('UPDATE commissions SET company_code = $1 WHERE company_code = $2', [v.company_code, code]);
+        await client.query('UPDATE ein_account_xref SET acct = $1 WHERE acct = $2', [v.company_code, code]);
+        await client.query('UPDATE companies SET ee_company_code = $1, parent_company_code = $1 WHERE ee_company_code = $2 OR parent_company_code = $2', [v.company_code, code]);
+      }
+      const r = await client.query(
+        'UPDATE companies SET company_code = $1, company_name = $2, ee_company_code = $3, ee_company_name = $4, parent_company_code = $3, parent_company_name = $4, ' +
+        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, active = $11 WHERE company_code = $12 RETURNING *',
+        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED', code]);
+      await client.query('COMMIT');
+      res.json({ success: true, company: r.rows[0] });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Admin update company error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/admin/companies/:code', requireAdmin, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const db = getPool();
+    const cur = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [code]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Company not found' });
+    const bills = await db.query('SELECT COUNT(*) AS n FROM invoices WHERE company_code = $1', [code]);
+    if (Number(bills.rows[0].n) > 0) {
+      return res.status(400).json({ error: 'Company ' + code + ' (' + cur.rows[0].company_name + ') has ' + bills.rows[0].n + ' bill(s) on file and cannot be deleted. Term the company instead, or remove its bills first.' });
+    }
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM commissions WHERE company_code = $1', [code]);
+      await client.query('DELETE FROM ein_account_xref WHERE acct = $1', [code]);
+      await client.query('DELETE FROM companies WHERE company_code = $1', [code]);
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin delete company error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
