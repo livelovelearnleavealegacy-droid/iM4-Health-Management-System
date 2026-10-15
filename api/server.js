@@ -2518,7 +2518,7 @@ function parseCommissionSchedule(buffer) {
     const acctRaw = r[acctIdx];
     if (acctRaw === null || acctRaw === undefined || String(acctRaw).trim() === '') continue;
     const companyCode = String(acctRaw).trim();
-    const bySteward = {};
+    const rawBySteward = {};
     for (const p of pairs) {
       const agentRaw = r[p.agent];
       if (agentRaw === null || agentRaw === undefined || String(agentRaw).trim() === '') continue;
@@ -2532,11 +2532,23 @@ function parseCommissionSchedule(buffer) {
         errors.push('Row ' + (ri + 1) + ': invalid % "' + pctRaw + '" for steward ' + stewardId);
         continue;
       }
-      const pct = Math.round(dec * 100 * 10000) / 10000;
-      bySteward[stewardId] = (bySteward[stewardId] || 0) + pct;
+      rawBySteward[stewardId] = (rawBySteward[stewardId] || 0) + dec;
     }
+    const rawIds = Object.keys(rawBySteward);
+    if (rawIds.length === 0) continue;
+    // Leroy's sheet carries decimals (0.125 = 12.5%); accept percents
+    // (12.5) too - decide per company by which total the raw values hit.
+    const rawTotal = rawIds.reduce(function (a, sid) { return a + rawBySteward[sid]; }, 0);
+    let factor = null;
+    if (Math.abs(rawTotal - 1) <= 0.02) factor = 100;
+    else if (Math.abs(rawTotal - 100) <= 1) factor = 1;
+    if (factor === null) {
+      errors.push('Company ' + companyCode + ': percentages sum to ' + (Math.round(rawTotal * 10000) / 10000) + ', not 100 (or 1.0 as decimals).');
+      continue;
+    }
+    const bySteward = {};
+    rawIds.forEach(function (sid) { bySteward[sid] = Math.round(rawBySteward[sid] * factor * 10000) / 10000; });
     const stewardIds = Object.keys(bySteward);
-    if (stewardIds.length === 0) continue;
     const total = stewardIds.reduce(function (a, sid) { return a + bySteward[sid]; }, 0);
     if (Math.abs(total - 100) > 0.01) {
       errors.push('Company ' + companyCode + ': percentages sum to ' + (Math.round(total * 100) / 100) + ', not 100.');
@@ -3353,8 +3365,13 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
         "total_invoice, status, TO_CHAR(paid_date, 'YYYY-MM-DD') AS paid_date, bill_type, bill_mode FROM invoices " +
         'ORDER BY company_code, payroll_date')).rows;
     } else if (type === 'commissions') {
-      // Wide format matching the import: one row per company, repeating steward_code,pct pairs.
-      const r = await db.query('SELECT company_code, steward_code, pct FROM commissions ORDER BY company_code, steward_code');
+      // Leroy's sheet format, matching the Excel import exactly: COMPANY_CODE,
+      // then WRITING AGENT #1 / #1 %, AGENT #2 / #2 %, ... Agent cells are
+      // "155026 - NAME"; % cells are decimals (0.375 = 37.5%).
+      const r = await db.query(
+        'SELECT c.company_code, c.steward_code, c.pct, s.first_name, s.last_name, s.email ' +
+        'FROM commissions c LEFT JOIN stewards s ON s.id = c.steward_code ' +
+        'ORDER BY c.company_code, c.steward_code');
       const byCo = {};
       const order = [];
       r.rows.forEach(function (x) {
@@ -3363,12 +3380,16 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       });
       let maxPairs = 0;
       order.forEach(function (c) { maxPairs = Math.max(maxPairs, byCo[c].length); });
-      const h = ['company_code'];
-      for (let pi = 0; pi < maxPairs; pi++) h.push('steward_code', 'pct');
+      const h = ['COMPANY_CODE'];
+      for (let pi = 0; pi < maxPairs; pi++) h.push(pi === 0 ? 'WRITING AGENT #1' : 'AGENT #' + (pi + 1), '#' + (pi + 1) + ' %');
       const lines = [h.join(',')];
       order.forEach(function (c) {
         const cells = [csvCell(c)];
-        byCo[c].forEach(function (x) { cells.push(csvCell(x.steward_code), csvCell(x.pct)); });
+        byCo[c].forEach(function (x) {
+          const nm = (((x.first_name || '') + ' ' + (x.last_name || '')).trim() || x.email || '');
+          cells.push(csvCell(nm ? (x.steward_code + ' - ' + nm) : String(x.steward_code)));
+          cells.push(csvCell(String(Math.round((Number(x.pct) / 100) * 1000000) / 1000000)));
+        });
         while (cells.length < h.length) cells.push('');
         lines.push(cells.join(','));
       });
@@ -3473,12 +3494,12 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT c.company_code, co.company_name, c.steward_code, c.pct, ' +
+      'SELECT co.company_code, co.company_name, c.steward_code, c.pct, ' +
       's.first_name, s.last_name, s.email ' +
-      'FROM commissions c ' +
-      'LEFT JOIN companies co ON co.company_code = c.company_code ' +
+      'FROM companies co ' +
+      'LEFT JOIN commissions c ON c.company_code = co.company_code ' +
       'LEFT JOIN stewards s ON s.id = c.steward_code ' +
-      'ORDER BY c.company_code, c.pct DESC');
+      'ORDER BY co.company_code, c.steward_code');
     const byCompany = {};
     const order = [];
     r.rows.forEach(function (row) {
@@ -3491,7 +3512,8 @@ app.get('/api/admin/commissions-by-company', requireAdminOrTopDog, async (req, r
         };
         order.push(code);
       }
-      var name = ((row.first_name || '') + ' ' + (row.last_name || '')).trim() || row.email || ('ID ' + row.steward_code);
+      if (row.steward_code === null || row.steward_code === undefined) return;
+      var name = ((row.first_name || '') + ' ' + (row.last_name || '')).trim() || row.email || '';
       byCompany[code].stewards.push({
         steward_code: row.steward_code,
         name: name,

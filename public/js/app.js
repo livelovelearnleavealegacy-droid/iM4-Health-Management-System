@@ -1178,33 +1178,42 @@ function viewAdminCommissions() {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     var q = '';
+    function fmtDec(p) { return String(Math.round((Number(p) / 100) * 1000000) / 1000000); }
     function load() {
       api.get('/api/admin/commissions-by-company').then(function (list) {
+        var maxPairs = 0;
+        list.forEach(function (c) { maxPairs = Math.max(maxPairs, c.stewards.length); });
+        var head = '<tr><th>COMPANY_CODE</th>';
+        for (var i = 0; i < maxPairs; i++) {
+          head += '<th>' + (i === 0 ? 'WRITING AGENT #1' : 'AGENT #' + (i + 1)) + '</th><th>#' + (i + 1) + ' %</th>';
+        }
+        head += '</tr>';
         var ql = q.toLowerCase();
-        var filtered = list.filter(function (c) {
+        var rows = list.filter(function (c) {
           if (!ql) return true;
           if (String(c.company_code).toLowerCase().indexOf(ql) !== -1) return true;
           if (String(c.company_name || '').toLowerCase().indexOf(ql) !== -1) return true;
           for (var i = 0; i < c.stewards.length; i++) {
             if (String(c.stewards[i].name).toLowerCase().indexOf(ql) !== -1) return true;
+            if (String(c.stewards[i].steward_code).indexOf(ql) !== -1) return true;
           }
           return false;
-        });
-        var cards = filtered.map(function (c) {
-          var lines = c.stewards.map(function (s) {
-            return '<div class="card-line">' + esc(s.name) + ' <span class="muted">— ' + esc(s.pct) + '%</span></div>';
-          }).join('');
-          return '<div class="card">' +
-            '<div class="card-code">' + esc(c.company_code) + '</div>' +
-            '<div class="card-title">' + esc(c.company_name) + '</div>' +
-            lines + '</div>';
+        }).map(function (c) {
+          var cells = '<td><b>' + esc(c.company_code) + '</b></td>';
+          for (var i = 0; i < maxPairs; i++) {
+            var s = c.stewards[i];
+            if (s) {
+              cells += '<td>' + esc(s.steward_code + (s.name ? ' - ' + s.name : '')) + '</td><td>' + esc(fmtDec(s.pct)) + '</td>';
+            } else {
+              cells += '<td></td><td></td>';
+            }
+          }
+          return '<tr>' + cells + '</tr>';
         }).join('');
-        var body = filtered.length === 0
-          ? '<p class="muted">No commissions found.</p>'
-          : '<div class="card-grid">' + cards + '</div>';
         render(shell(
           '<h2>Commissions</h2>' + filterBar(q, '') +
-          '<div id="err"></div>' + body,
+          '<div class="table-scroll"><table class="data-table"><thead>' + head + '</thead>' +
+          '<tbody>' + rows + '</tbody></table></div>',
           '#/admin/commissions'));
         var fq = document.getElementById('fq');
         fq.onchange = function () { q = fq.value; load(); };
@@ -1766,7 +1775,7 @@ var IMPORT_FORMATS = {
   companies: 'parent_code, parent_name, company_code, ein, company_name, company_address_1, company_city, company_state, company_zip, company_status. Only company_code and company_name are required; blank cells leave the current values unchanged (company_status: ACTIVE, TERMED, or PENDING; the old active Yes/No column still works). Headers are case-insensitive.',
   assignments: 'steward_id, company_code',
   billing: 'company_code (required), company_name, ein, payroll_date (YYYY-MM-DD), payroll_end_date (YYYY-MM-DD), lives_count, total_invoice, status (open or paid), paid_date (YYYY-MM-DD), bill_type (F or S), bill_mode',
-  commissions: 'One line per steward OR one line per company (auto-detected): steward_id then repeating company_code,pct pairs - or company_code then repeating steward_id,pct pairs (e.g. 1001,155026,37.5,153909,25). Percentages for each company must add up to 100. The file replaces the commission table for every company code it mentions.'
+  commissions: 'Excel sheet: COMPANY_CODE, WRITING AGENT #1, #1 %, AGENT #2, #2 %, and so on. Agent cells look like "155026 - RLJAT" (the number is the Steward ID). % cells are decimals (0.125 = 12.5%) and each company must add up to 1.0 (100%). A pasted CSV also works in the wide pair format (company_code, then steward_id,pct pairs with percents adding to 100). The import replaces the commissions for every company in the file.'
 };
 
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
