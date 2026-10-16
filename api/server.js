@@ -271,8 +271,7 @@ async function migrate() {
     ['companies', 'github_issue_number', 'INT'],
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
-    ['companies', 'ee_company_code', 'TEXT'],
-    ['companies', 'ee_company_name', 'TEXT'],
+
     ['companies', 'payroll_total', 'INT'],
     ['companies', 'payroll_ineligible', 'INT'],
     ['companies', 'payroll_opted_out', 'INT'],
@@ -310,8 +309,17 @@ async function migrate() {
   // keeps driving the existing visibility/billing filters).
   await db.query("UPDATE companies SET company_status = 'TERMED' WHERE active = FALSE AND company_status <> 'TERMED'");
   // v5: "parent" renamed to "ee" on import headings; carry existing values over.
-  await db.query('UPDATE companies SET ee_company_code = parent_company_code WHERE (ee_company_code IS NULL OR ee_company_code = ' + "''" + ') AND parent_company_code IS NOT NULL AND parent_company_code <> ' + "''");
-  await db.query('UPDATE companies SET ee_company_name = parent_company_name WHERE (ee_company_name IS NULL OR ee_company_name = ' + "''" + ') AND parent_company_name IS NOT NULL AND parent_company_name <> ' + "''");
+  // v6.11.0 (Leroy): consolidate the parent fields into parent_company_code /
+  // parent_company_name and drop the legacy ee_* columns for good. Copies
+  // any ee value into the parent pair wherever the parent pair is empty,
+  // then drops both ee columns. Guarded so later boots are no-ops.
+  await db.query('DO $$ BEGIN ' +
+    "IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'companies' AND column_name = 'ee_company_code') THEN " +
+    "UPDATE companies SET parent_company_code = ee_company_code WHERE (parent_company_code IS NULL OR parent_company_code = '') AND ee_company_code IS NOT NULL AND ee_company_code <> ''; " +
+    "UPDATE companies SET parent_company_name = ee_company_name WHERE (parent_company_name IS NULL OR parent_company_name = '') AND ee_company_name IS NOT NULL AND ee_company_name <> ''; " +
+    'ALTER TABLE companies DROP COLUMN ee_company_code; ' +
+    'ALTER TABLE companies DROP COLUMN ee_company_name; ' +
+    'END IF; END $$');
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
   // v5: backfill user_roles from the legacy single-role column (idempotent).
   await db.query("INSERT INTO user_roles (steward_id, role) SELECT id, role FROM stewards WHERE role IN ('admin', 'steward', 'top_dog') ON CONFLICT DO NOTHING");
@@ -408,9 +416,9 @@ async function migrate() {
     'PRIMARY KEY (parent_code, doc_kind))');
   // Seed parents from the parent codes already carried by companies.
   await db.query('INSERT INTO parents (parent_code, parent_name) ' +
-    'SELECT ee_company_code, MAX(ee_company_name) FROM companies ' +
-    "WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' AND ee_company_name IS NOT NULL AND ee_company_name <> '' " +
-    'GROUP BY ee_company_code ON CONFLICT (parent_code) DO NOTHING');
+    'SELECT parent_company_code, MAX(parent_company_name) FROM companies ' +
+    "WHERE parent_company_code IS NOT NULL AND parent_company_code <> '' AND parent_company_name IS NOT NULL AND parent_company_name <> '' " +
+    'GROUP BY parent_company_code ON CONFLICT (parent_code) DO NOTHING');
   await db.query('INSERT INTO parents (parent_code, parent_name) ' +
     'SELECT parent_company_code, MAX(parent_company_name) FROM companies ' +
     "WHERE parent_company_code IS NOT NULL AND parent_company_code <> '' AND parent_company_name IS NOT NULL AND parent_company_name <> '' " +
@@ -658,6 +666,18 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
+// TEMP PROBE (remove after use): verify the ee -> parent_company migration.
+app.get('/api/temp-parent-probe', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const cols = await db.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' ORDER BY ordinal_position");
+    const counts = await db.query("SELECT COUNT(*)::int AS total, COUNT(parent_company_code)::int AS with_code, COUNT(parent_company_name)::int AS with_name, COUNT(DISTINCT parent_company_code)::int AS distinct_parents FROM companies");
+    const sample = await db.query('SELECT company_code, parent_company_code, parent_company_name FROM companies ORDER BY company_code LIMIT 3');
+    res.json({ columns: cols.rows.map(function (r) { return r.column_name; }), counts: counts.rows[0], sample: sample.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
@@ -678,14 +698,12 @@ function eligibleOf(c) {
 }
 
 function parentKey(c) {
-  const ee = c.ee_company_code && String(c.ee_company_code).trim();
   const par = c.parent_company_code && String(c.parent_company_code).trim();
-  return ee || par || c.company_code;
+  return par || c.company_code;
 }
 function parentName(c) {
-  const ee = c.ee_company_name && String(c.ee_company_name).trim();
   const par = c.parent_company_name && String(c.parent_company_name).trim();
-  return ee || par || c.company_name;
+  return par || c.company_name;
 }
 
 async function userRoles(db, stewardId) {
@@ -1149,8 +1167,6 @@ app.get('/api/clients', requireAuth, async (req, res) => {
       params.push('%' + q + '%');
       where += (where ? ' AND ' : 'WHERE ') + '(LOWER(c.company_code) LIKE $' + params.length +
         ' OR LOWER(c.company_name) LIKE $' + params.length +
-        ' OR LOWER(COALESCE(c.ee_company_code, ' + "''" + ')) LIKE $' + params.length +
-        ' OR LOWER(COALESCE(c.ee_company_name, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_code, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
@@ -1197,7 +1213,7 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
   try {
     const code = String(req.params.code);
     const ids = await visibleCompanyIds(req.user);
-    let where = "(c.company_code = $1 OR c.ee_company_code = $1 OR c.parent_company_code = $1)";
+    let where = "(c.company_code = $1 OR c.parent_company_code = $1)";
     const params = [code];
     if (ids) {
       if (ids.length === 0) return res.status(403).json({ error: 'Not assigned to this client' });
@@ -1259,15 +1275,13 @@ async function canonicalParent(db, code) {
   const t = await db.query('SELECT parent_name FROM parents WHERE parent_code = $1', [String(code)]);
   if (t.rows.length) return { code: String(code), name: t.rows[0].parent_name };
   const c = await db.query(
-    'SELECT MAX(name) AS name FROM (SELECT ee_company_name AS name FROM companies WHERE ee_company_code = $1 ' +
-    'UNION ALL SELECT parent_company_name FROM companies WHERE parent_company_code = $1) u', [String(code)]);
+    'SELECT MAX(parent_company_name) AS name FROM companies WHERE parent_company_code = $1', [String(code)]);
   return { code: String(code), name: (c.rows.length && c.rows[0].name) || String(code) };
 }
 
 async function parentCodeSet(db) {
   const r = await db.query(
     'SELECT parent_code AS code FROM parents ' +
-    "UNION SELECT ee_company_code FROM companies WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' " +
     "UNION SELECT parent_company_code FROM companies WHERE parent_company_code IS NOT NULL AND parent_company_code <> ''");
   const set = {};
   r.rows.forEach(function (x) { if (x.code) set[String(x.code)] = true; });
@@ -1279,23 +1293,19 @@ async function listParents(db) {
   const nameRows = await db.query(
     'SELECT code, MAX(name) AS name FROM (' +
     'SELECT parent_code AS code, parent_name AS name FROM parents ' +
-    'UNION ALL SELECT ee_company_code, ee_company_name FROM companies ' +
-    "WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' " +
     'UNION ALL SELECT parent_company_code, parent_company_name FROM companies ' +
     "WHERE parent_company_code IS NOT NULL AND parent_company_code <> '') u GROUP BY code");
   const names = {};
   nameRows.rows.forEach(function (x) { if (x.code && x.name) names[String(x.code)] = x.name; });
   const tableNames = await db.query('SELECT parent_code, parent_name FROM parents');
   tableNames.rows.forEach(function (x) { names[String(x.parent_code)] = x.parent_name; });
-  // Child counts per parent: a company ties to its ee (parent) code first,
-  // matching parentKey() everywhere else in the app.
+  // Child counts per parent, matching parentKey() everywhere else in the app.
   const countsRows = await db.query(
     'SELECT pcode, COUNT(*)::int AS total, ' +
     "COUNT(*) FILTER (WHERE company_status = 'ACTIVE')::int AS active, " +
     "COUNT(*) FILTER (WHERE company_status = 'PENDING')::int AS pending, " +
     "COUNT(*) FILTER (WHERE company_status = 'TERMED')::int AS termed " +
-    'FROM (SELECT CASE WHEN ee_company_code IS NOT NULL AND ee_company_code <> ' + "''" + ' THEN ee_company_code ' +
-    "WHEN parent_company_code IS NOT NULL AND parent_company_code <> '' THEN parent_company_code END AS pcode, company_status FROM companies) s " +
+    'FROM (SELECT CASE WHEN parent_company_code IS NOT NULL AND parent_company_code <> ' + "''" + ' THEN parent_company_code END AS pcode, company_status FROM companies) s ' +
     'WHERE pcode IS NOT NULL GROUP BY pcode');
   const counts = {};
   countsRows.rows.forEach(function (x) { counts[String(x.pcode)] = x; });
@@ -1373,13 +1383,11 @@ app.put('/api/parent-page/:code', requireAdmin, async (req, res) => {
     // Make sure the parent has a concrete row before cascading.
     await client.query('INSERT INTO parents (parent_code, parent_name) VALUES ($1, $2) ON CONFLICT (parent_code) DO NOTHING', [oldCode, newName]);
     if (newCode !== oldCode) {
-      await client.query('UPDATE companies SET ee_company_code = $1 WHERE ee_company_code = $2', [newCode, oldCode]);
       await client.query('UPDATE companies SET parent_company_code = $1 WHERE parent_company_code = $2', [newCode, oldCode]);
       await client.query('UPDATE parent_documents SET parent_code = $1 WHERE parent_code = $2', [newCode, oldCode]);
       await client.query('UPDATE parents SET parent_code = $1, updated_at = NOW() WHERE parent_code = $2', [newCode, oldCode]);
     }
     await client.query('UPDATE parents SET parent_name = $1, updated_at = NOW() WHERE parent_code = $2', [newName, newCode]);
-    await client.query('UPDATE companies SET ee_company_name = $1 WHERE ee_company_code = $2', [newName, newCode]);
     await client.query('UPDATE companies SET parent_company_name = $1 WHERE parent_company_code = $2', [newName, newCode]);
     await client.query('COMMIT');
     client.release();
@@ -1397,7 +1405,7 @@ app.delete('/api/parent-page/:code', requireAdmin, async (req, res) => {
   try {
     const code = String(req.params.code || '').trim();
     const tied = await db.query(
-      'SELECT COUNT(*)::int AS n FROM companies WHERE ee_company_code = $1 OR parent_company_code = $1', [code]);
+      'SELECT COUNT(*)::int AS n FROM companies WHERE parent_company_code = $1', [code]);
     if (tied.rows[0].n > 0) {
       return res.status(400).json({ error: tied.rows[0].n + ' companies are still tied to this parent. Reassign or remove those companies first, then delete the parent.' });
     }
@@ -1419,8 +1427,7 @@ app.post('/api/parent-page/:code/documents/:kind', requireAdmin, handleUpload('f
     if (!set[code]) return res.status(404).json({ error: 'Parent not found' });
     if (!req.file) return res.status(400).json({ error: 'A file is required' });
     await db.query('INSERT INTO parents (parent_code, parent_name) ' +
-      'SELECT $1, COALESCE((SELECT MAX(ee_company_name) FROM companies WHERE ee_company_code = $1), ' +
-      '(SELECT MAX(parent_company_name) FROM companies WHERE parent_company_code = $1), $1) ' +
+      'SELECT $1, COALESCE((SELECT MAX(parent_company_name) FROM companies WHERE parent_company_code = $1), $1) ' +
       'ON CONFLICT (parent_code) DO NOTHING', [code]);
     await db.query(
       'INSERT INTO parent_documents (parent_code, doc_kind, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6) ' +
@@ -1514,7 +1521,7 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
     const r = await getPool().query(
-      'SELECT i.*, c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.parent_company_code, c.parent_company_name, ' +
+      'SELECT i.*, c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
       '(SELECT entered_at FROM stage_history h WHERE h.implementation_id = i.id AND h.exited_at IS NULL ' +
       'ORDER BY h.entered_at DESC LIMIT 1) AS stage_entered_at ' +
@@ -3341,8 +3348,8 @@ app.post('/api/admin/companies', requireAdmin, async (req, res) => {
     const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
     if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
     const r = await db.query(
-      'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
-      'VALUES ($1,$2,$3,$4,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
       [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED']);
     res.json({ success: true, company: r.rows[0] });
   } catch (error) {
@@ -3364,7 +3371,7 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
     const errs = companyFieldErrors(v);
     if (errs.length) return res.status(400).json({ error: errs.join(' ') });
     const db = getPool();
-    const cur = await db.query('SELECT company_code, parent_company_code, ee_company_code FROM companies WHERE company_code = $1', [code]);
+    const cur = await db.query('SELECT company_code, parent_company_code FROM companies WHERE company_code = $1', [code]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Company not found' });
     const codeChange = v.company_code !== code;
     if (codeChange) {
@@ -3381,10 +3388,10 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
         await client.query('UPDATE invoices SET company_code = $1 WHERE company_code = $2', [v.company_code, code]);
         await client.query('UPDATE commissions SET company_code = $1 WHERE company_code = $2', [v.company_code, code]);
         await client.query('UPDATE ein_account_xref SET acct = $1 WHERE acct = $2', [v.company_code, code]);
-        await client.query('UPDATE companies SET ee_company_code = $1, parent_company_code = $1 WHERE ee_company_code = $2 OR parent_company_code = $2', [v.company_code, code]);
+        await client.query('UPDATE companies SET parent_company_code = $1 WHERE parent_company_code = $2', [v.company_code, code]);
       }
       const r = await client.query(
-        'UPDATE companies SET company_code = $1, company_name = $2, ee_company_code = $3, ee_company_name = $4, parent_company_code = $3, parent_company_name = $4, ' +
+        'UPDATE companies SET company_code = $1, company_name = $2, parent_company_code = $3, parent_company_name = $4, ' +
         'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, active = $11 WHERE company_code = $12 RETURNING *',
         [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED', code]);
       await client.query('COMMIT');
@@ -3654,8 +3661,8 @@ function validateImport(type, rows) {
       const key = String(row.company_code).trim();
       if (seen[key]) { e('duplicate company_code in file'); return; }
       seen[key] = true;
-      const parentCode = row.parent_code || row.ee_company_code || row.parent_company_code;
-      const parentName = row.parent_name || row.ee_company_name || row.parent_company_name;
+      const parentCode = row.parent_code || row.parent_company_code;
+      const parentName = row.parent_name || row.parent_company_name;
       let status = null;
       const statusRaw = row.company_status !== undefined && row.company_status !== null ? String(row.company_status).trim() : '';
       if (statusRaw !== '') {
@@ -3674,8 +3681,8 @@ function validateImport(type, rows) {
       const txt = function (v) { return v !== undefined && v !== null && String(v).trim() !== '' ? String(v).trim() : null; };
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
-        ee_company_code: parentCode ? String(parentCode).trim() : null,
-        ee_company_name: parentName ? String(parentName).trim() : null,
+        parent_company_code: parentCode ? String(parentCode).trim() : null,
+        parent_company_name: parentName ? String(parentName).trim() : null,
         company_status: status,
         active: status === null ? null : (status !== 'TERMED'),
         ein: txt(row.ein),
@@ -3802,19 +3809,19 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
             'zip = COALESCE(EXCLUDED.zip, companies.zip)';
           if (c.company_status === null || c.company_status === undefined) {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, ein, address_1, city, state, zip) ' +
+              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip) ' +
               'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
-              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' + detailSets,
-              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.ein, c.address_1, c.city, c.state, c.zip]);
+              'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' + detailSets,
+              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.ein, c.address_1, c.city, c.state, c.zip]);
           } else {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, company_status, active, ein, address_1, city, state, zip) ' +
+              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, company_status, active, ein, address_1, city, state, zip) ' +
               'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
-              'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
+              'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' +
               'company_status = EXCLUDED.company_status, active = EXCLUDED.active, ' + detailSets,
-              [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.company_status, c.active, c.ein, c.address_1, c.city, c.state, c.zip]);
+              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.company_status, c.active, c.ein, c.address_1, c.city, c.state, c.zip]);
           }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
@@ -3865,7 +3872,7 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
     } else if (type === 'companies') {
       headers = ['parent_code', 'parent_name', 'company_code', 'ein', 'company_name', 'company_address_1', 'company_city', 'company_state', 'company_zip', 'company_status'];
       rows = (await db.query(
-        "SELECT ee_company_code AS parent_code, ee_company_name AS parent_name, company_code, ein, company_name, " +
+        "SELECT parent_company_code AS parent_code, parent_company_name AS parent_name, company_code, ein, company_name, " +
         "address_1 AS company_address_1, city AS company_city, state AS company_state, zip AS company_zip, " +
         "COALESCE(company_status, CASE WHEN active = FALSE THEN 'TERMED' ELSE 'ACTIVE' END) AS company_status " +
         'FROM companies ORDER BY company_code')).rows;
@@ -6135,7 +6142,7 @@ function validateDocusignPackage(pages, policyName) {
 }
 
 async function nextParentCode(db) {
-  const r = await db.query("SELECT COALESCE(NULLIF(parent_company_code, ''), ee_company_code) AS pc FROM companies");
+  const r = await db.query("SELECT parent_company_code AS pc FROM companies");
   let max = 1000;
   r.rows.forEach(function (x) {
     const m = String(x.pc || '').match(/^PC(\d+)$/);
@@ -6512,8 +6519,8 @@ app.post('/api/onboarding/:id/process-submit-companies', requireOnboarder, async
       [record.parent_code, record.parent_name]);
     for (const co of out.companies) {
       await client.query(
-        'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
-        'VALUES ($3, $4, $1, $2, $1, $2, $5, $6, $7, $8, $9, $10, TRUE)',
+        'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
+        'VALUES ($3, $4, $1, $2, $5, $6, $7, $8, $9, $10, TRUE)',
         [record.parent_code, record.parent_name, co.company_code, co.company_name, co.ein, co.company_address_1, co.company_city, co.company_state, co.company_zip, co.company_status]);
     }
     await client.query('UPDATE onboarding_clients SET companies_json = $1, wizard_step = 4, payroll_provider = COALESCE(NULLIF($2, \'\'), payroll_provider) WHERE id = $3',

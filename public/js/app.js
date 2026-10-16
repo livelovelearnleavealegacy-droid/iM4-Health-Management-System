@@ -901,8 +901,8 @@ function viewChild(id) {
       var c = d.company;
       var implCards = d.implementations.map(implCard).join('');
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
-      var eeCode = c.ee_company_code || c.parent_company_code;
-      var eeName = c.ee_company_name || c.parent_company_name || eeCode;
+      var eeCode = c.parent_company_code;
+      var eeName = c.parent_company_name || eeCode;
       var parentLink = (eeCode && eeCode !== c.company_code)
         ? '<p><a href="#/parent/' + esc(eeCode) + '">&larr; ' + esc(eeName) + '</a></p>'
         : '<p><a href="#/clients">&larr; Companies</a></p>';
@@ -1071,7 +1071,7 @@ function viewProject(id) {
       render(shell(
         '<p><a href="#/implementations">&larr; Implementation</a></p>' +
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
-        ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
+        (i.parent_company_name ? '<p class="muted">' + esc(i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
         '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage, i.stage_entered_at, rag) +
         '<h3>Updates</h3>' + updatesHtml(d.updates) +
@@ -1995,8 +1995,8 @@ function viewAdminCompanies() {
     var isAdmin = ar === 'admin';
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
-      function parentCode(c) { return c.ee_company_code || c.parent_company_code; }
-      function parentName(c) { return c.ee_company_name || c.parent_company_name; }
+      function parentCode(c) { return c.parent_company_code; }
+      function parentName(c) { return c.parent_company_name; }
       function statusOf(c) { return c.company_status || (c.active === false ? 'TERMED' : 'ACTIVE'); }
       var byCode = {};
       list.forEach(function (c) { byCode[c.company_code] = c; });
