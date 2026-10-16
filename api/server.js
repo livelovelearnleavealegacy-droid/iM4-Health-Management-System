@@ -6333,6 +6333,30 @@ app.delete('/api/onboarding/:id/documents/:docId', requireOnboarder, async (req,
 });
 
 // Download a document.
+// v6.10.0 (Leroy): delete an unfinished onboarding session. Only before
+// the point of no return: a completed session is a record, and once
+// companies have been created (Step 4) the session stays - the companies
+// themselves are managed on the Companies page. Documents and audit
+// issues cascade-delete with the client row.
+app.delete('/api/onboarding/:id', requireOnboarder, async (req, res) => {
+  const r = req.user && req.user.activeRole;
+  if (r !== 'admin' && r !== 'onboarding') return res.status(403).json({ error: 'Admin or Onboarding only' });
+  try {
+    const db = getPool();
+    const cur = await db.query('SELECT status, wizard_step, github_issue_number FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Onboarding session not found' });
+    const c = cur.rows[0];
+    if (c.status === 'complete' || c.github_issue_number) {
+      return res.status(400).json({ error: 'This onboarding is complete and cannot be deleted.' });
+    }
+    if ((c.wizard_step || 1) >= 4) {
+      return res.status(400).json({ error: 'Companies were already created from this session, so the session cannot be deleted. The companies themselves can be removed on the Companies page.' });
+    }
+    await db.query('DELETE FROM onboarding_clients WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Onboarding session delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.get('/api/onboarding/:id/documents/:docId/download', requireOnboarder, async (req, res) => {
   try {
     const r = await getPool().query('SELECT file_name, mime_type, file_data FROM onboarding_documents WHERE id = $1 AND client_id = $2', [req.params.docId, req.params.id]);

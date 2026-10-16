@@ -3650,14 +3650,17 @@ function viewOnboarding() {
     api.get('/api/onboarding').then(function (list) {
       var prog = list.filter(function (c) { return c.status === 'in_progress'; });
       var done = list.filter(function (c) { return c.status !== 'in_progress'; });
+      var canDel = activeRole() === 'admin' || activeRole() === 'onboarding';
       function card(c) {
         var badge = c.critical_open > 0
           ? '<span class="rag rag-red">' + c.critical_open + ' critical</span>'
           : '<span class="rag rag-green">Checked</span>';
+        var delBtn = (canDel && c.status === 'in_progress' && (c.wizard_step || 1) < 4)
+          ? ' <button class="btn btn-danger" data-obdel="' + c.id + '">Delete</button>' : '';
         return '<div class="ob-card"><div class="ob-card-head"><b>' + esc(c.client_name) + '</b>' + badge + '</div>' +
           '<div class="muted">' + c.doc_count + ' document(s) &middot; started ' + fmtDate(c.created_at) +
           (c.github_issue_number ? ' &middot; GitHub #' + c.github_issue_number : '') + '</div>' +
-          '<p><a class="btn btn-primary" href="#/onboarding/' + (c.wizard_step ? 'process/' : '') + c.id + '">Open</a></p></div>';
+          '<p><a class="btn btn-primary" href="#/onboarding/' + (c.wizard_step ? 'process/' : '') + c.id + '">Open</a>' + delBtn + '</p></div>';
       }
       render(shell(
         '<h2>Onboarding</h2><div id="err"></div>' +
@@ -3667,6 +3670,13 @@ function viewOnboarding() {
         '<h3>Complete (' + done.length + ')</h3>' +
         (done.length ? '<div class="ob-grid">' + done.map(card).join('') + '</div>' : '<p class="muted">Nothing completed yet.</p>'),
         '#/onboarding'));
+      document.querySelectorAll('[data-obdel]').forEach(function (b) {
+        b.onclick = function () {
+          if (!window.confirm('Delete this unfinished onboarding session and its uploaded documents? This cannot be undone.')) return;
+          api.delete('/api/onboarding/' + b.getAttribute('data-obdel')).then(function () { viewOnboarding(); })
+            .catch(function (e) { document.getElementById('err').innerHTML = errorHtml(e.message); });
+        };
+      });
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/onboarding')); });
   });
 }
@@ -3689,7 +3699,8 @@ function viewOnboardingNew() {
       '<div class="card"><h3>Step 1: Upload the DocuSign package</h3>' +
       '<p class="muted">Upload the completed DocuSign package (PDF). It must contain the Group Benefits - Fixed Indemnity Application, the Master Services Agreement, and the Authorization Agreement for Direct Payments (ACH).</p>' +
       '<p><input type="file" id="obpkg" accept=".pdf"></p>' +
-      '<p><button class="btn btn-primary" id="obgo">Upload and verify</button></p><div id="obout"></div></div>' +
+      '<p><button class="btn btn-primary" id="obgo">Upload and verify</button></p><div id="obout"></div>' +
+      '<p id="obcancelwrap" style="display:none;"><button class="btn btn-danger" id="obcancel">Cancel and delete this session</button></p></div>' +
       '<div class="card" id="obstep2" style="display:none;"><h3>Step 2: Verification</h3><div id="obchecks"></div><div id="obparent"></div></div>',
       '#/onboarding/new'));
     function showErr(m) { document.getElementById('err').innerHTML = errorHtml(m); }
@@ -3739,8 +3750,15 @@ function viewOnboardingNew() {
       if (processId) { uploadAndCheck(); return; }
       api.post('/api/onboarding/process-start', {}).then(function (r) {
         processId = r.id;
+        document.getElementById('obcancelwrap').style.display = '';
         uploadAndCheck();
       }).catch(function (e) { out.innerHTML = errorHtml(e.message); });
+    };
+    document.getElementById('obcancel').onclick = function () {
+      if (!processId) { location.hash = '#/onboarding'; return; }
+      if (!window.confirm('Cancel and delete this onboarding session and its uploaded documents? This cannot be undone.')) return;
+      api.delete('/api/onboarding/' + processId).then(function () { location.hash = '#/onboarding'; })
+        .catch(function (e) { showErr(e.message); });
     };
   });
 }
@@ -3782,11 +3800,22 @@ function viewOnboardingProcess(id) {
           done = '<div class="card"><h3>Submitted</h3><p>This onboarding is complete.' +
             (c.github_issue_number ? ' GitHub card: <b>#' + c.github_issue_number + '</b> (' + esc(c.github_repo || '') + ').' : '') + '</p></div>';
         }
+        var delSession = '';
+        if (c.status === 'in_progress' && (c.wizard_step || 1) < 4 && (activeRole() === 'admin' || activeRole() === 'onboarding')) {
+          delSession = '<p><button class="btn btn-danger" id="obdelsession">Delete this session</button> ' +
+            '<span class="muted">Stops this onboarding here and removes the session and its uploaded documents. Nothing has been created from it yet.</span></p>';
+        }
         render(shell(
           '<p><a href="#/onboarding">&larr; Onboarding</a></p>' +
           '<h2>Onboarding: ' + esc(c.parent_name || c.client_name) + '</h2><div id="err"></div>' +
-          parentLine + step2 + step3 + step4 + done,
+          parentLine + delSession + step2 + step3 + step4 + done,
           '#/onboarding'));
+        var delSessBtn = document.getElementById('obdelsession');
+        if (delSessBtn) delSessBtn.onclick = function () {
+          if (!window.confirm('Delete this unfinished onboarding session and its uploaded documents? This cannot be undone.')) return;
+          api.delete('/api/onboarding/' + id).then(function () { location.hash = '#/onboarding'; })
+            .catch(function (e) { document.getElementById('err').innerHTML = errorHtml(e.message); });
+        };
         var preUp = document.getElementById('obpreup');
         if (preUp) preUp.onclick = function () {
           var f = document.getElementById('obpre').files[0];
