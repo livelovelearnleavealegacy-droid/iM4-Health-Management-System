@@ -669,15 +669,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (remove after use): companies column list after the drops.
-app.get('/api/temp-cols-probe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const cols = await getPool().query("SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' ORDER BY ordinal_position");
-    res.json({ companies_columns: cols.rows.map(function (r) { return r.column_name; }) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
