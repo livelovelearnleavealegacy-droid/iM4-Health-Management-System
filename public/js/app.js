@@ -349,25 +349,28 @@ function windowTables() {
 // the container's own bottom scrollbar.
 function syncTopScrollbars() {
   document.querySelectorAll('.table-scroll, .comm-scroll').forEach(function (sc) {
-    if (sc.dataset.topbar) return;
-    if (sc.scrollWidth <= sc.clientWidth + 1) return;
-    sc.dataset.topbar = '1';
-    var bar = document.createElement('div');
-    bar.className = 'top-scroll';
-    var inner = document.createElement('div');
-    inner.style.height = '1px';
-    inner.style.width = sc.scrollWidth + 'px';
-    bar.appendChild(inner);
-    sc.parentNode.insertBefore(bar, sc);
+    var prev = sc.previousElementSibling;
+    var bar = (prev && prev.classList && prev.classList.contains('top-scroll')) ? prev : null;
+    if (!bar) {
+      if (sc.scrollWidth <= sc.clientWidth + 1) return;
+      bar = document.createElement('div');
+      bar.className = 'top-scroll';
+      var inner = document.createElement('div');
+      inner.style.height = '1px';
+      bar.appendChild(inner);
+      sc.parentNode.insertBefore(bar, sc);
+      var lock = false;
+      bar.onscroll = function () { if (!lock) { lock = true; sc.scrollLeft = bar.scrollLeft; lock = false; } };
+      sc.onscroll = function () { if (!lock) { lock = true; bar.scrollLeft = sc.scrollLeft; lock = false; } };
+    }
     // The top bar is exactly as wide as the table window it mirrors, and
-    // aligned with it (v6.8.4) — never wider than the table.
+    // aligned with it (v6.8.4) — never wider than the table. Refreshed on
+    // every pass so late layout changes are picked up (v6.9.3).
     var cs = window.getComputedStyle(sc);
+    bar.firstChild.style.width = sc.scrollWidth + 'px';
     bar.style.width = sc.clientWidth + 'px';
     bar.style.marginLeft = cs.marginLeft;
     bar.style.marginRight = cs.marginRight;
-    var lock = false;
-    bar.onscroll = function () { if (!lock) { lock = true; sc.scrollLeft = bar.scrollLeft; lock = false; } };
-    sc.onscroll = function () { if (!lock) { lock = true; bar.scrollLeft = sc.scrollLeft; lock = false; } };
   });
 }
 
