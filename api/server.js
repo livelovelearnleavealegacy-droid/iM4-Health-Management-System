@@ -745,28 +745,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (remove after use): company_status vs active distribution.
-app.get('/api/temp-active-probe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const has = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'companies' AND column_name = 'active'");
-    const out = { has_active: !!has.rows.length };
-    const sc = await db.query("SELECT COALESCE(NULLIF(company_status, ''), '(blank)') AS s, COUNT(*)::int AS n FROM companies GROUP BY 1 ORDER BY 1");
-    out.status_counts = sc.rows;
-    out.total = sc.rows.reduce(function (a, r) { return a + r.n; }, 0);
-    if (has.rows.length) {
-      const ac = await db.query('SELECT active::text AS a, COUNT(*)::int AS n FROM companies GROUP BY 1 ORDER BY 1');
-      out.active_counts = ac.rows;
-      const mm = await db.query("SELECT COUNT(*)::int AS n FROM companies WHERE (company_status = 'TERMED') <> (active IS FALSE)");
-      out.status_active_mismatches = mm.rows[0].n;
-      const blank = await db.query("SELECT COUNT(*)::int AS n FROM companies WHERE company_status IS NULL OR company_status = ''");
-      out.blank_status = blank.rows[0].n;
-    }
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
