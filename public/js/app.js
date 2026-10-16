@@ -486,7 +486,9 @@ function viewDashboard() {
         '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div></div>' +
         '<div class="card"><div class="card-title">$ Outstanding</div><div class="stat-big">' + fmtMoney(d.billingOpen.total) + '</div></div>' +
         '</div>' +
-        '<h3>My Accountability</h3>' +
+        '<h3>Implementation Stage</h3>' +
+        '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>' +
+        '<h3>Service Tickets</h3>' +
         '<div class="card-grid">' +
         '<div class="card"><div class="card-title">My Open Tickets</div><div class="stat-big">' + (a.my_open_tickets || 0) + '</div></div>' +
         '<div class="card"><div class="card-title">Resolved (30d)</div><div class="stat-big">' + (a.my_resolved_30d || 0) + '</div></div>' +
@@ -496,8 +498,12 @@ function viewDashboard() {
           var nm = ((m.first_name || '') + ' ' + (m.last_name || '')).trim() || m.email;
           return '<tr><td>' + esc(nm) + '</td><td><b>' + m.open_tickets + '</b></td><td>' + m.resolved_30d + '</td></tr>';
         }).join('') + '</tbody></table></div>' : '') +
-        '<h3>Implementation Stage</h3>' +
-        '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>',
+        // Accountability (v6.3, Leroy): placeholder. Tasks assigned to the
+        // signed-in person will be listed here with a checkmark; checking
+        // one grays it out and it disappears 48 hours later. Tasks will be
+        // created from the Implementation Kanban boards (details TBD).
+        '<h3>Accountability</h3>' +
+        '<div class="card"><p class="muted">Tasks assigned to you will be listed here. Check a task when it is done — it grays out and disappears after 48 hours. Tasks will be created from the Implementation Kanban boards. (Coming soon.)</p></div>',
         '#/dashboard'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/dashboard')); });
   });
