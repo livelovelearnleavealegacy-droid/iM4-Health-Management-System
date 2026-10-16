@@ -268,7 +268,6 @@ async function migrate() {
     ['companies', 'city', 'TEXT'],
     ['companies', 'state', 'TEXT'],
     ['companies', 'zip', 'TEXT'],
-    ['companies', 'github_issue_number', 'INT'],
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
 
@@ -320,6 +319,10 @@ async function migrate() {
     'ALTER TABLE companies DROP COLUMN ee_company_code; ' +
     'ALTER TABLE companies DROP COLUMN ee_company_name; ' +
     'END IF; END $$');
+  // v6.11.1 (Leroy): companies.github_issue_number was never read or written
+  // (the live issue numbers live on implementations and onboarding_clients)
+  // and held no values - drop it. Its re-add entry above is also removed.
+  await db.query('ALTER TABLE companies DROP COLUMN IF EXISTS github_issue_number');
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
   // v5: backfill user_roles from the legacy single-role column (idempotent).
   await db.query("INSERT INTO user_roles (steward_id, role) SELECT id, role FROM stewards WHERE role IN ('admin', 'steward', 'top_dog') ON CONFLICT DO NOTHING");
@@ -665,6 +668,15 @@ function displayName(u) {
   const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
   return full || u.name || u.email;
 }
+
+// TEMP PROBE (remove after use): companies column list after the drops.
+app.get('/api/temp-cols-probe', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const cols = await getPool().query("SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' ORDER BY ordinal_position");
+    res.json({ companies_columns: cols.rows.map(function (r) { return r.column_name; }) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
