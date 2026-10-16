@@ -5058,17 +5058,6 @@ async function runGithubSync() {
   }
 }
 
-// TEMP PROBE (remove after use): live gate lists for the commissions split.
-app.get('/api/admin/probe-gate-lists', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const codes = (await db.query('SELECT company_code FROM companies ORDER BY company_code')).rows.map(r => String(r.company_code));
-    const sids = (await db.query('SELECT id FROM stewards ORDER BY id')).rows.map(r => Number(r.id));
-    res.json({ companies: codes, stewards: sids });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 app.post('/api/admin/sync-github', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
