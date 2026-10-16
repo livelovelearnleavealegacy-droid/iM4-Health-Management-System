@@ -326,6 +326,7 @@ function okHtml(msg) {
 
 function filterBar(searchVal, extra) {
   return '<div class="filterbar"><input id="fq" type="search" placeholder="Search..." value="' + esc(searchVal || '') + '">' +
+    '<button class="btn btn-small" id="fqreset" type="button" style="margin-left:2px;">Reset</button>' +
     (extra || '') + '</div>';
 }
 
@@ -697,6 +698,7 @@ function viewClients() {
         var fq = document.getElementById('fq');
         fq.onchange = function () { q = fq.value; load(); };
         fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
+        document.getElementById('fqreset').onclick = function () { q = ''; fq.value = ''; load(); };
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/clients')); });
     }
     load();
@@ -883,6 +885,7 @@ function viewImplementations() {
         var fs = document.getElementById('fstage');
         fq.onchange = function () { q = fq.value; load(); };
         fq.onkeydown = function (e) { if (e.key === 'Enter') { q = fq.value; load(); } };
+        document.getElementById('fqreset').onclick = function () { q = ''; fq.value = ''; load(); };
         fs.onchange = function () { stage = fs.value; load(); };
       }).catch(function (err) { render(shell(errorHtml(err.message), '#/implementations')); });
     }
@@ -1334,9 +1337,8 @@ function viewAdminCommissions() {
           '<p class="muted">Companies appear as they are added to the Company table. Onboarding and Admin can edit Steward IDs and Percentages. An Admin can delete a company\'s commission row (all of its splits) &mdash; the company itself is not deleted. No one can delete a company from this page.</p>' +
           '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
             '<div style="position:relative;flex:1;min-width:260px;">' +
-              '<label>Search <input id="cmSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"></label>' +
+              '<label>Search</label> <span style="display:inline-flex;gap:2px;align-items:center;"><input id="cmSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"><button class="btn btn-small" id="cmReset" type="button">Reset</button></span>' +
               '<div id="cmSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
-              '<div id="cmExact" style="margin-top:4px;"></div>' +
             '</div>' +
             '<div><label>Status <select id="cmStatusFilter">' +
               '<option value="active" selected>Active</option>' +
@@ -1358,9 +1360,10 @@ function viewAdminCommissions() {
           var statusEl = document.getElementById('cmStatusFilter');
           searchEl.value = cmQuery;
           statusEl.value = cmStatusFilter;
+          var cmSuggestClosed = false;
           function paintSuggest() {
             var box = document.getElementById('cmSuggest');
-            if (!cmQuery || cmExact) { box.style.display = 'none'; box.innerHTML = ''; return; }
+            if (!cmQuery || cmExact || cmSuggestClosed) { box.style.display = 'none'; box.innerHTML = ''; return; }
             var q = cmQuery.toLowerCase();
             var matches = list.filter(function (c) { return String(c.company_name || '').toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
             if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
@@ -1394,18 +1397,15 @@ function viewAdminCommissions() {
               }
               tr.style.display = show ? '' : 'none';
             });
-            var ex = document.getElementById('cmExact');
-            if (cmExact) {
-              var cc = byCode[cmExact] || {};
-              ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(cc.company_name || cmExact) + '</b> (' + esc(cmExact) + ')</span> ' +
-                '<button class="btn btn-small" id="cmClear">Clear</button>';
-              document.getElementById('cmClear').onclick = function () {
-                cmExact = null; cmQuery = ''; searchEl.value = ''; apply();
-              };
-            } else { ex.innerHTML = ''; }
             paintSuggest();
           }
-          searchEl.addEventListener('input', function (e) { cmQuery = e.target.value; cmExact = null; apply(); });
+          searchEl.addEventListener('input', function (e) { cmQuery = e.target.value; cmExact = null; cmSuggestClosed = false; apply(); });
+          searchEl.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); cmSuggestClosed = true; apply(); }
+          });
+          document.getElementById('cmReset').onclick = function () {
+            cmExact = null; cmQuery = ''; cmSuggestClosed = false; searchEl.value = ''; apply();
+          };
           statusEl.onchange = function (e) { cmStatusFilter = e.target.value; apply(); };
           apply();
         })();
@@ -1975,9 +1975,8 @@ function viewAdminCompanies() {
         (isAdmin ? '<p><button class="btn btn-primary" id="co-add">Add Company</button></p>' : '') + (canMaintain ? editor : '') +
         '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
           '<div style="position:relative;flex:1;min-width:260px;">' +
-            '<label>Search <input id="coSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"></label>' +
+            '<label>Search</label> <span style="display:inline-flex;gap:2px;align-items:center;"><input id="coSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"><button class="btn btn-small" id="coReset" type="button">Reset</button></span>' +
             '<div id="coSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
-            '<div id="coExact" style="margin-top:4px;"></div>' +
           '</div>' +
           '<div><label>Status <select id="coStatusFilter">' +
             '<option value="active">Active</option>' +
@@ -2013,22 +2012,12 @@ function viewAdminCompanies() {
           }
           tr.style.display = show ? '' : 'none';
         });
-        var ex = document.getElementById('coExact');
-        if (coExact) {
-          var cc = byCode[coExact] || {};
-          ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(cc.company_name || coExact) + '</b> (' + esc(coExact) + ')</span> ' +
-            '<button class="btn btn-small" id="coClear">Clear</button>';
-          document.getElementById('coClear').onclick = function () {
-            coExact = null; coQuery = '';
-            document.getElementById('coSearch').value = '';
-            applyCompanyFilter();
-          };
-        } else { ex.innerHTML = ''; }
         paintCoSuggest();
       }
+      var coSuggestClosed = false;
       function paintCoSuggest() {
         var box = document.getElementById('coSuggest');
-        if (!coQuery || coExact) { box.style.display = 'none'; box.innerHTML = ''; return; }
+        if (!coQuery || coExact || coSuggestClosed) { box.style.display = 'none'; box.innerHTML = ''; return; }
         var q = coQuery.toLowerCase();
         var matches = list.filter(function (c) { return String(c.company_name || '').toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
         if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
@@ -2048,8 +2037,16 @@ function viewAdminCompanies() {
         });
       }
       document.getElementById('coSearch').addEventListener('input', function (e) {
-        coQuery = e.target.value; coExact = null; applyCompanyFilter();
+        coQuery = e.target.value; coExact = null; coSuggestClosed = false; applyCompanyFilter();
       });
+      document.getElementById('coSearch').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); coSuggestClosed = true; applyCompanyFilter(); }
+      });
+      document.getElementById('coReset').onclick = function () {
+        coQuery = ''; coExact = null; coSuggestClosed = false;
+        document.getElementById('coSearch').value = '';
+        applyCompanyFilter();
+      };
       document.getElementById('coStatusFilter').onchange = applyCompanyFilter;
       applyCompanyFilter();
       // Parents (for the editor's Parent Code dropdown) — the same list the
@@ -2325,10 +2322,11 @@ function viewParentPage() {
           ? '<button class="btn btn-small" data-edit="' + esc(p.parent_code) + '">Edit</button> <button class="btn btn-small" data-del="' + esc(p.parent_code) + '">Delete</button>'
           : '<span class="muted">View only</span>') + '</td></tr>';
     }
+    var suggestClosed = false;
     function paintSuggest() {
       var box = document.getElementById('parentSuggest');
       if (!box) return;
-      if (!query || exactCode) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      if (!query || exactCode || suggestClosed) { box.style.display = 'none'; box.innerHTML = ''; return; }
       var q = query.toLowerCase();
       var matches = all.filter(function (p) { return p.parent_name.toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
       if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
@@ -2354,17 +2352,6 @@ function viewParentPage() {
       if (!tbody) return;
       tbody.innerHTML = rows.length ? rows.map(rowHtml).join('') : '<tr><td colspan="7" class="muted">No parents match.</td></tr>';
       document.getElementById('parentCount').textContent = rows.length + ' of ' + all.length + ' parents shown';
-      var ex = document.getElementById('parentExact');
-      if (exactCode) {
-        var p = all.filter(function (x) { return x.parent_code === exactCode; })[0];
-        ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(p ? p.parent_name : exactCode) + '</b> (' + esc(exactCode) + ')</span> ' +
-          '<button class="btn btn-small" id="parentClear">Clear</button>';
-        document.getElementById('parentClear').onclick = function () {
-          exactCode = null; query = '';
-          document.getElementById('parentSearch').value = '';
-          paint();
-        };
-      } else { ex.innerHTML = ''; }
       wireRows();
       paintSuggest();
     }
@@ -2431,9 +2418,8 @@ function viewParentPage() {
         : '') +
       '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
         '<div style="position:relative;flex:1;min-width:260px;">' +
-          '<label>Search <input id="parentSearch" type="text" placeholder="Start typing a parent name..." autocomplete="off"></label>' +
+          '<label>Search</label> <span style="display:inline-flex;gap:2px;align-items:center;"><input id="parentSearch" type="text" placeholder="Start typing a parent name..." autocomplete="off"><button class="btn btn-small" id="parentReset" type="button">Reset</button></span>' +
           '<div id="parentSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
-          '<div id="parentExact" style="margin-top:4px;"></div>' +
         '</div>' +
         '<div><label>Status <select id="parentStatusFilter">' +
           '<option value="active">Active</option>' +
@@ -2451,8 +2437,16 @@ function viewParentPage() {
       '<input type="file" id="parentDocFile" style="display:none;">',
       '#/parent-page'));
     document.getElementById('parentSearch').addEventListener('input', function (e) {
-      query = e.target.value; exactCode = null; paint();
+      query = e.target.value; exactCode = null; suggestClosed = false; paint();
     });
+    document.getElementById('parentSearch').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); suggestClosed = true; paint(); }
+    });
+    document.getElementById('parentReset').onclick = function () {
+      query = ''; exactCode = null; suggestClosed = false;
+      document.getElementById('parentSearch').value = '';
+      paint();
+    };
     document.getElementById('parentStatusFilter').onchange = function (e) { statusFilter = e.target.value; paint(); };
     document.getElementById('parentDocFile').onchange = function (e) {
       var f = e.target.files[0];
