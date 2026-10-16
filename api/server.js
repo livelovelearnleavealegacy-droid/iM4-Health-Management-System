@@ -658,51 +658,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (v6.8.5 diagnostics, remove after use): EIN format stats for
-// the payroll matching investigation. Sync-secret gated, aggregated only.
-app.get('/api/temp-ein-probe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const out = {};
-    const x = await db.query("SELECT COUNT(*)::int AS n, COUNT(DISTINCT regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g'))::int AS distinct_n FROM ein_account_xref WHERE tin IS NOT NULL");
-    out.xref = x.rows[0];
-    const xl = await db.query("SELECT length(regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g')) AS len, COUNT(*)::int AS n FROM ein_account_xref WHERE tin IS NOT NULL GROUP BY 1 ORDER BY 1");
-    out.xref_len_dist = xl.rows;
-    const xs = await db.query("SELECT tin FROM ein_account_xref WHERE tin IS NOT NULL ORDER BY tin LIMIT 5");
-    out.xref_samples = xs.rows.map(function (r) { return r.tin; });
-    const ps = await db.query('SELECT COUNT(*)::int AS n, MAX(file_name) AS latest_file FROM payroll_company_summary');
-    out.summary = ps.rows[0];
-    const pl = await db.query("SELECT length(ein) AS len, COUNT(*)::int AS n FROM payroll_company_summary WHERE ein IS NOT NULL GROUP BY 1 ORDER BY 1");
-    out.summary_ein_len_dist = pl.rows;
-    const pss = await db.query('SELECT ein FROM payroll_company_summary WHERE ein IS NOT NULL ORDER BY ein LIMIT 5');
-    out.summary_samples = pss.rows.map(function (r) { return r.ein; });
-    const co = await db.query("SELECT COUNT(*)::int AS total, COUNT(ein)::int AS with_ein, COUNT(payroll_ein)::int AS with_payroll_ein FROM companies");
-    out.companies = co.rows[0];
-    const cs = await db.query('SELECT ein FROM companies WHERE ein IS NOT NULL ORDER BY ein LIMIT 5');
-    out.company_ein_samples = cs.rows.map(function (r) { return r.ein; });
-    // Match simulation: summary EINs vs xref set, raw-normalized vs zero-padded.
-    const xr = await db.query("SELECT DISTINCT regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g') AS n FROM ein_account_xref WHERE tin IS NOT NULL");
-    const setRaw = {}, setPad = {};
-    xr.rows.forEach(function (r) {
-      if (!r.n) return;
-      setRaw[r.n] = true;
-      const p = /^[0-9]+$/.test(r.n) && r.n.length < 9 ? r.n.padStart(9, '0') : r.n;
-      setPad[p] = true;
-    });
-    const sm = await db.query('SELECT DISTINCT ein FROM payroll_company_summary WHERE ein IS NOT NULL');
-    let mRaw = 0, mPad = 0;
-    sm.rows.forEach(function (r) {
-      const n = String(r.ein).replace(/[^0-9a-zA-Z]/g, '');
-      if (setRaw[n]) mRaw++;
-      const p = /^[0-9]+$/.test(n) && n.length < 9 ? n.padStart(9, '0') : n;
-      if (setPad[p]) mPad++;
-    });
-    out.match_sim = { summary_distinct_eins: sm.rows.length, matched_raw_normalized: mRaw, matched_with_zero_pad: mPad };
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
@@ -2131,6 +2086,17 @@ function payrollBool(v) {
   return s === 'true' || s === 'yes' || s === '1';
 }
 
+// v6.9.0 (Leroy): canonical EIN form for ALL matching - punctuation and
+// dashes stripped, uppercased, and a purely numeric value shorter than 9
+// digits is left-padded with zeros (Excel number cells lose leading
+// zeros). With or without the dash, the same EIN produces the same key.
+function normEin(v) {
+  if (v === null || v === undefined) return '';
+  let s = String(v).replace(/[^0-9a-zA-Z]/g, '').toUpperCase();
+  if (/^[0-9]+$/.test(s) && s.length < 9) s = s.padStart(9, '0');
+  return s;
+}
+
 function parsePayrollExport(buffer, fileName) {
   // v5.36: one row per EIN — the latest case with Status='done' that has at
   // least one finalized employee. Headcounts come from the case's LATEST
@@ -2186,9 +2152,10 @@ function parsePayrollExport(buffer, fileName) {
   const cases = {};
   rows.forEach(function (r) {
     const caseNum = txt(r[cCase]);
-    // Normalize EIN: the export mixes '47-2606741' and '472606741' for the same
-    // company. Keep letters so division suffixes ('-reg', '-105A') stay distinct.
-    const ein = txt(r[cEin]) ? txt(r[cEin]).replace(/[^0-9a-zA-Z]/g, '') : null;
+    // Normalize EIN (v6.9.0): canonical key via normEin so '47-2606741',
+    // '472606741', and a zero-stripped Excel number all match. Letters are
+    // kept so division suffixes ('-reg', '-105A') stay distinct.
+    const ein = txt(r[cEin]) ? normEin(txt(r[cEin])) : null;
     if (!caseNum || !ein) return;
     const key = ein + '|' + caseNum;
     let c = cases[key];
@@ -2323,15 +2290,19 @@ app.post('/api/admin/jobs/payroll-preview', requireAdmin, handleUpload('file'), 
       employees += g.employee_count;
       if (g.ineligible_count + g.opt_out_count + g.eligible_count !== g.employee_count) reconBad++;
     });
-    // How many companies will match to iM4 company codes via the EIN cross-reference?
+    // How many companies will match to iM4 company codes? v6.9.0: EINs are
+    // matched in canonical form (dash or no dash, leading zeros restored)
+    // against the EIN cross-reference AND the companies table's own EINs.
     const db = getPool();
     let matched = 0;
     try {
-      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n FROM ein_account_xref WHERE tin IS NOT NULL', ['[^0-9a-zA-Z]', '', 'g']);
       const tinSet = {};
-      xr.rows.forEach(function (r) { if (r.tin_n) tinSet[r.tin_n] = true; });
+      const xr = await db.query('SELECT DISTINCT tin FROM ein_account_xref WHERE tin IS NOT NULL');
+      xr.rows.forEach(function (r) { const n = normEin(r.tin); if (n) tinSet[n] = true; });
+      const ce = await db.query('SELECT DISTINCT ein FROM companies WHERE ein IS NOT NULL');
+      ce.rows.forEach(function (r) { const n = normEin(r.ein); if (n) tinSet[n] = true; });
       groups.forEach(function (g) {
-        const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
+        const en = normEin(g.ein);
         if (en && tinSet[en]) matched++;
       });
     } catch (e) { /* xref table may not exist yet */ }
@@ -2376,15 +2347,26 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
     // downstream of companies.payroll_*) picks them up.
     let companiesUpdated = 0, xrefMissed = 0;
     try {
-      const xr = await db.query('SELECT DISTINCT regexp_replace(tin, %s, %s, %s) AS tin_n, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL', ['[^0-9a-zA-Z]', '', 'g']);
       const acctByTin = {};
+      const xr = await db.query('SELECT DISTINCT tin, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL');
       xr.rows.forEach(function (r) {
-        if (!r.tin_n || !r.acct) return;
-        if (!acctByTin[r.tin_n]) acctByTin[r.tin_n] = [];
-        acctByTin[r.tin_n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
+        const n = normEin(r.tin);
+        if (!n || !r.acct) return;
+        if (!acctByTin[n]) acctByTin[n] = [];
+        acctByTin[n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
+      });
+      // v6.9.0: fall back to the companies table's own EIN when the
+      // cross-reference has no entry for it - every company carries an EIN,
+      // so a payroll row whose EIN matches a company always lands.
+      const ce = await db.query('SELECT company_code, ein FROM companies WHERE ein IS NOT NULL');
+      ce.rows.forEach(function (r) {
+        const n = normEin(r.ein);
+        if (!n || !r.company_code) return;
+        if (!acctByTin[n]) acctByTin[n] = [];
+        if (acctByTin[n].indexOf(r.company_code) === -1) acctByTin[n].push(r.company_code);
       });
       for (const g of groups) {
-        const en = String(g.ein || '').replace(/[^0-9a-zA-Z]/g, '');
+        const en = normEin(g.ein);
         const accts = acctByTin[en] || [];
         if (!accts.length) { xrefMissed++; continue; }
         const notEnrolled = Math.max(g.eligible_count - g.enrolled_count - g.new_count, 0);

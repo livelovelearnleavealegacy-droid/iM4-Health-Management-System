@@ -318,6 +318,10 @@ function render(html) {
   window.scrollTo(0, 0);
 }
 
+// Re-run the table enhancements after a view paints rows itself (the
+// Parent page fills its table after render). v6.9.0.
+function enhanceTables() { windowTables(); syncTopScrollbars(); }
+
 // v6.8.3 (Leroy): any table with more than 15 rows becomes a scrollable
 // window showing 15 rows; the column headings stay fixed at the top of
 // the window while scrolling (CSS makes thead sticky inside scroll
@@ -1989,7 +1993,7 @@ function viewAdminCompanies() {
             (isAdmin ? ' <button class="btn btn-small" data-del="' + esc(c.company_code) + '">Delete</button>' : '') + '</td>';
         }
         return '<tr data-status="' + status + '" data-name="' + esc(String(c.company_name || '').toLowerCase()) + '" data-code="' + esc(c.company_code) + '">' + cell(parentCode(c)) + cell(parentName(c)) +
-          '<td><b>' + esc(c.company_code) + '</b></td>' + cell(c.ein) + '<td>' + esc(c.company_name) + '</td>' +
+          '<td><b>' + esc(c.company_code) + '</b></td>' + '<td style="white-space:nowrap;min-width:100px;">' + esc(c.ein || '') + '</td>' + '<td>' + esc(c.company_name) + '</td>' +
           cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) +
           '<td>' + statusHtml + '</td>' +
           '<td id="ach-' + esc(c.company_code) + '"><span class="muted">...</span></td>' + actions + '</tr>';
@@ -2038,7 +2042,7 @@ function viewAdminCompanies() {
           '</select></label></div>' +
         '</div>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
-        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>EIN</th><th>Company Name</th>' +
+        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th style="white-space:nowrap;min-width:100px;">EIN</th><th>Company Name</th>' +
         '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th><th>ACH</th>' +
         (canMaintain ? '<th>Actions</th>' : '') + '</tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>' +
@@ -2405,6 +2409,7 @@ function viewParentPage() {
       document.getElementById('parentCount').textContent = rows.length + ' of ' + all.length + ' parents shown';
       wireRows();
       paintSuggest();
+      enhanceTables();
     }
     function wireRows() {
       document.querySelectorAll('[data-edit]').forEach(function (b) {
