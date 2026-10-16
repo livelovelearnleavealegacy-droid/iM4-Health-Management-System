@@ -313,8 +313,31 @@ function render(html) {
       links[i].onclick = function () { hm.classList.remove('open'); };
     }
   }
+  windowTables();
   syncTopScrollbars();
   window.scrollTo(0, 0);
+}
+
+// v6.8.3 (Leroy): any table with more than 15 rows becomes a scrollable
+// window showing 15 rows; the column headings stay fixed at the top of
+// the window while scrolling (CSS makes thead sticky inside scroll
+// containers).
+function windowTables() {
+  document.querySelectorAll('table.data-table').forEach(function (tbl) {
+    var body = tbl.tBodies[0];
+    if (!body || body.rows.length <= 15) return;
+    var rowH = (body.rows[0] && body.rows[0].offsetHeight) || 32;
+    var headH = tbl.tHead ? tbl.tHead.offsetHeight : 34;
+    var sc = tbl.closest('.table-scroll, .comm-scroll');
+    if (!sc) {
+      sc = document.createElement('div');
+      sc.className = 'table-scroll';
+      tbl.parentNode.insertBefore(sc, tbl);
+      sc.appendChild(tbl);
+    }
+    sc.style.maxHeight = (headH + rowH * 15 + 4) + 'px';
+    sc.style.overflowY = 'auto';
+  });
 }
 
 // v6.8.2 (Leroy): every horizontally scrollable table also gets a scrollbar
