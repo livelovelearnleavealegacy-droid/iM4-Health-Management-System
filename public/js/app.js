@@ -342,6 +342,19 @@ function windowTables() {
     sc.style.maxHeight = (headH + rowH * 15 + 4) + 'px';
     sc.style.overflowY = 'auto';
   });
+  // Commissions window: size it to the frozen columns plus exactly two
+  // steward/% pairs, measured from the real rendered columns (v6.9.4) so
+  // the second % is never cut off.
+  var comm = document.querySelector('.comm-scroll');
+  if (comm) {
+    var pcts = comm.querySelectorAll('thead th.cm-pct');
+    if (pcts.length >= 2) {
+      var cellR = pcts[1].getBoundingClientRect().right - comm.getBoundingClientRect().left + comm.scrollLeft;
+      var vAllowance = comm.offsetWidth - comm.clientWidth;
+      comm.style.width = (Math.ceil(cellR) + vAllowance + 2) + 'px';
+      comm.style.maxWidth = '100%';
+    }
+  }
 }
 
 // v6.8.2 (Leroy): every horizontally scrollable table also gets a scrollbar
