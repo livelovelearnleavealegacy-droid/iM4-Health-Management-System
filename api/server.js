@@ -271,20 +271,7 @@ async function migrate() {
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
 
-    ['companies', 'payroll_total', 'INT'],
-    ['companies', 'payroll_ineligible', 'INT'],
-    ['companies', 'payroll_opted_out', 'INT'],
-    ['companies', 'payroll_qualified', 'INT'],
-    ['companies', 'payroll_enrolled', 'INT'],
-    ['companies', 'payroll_not_enrolled', 'INT'],
-    ['companies', 'payroll_new_qualified', 'INT'],
-    ['companies', 'payroll_bill_premium', 'NUMERIC'],
-    ['companies', 'payroll_bill_claims', 'NUMERIC'],
-    ['companies', 'payroll_bill_admin', 'NUMERIC'],
-    ['companies', 'payroll_bill_savings', 'NUMERIC'],
-    ['companies', 'payroll_pay_schedule', 'TEXT'],
-    ['companies', 'payroll_ein', 'TEXT'],
-    ['companies', 'payroll_dataset_date', 'DATE'],
+
     ['companies', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE'],
     ['implementations', 'github_item_id', 'TEXT UNIQUE'],
     ['implementations', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
@@ -524,6 +511,88 @@ async function migrate() {
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
     "WHERE (last_name IS NULL OR last_name = '') AND name IS NOT NULL AND POSITION(' ' IN name) > 0");
+  // ---- v6.12.0 (Leroy): payroll data moves OFF companies into
+  // payroll_company_summary, which becomes the payroll table: one row per
+  // case per import dataset, stamped with the company it belongs to, kept
+  // as history. Companies keep no payroll columns; readers take each
+  // company's latest payroll row (see payrollJoin).
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS company_code TEXT');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS dataset_date DATE');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS period_start DATE');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS period_end DATE');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS bill_premium NUMERIC');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS bill_claims NUMERIC');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS bill_admin NUMERIC');
+  await db.query('ALTER TABLE payroll_company_summary ADD COLUMN IF NOT EXISTS bill_savings NUMERIC');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payroll_summary_company ON payroll_company_summary (company_code, dataset_date DESC)');
+  await db.query('UPDATE payroll_company_summary SET dataset_date = imported_at::date WHERE dataset_date IS NULL AND imported_at IS NOT NULL');
+  await db.query("UPDATE payroll_company_summary SET period_end = make_date(period_year, period_month::int, period_day) " +
+    "WHERE period_end IS NULL AND period_year IS NOT NULL AND period_month ~ '^[0-9]+$' AND period_month::int BETWEEN 1 AND 12 AND period_day BETWEEN 1 AND 31");
+  // One-time legacy migration, only while companies still carries the old
+  // payroll columns: stamp existing summary rows with their company, copy
+  // the pushed bill values onto them, synthesize rows for any company whose
+  // snapshot would otherwise be lost, then drop the 14 columns.
+  const legacyPayroll = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'companies' AND column_name = 'payroll_total'");
+  if (legacyPayroll.rows.length) {
+    try {
+      const acctByTin = {};
+      const xr = await db.query('SELECT DISTINCT tin, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL');
+      xr.rows.forEach(function (r) {
+        const n = normEin(r.tin);
+        if (!n || !r.acct) return;
+        if (!acctByTin[n]) acctByTin[n] = [];
+        acctByTin[n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
+      });
+      const ce = await db.query('SELECT company_code, ein FROM companies WHERE ein IS NOT NULL');
+      ce.rows.forEach(function (r) {
+        const n = normEin(r.ein);
+        if (!n || !r.company_code) return;
+        if (!acctByTin[n]) acctByTin[n] = [];
+        if (acctByTin[n].indexOf(r.company_code) === -1) acctByTin[n].push(r.company_code);
+      });
+      const coSet = {};
+      ce.rows.forEach(function (r) { coSet[String(r.company_code)] = true; });
+      const allCos = await db.query('SELECT company_code FROM companies');
+      allCos.rows.forEach(function (r) { coSet[String(r.company_code)] = true; });
+      const unstamped = await db.query('SELECT id, ein FROM payroll_company_summary WHERE company_code IS NULL AND ein IS NOT NULL');
+      for (const row of unstamped.rows) {
+        const accts = (acctByTin[normEin(row.ein)] || []).filter(function (a) { return coSet[a]; });
+        if (!accts.length) continue;
+        await db.query('UPDATE payroll_company_summary SET company_code = $1 WHERE id = $2', [accts[0], row.id]);
+        for (let i = 1; i < accts.length; i++) {
+          await db.query(
+            'INSERT INTO payroll_company_summary (case_number, ein, employer_name, employer_location, state, zip, pay_schedule, cycle, period_year, period_quarter, period_month, period_day, employee_count, eligible_count, ineligible_count, opt_out_count, enrolled_count, new_count, total_gross_wages, total_net_pay, total_premium, total_admin_fee, total_benefit, total_claim, total_fica_savings, file_name, is_latest_case, company_code, dataset_date, period_start, period_end, bill_premium, bill_claims, bill_admin, bill_savings) ' +
+            'SELECT case_number, ein, employer_name, employer_location, state, zip, pay_schedule, cycle, period_year, period_quarter, period_month, period_day, employee_count, eligible_count, ineligible_count, opt_out_count, enrolled_count, new_count, total_gross_wages, total_net_pay, total_premium, total_admin_fee, total_benefit, total_claim, total_fica_savings, file_name, is_latest_case, $2, dataset_date, period_start, period_end, bill_premium, bill_claims, bill_admin, bill_savings FROM payroll_company_summary WHERE id = $1',
+            [row.id, accts[i]]);
+        }
+      }
+      await db.query('UPDATE payroll_company_summary s SET bill_premium = c.payroll_bill_premium, bill_claims = c.payroll_bill_claims, bill_admin = c.payroll_bill_admin, bill_savings = c.payroll_bill_savings ' +
+        'FROM companies c WHERE s.company_code = c.company_code AND s.dataset_date = c.payroll_dataset_date AND c.payroll_bill_premium IS NOT NULL');
+      const orphans = await db.query(
+        'SELECT c.company_code, c.company_name, c.payroll_total, c.payroll_qualified, c.payroll_ineligible, c.payroll_opted_out, c.payroll_enrolled, c.payroll_new_qualified, ' +
+        'c.payroll_bill_premium, c.payroll_bill_claims, c.payroll_bill_admin, c.payroll_bill_savings, c.payroll_pay_schedule, c.payroll_ein, c.payroll_dataset_date ' +
+        'FROM companies c WHERE (c.payroll_total IS NOT NULL OR c.payroll_dataset_date IS NOT NULL) ' +
+        'AND NOT EXISTS (SELECT 1 FROM payroll_company_summary s WHERE s.company_code = c.company_code)');
+      for (const o of orphans.rows) {
+        await db.query(
+          'INSERT INTO payroll_company_summary (ein, employer_name, pay_schedule, employee_count, eligible_count, ineligible_count, opt_out_count, enrolled_count, new_count, bill_premium, bill_claims, bill_admin, bill_savings, file_name, company_code, dataset_date) ' +
+          'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
+          [o.payroll_ein, o.company_name, o.payroll_pay_schedule, o.payroll_total || 0, o.payroll_qualified || 0, o.payroll_ineligible || 0,
+           o.payroll_opted_out || 0, o.payroll_enrolled || 0, o.payroll_new_qualified || 0, o.payroll_bill_premium, o.payroll_bill_claims,
+           o.payroll_bill_admin, o.payroll_bill_savings, 'legacy-companies-snapshot', o.company_code, o.payroll_dataset_date]);
+      }
+      // Drops happen only when every step above succeeded; on any error the
+      // old columns stay and the migration retries on the next boot.
+      await db.query('ALTER TABLE companies ' +
+        'DROP COLUMN IF EXISTS payroll_total, DROP COLUMN IF EXISTS payroll_qualified, ' +
+        'DROP COLUMN IF EXISTS payroll_ineligible, DROP COLUMN IF EXISTS payroll_opted_out, ' +
+        'DROP COLUMN IF EXISTS payroll_enrolled, DROP COLUMN IF EXISTS payroll_not_enrolled, ' +
+        'DROP COLUMN IF EXISTS payroll_new_qualified, DROP COLUMN IF EXISTS payroll_bill_premium, ' +
+        'DROP COLUMN IF EXISTS payroll_bill_claims, DROP COLUMN IF EXISTS payroll_bill_admin, ' +
+        'DROP COLUMN IF EXISTS payroll_bill_savings, DROP COLUMN IF EXISTS payroll_pay_schedule, ' +
+        'DROP COLUMN IF EXISTS payroll_ein, DROP COLUMN IF EXISTS payroll_dataset_date');
+    } catch (e) { console.error('Payroll migration error:', e.message); }
+  }
 }
 
 async function bootstrapAdmin() {
@@ -700,6 +769,35 @@ function num(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = parseInt(v, 10);
   return isNaN(n) ? null : n;
+}
+
+// v6.12.0: payroll lives in payroll_company_summary now. This lateral join
+// attaches each company's LATEST payroll row under the same payroll_* field
+// names the companies table used to carry, so every reader keeps working.
+function payrollJoin(alias) {
+  const a = alias || 'c';
+  return 'LEFT JOIN LATERAL (SELECT s.employee_count AS payroll_total, s.eligible_count AS payroll_qualified, ' +
+    's.ineligible_count AS payroll_ineligible, s.opt_out_count AS payroll_opted_out, s.enrolled_count AS payroll_enrolled, ' +
+    'GREATEST(s.eligible_count - s.enrolled_count - s.new_count, 0) AS payroll_not_enrolled, ' +
+    's.new_count AS payroll_new_qualified, s.bill_premium AS payroll_bill_premium, s.bill_claims AS payroll_bill_claims, ' +
+    's.bill_admin AS payroll_bill_admin, s.bill_savings AS payroll_bill_savings, s.pay_schedule AS payroll_pay_schedule, ' +
+    's.ein AS payroll_ein, s.dataset_date AS payroll_dataset_date FROM payroll_company_summary s ' +
+    'WHERE s.company_code = ' + a + '.company_code ORDER BY s.dataset_date DESC NULLS LAST, s.imported_at DESC, s.id DESC LIMIT 1) p ON TRUE ';
+}
+const PAYROLL_COLS = 'p.payroll_total, p.payroll_qualified, p.payroll_ineligible, p.payroll_opted_out, p.payroll_enrolled, ' +
+  'p.payroll_not_enrolled, p.payroll_new_qualified, p.payroll_bill_premium, p.payroll_bill_claims, p.payroll_bill_admin, ' +
+  'p.payroll_bill_savings, p.payroll_pay_schedule, p.payroll_ein, p.payroll_dataset_date';
+
+// Compose a YYYY-MM-DD period-end date from a payroll group's period parts,
+// or null when they don't form a real date. The Power BI source carries no
+// period start date, so period_start stays empty rather than invented.
+function payrollPeriodEnd(g) {
+  if (!g.period_year || !g.period_month || !g.period_day) return null;
+  const y = parseInt(g.period_year, 10), m = parseInt(g.period_month, 10), d = parseInt(g.period_day, 10);
+  if (!(y > 1900 && m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+  return y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
 }
 
 // Eligible = stored qualified value, else computed total - ineligible - opted out.
@@ -1184,7 +1282,7 @@ app.get('/api/clients', requireAuth, async (req, res) => {
     }
     const activeWhere = 'c.active IS NOT FALSE';
     where = where ? where + ' AND ' + activeWhere : 'WHERE ' + activeWhere;
-    const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort('c'), params);
+    const r = await getPool().query('SELECT c.*, ' + PAYROLL_COLS + ' FROM companies c ' + payrollJoin('c') + where + ' ' + numericCodeSort('c'), params);
     const groups = groupParents(r.rows);
     // Attach open invoice count/total/oldest per company_code (arrears from oldest).
     try {
@@ -1232,7 +1330,7 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
       params.push(ids);
       where = "(" + where + ") AND c.id = ANY($" + params.length + ")";
     }
-    const rows = await getPool().query('SELECT * FROM companies c WHERE ' + where + ' ' + numericCodeSort('c'), params);
+    const rows = await getPool().query('SELECT c.*, ' + PAYROLL_COLS + ' FROM companies c ' + payrollJoin('c') + 'WHERE ' + where + ' ' + numericCodeSort('c'), params);
     if (rows.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
     const groups = groupParents(rows.rows);
     const group = groups[0];
@@ -1477,7 +1575,7 @@ app.get('/api/clients/:id', requireAuth, async (req, res) => {
     if (ids && ids.indexOf(parseInt(req.params.id, 10)) === -1) {
       return res.status(403).json({ error: 'Not assigned to this client' });
     }
-    const c = await getPool().query('SELECT * FROM companies WHERE id = $1', [req.params.id]);
+    const c = await getPool().query('SELECT c.*, ' + PAYROLL_COLS + ' FROM companies c ' + payrollJoin('c') + 'WHERE c.id = $1', [req.params.id]);
     if (c.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
     const impls = await getPool().query(
       'SELECT i.*, EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
@@ -1517,11 +1615,11 @@ app.get('/api/implementations', requireAuth, async (req, res) => {
     }
     if (clauses.length > 0) where += (where ? ' AND ' : 'WHERE ') + clauses.join(' AND ');
     const r = await getPool().query(
-      'SELECT i.*, c.company_code, c.company_name, c.payroll_enrolled AS lives, ' +
+      'SELECT i.*, c.company_code, c.company_name, p.payroll_enrolled AS lives, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
       '(SELECT body FROM implementation_updates u WHERE u.implementation_id = i.id ORDER BY u.update_date DESC LIMIT 1) AS latest_update ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
-      where + ' ORDER BY i.status, c.company_name', params);
+      payrollJoin('c') + where + ' ORDER BY i.status, c.company_name', params);
     res.json(r.rows);
   } catch (error) {
     console.error('Load implementations error:', error);
@@ -1607,11 +1705,11 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     const coActive = coWhere ? coWhere + ' AND c.active IS NOT FALSE' : 'WHERE c.active IS NOT FALSE';
     const tc = await db.query('SELECT COUNT(*)::int AS c FROM companies c ' + coActive, coParams);
     const tl = await db.query(
-      'SELECT COALESCE(SUM(COALESCE(c.payroll_qualified, c.payroll_total - COALESCE(c.payroll_ineligible, 0) - COALESCE(c.payroll_opted_out, 0))), 0)::int AS t ' +
-      'FROM companies c ' + coActive, coParams);
+      'SELECT COALESCE(SUM(COALESCE(p.payroll_qualified, p.payroll_total - COALESCE(p.payroll_ineligible, 0) - COALESCE(p.payroll_opted_out, 0))), 0)::int AS t ' +
+      'FROM companies c ' + payrollJoin('c') + coActive, coParams);
     // v5.4: Total Enrolled = sum of payroll_enrolled across each company's latest payroll.
     const te = await db.query(
-      'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t FROM companies c ' + coActive, coParams);
+      'SELECT COALESCE(SUM(p.payroll_enrolled), 0)::int AS t FROM companies c ' + payrollJoin('c') + coActive, coParams);
     let stWhere = '';
     const stParams = [];
     if (ids) {
@@ -1641,19 +1739,21 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       });
     }
     // v5.3: total enrolled from the most recent payroll_dataset_date.
+    // v6.12.0: dataset dates live on the payroll rows; p is each company's
+    // latest payroll row (payrollJoin), same as the old companies columns.
     let enrolledLast = { rows: [] };
     try {
-      let eWhere = 'WHERE c.payroll_dataset_date IS NOT NULL AND c.active IS NOT FALSE';
+      let eWhere = 'WHERE p.payroll_dataset_date IS NOT NULL AND c.active IS NOT FALSE';
       const eParams = [];
       if (ids) {
         eParams.push(ids);
         eWhere += ' AND c.id = ANY($' + eParams.length + ')';
       }
       enrolledLast = await db.query(
-        'SELECT COALESCE(SUM(c.payroll_enrolled), 0)::int AS t, MAX(c.payroll_dataset_date)::text AS d ' +
-        'FROM companies c ' + eWhere + ' AND c.payroll_dataset_date = (' +
-        'SELECT MAX(c2.payroll_dataset_date) FROM companies c2 ' +
-        (ids ? 'WHERE c2.id = ANY($1) AND c2.payroll_dataset_date IS NOT NULL AND c2.active IS NOT FALSE' : 'WHERE c2.payroll_dataset_date IS NOT NULL AND c2.active IS NOT FALSE') + ')',
+        'SELECT COALESCE(SUM(p.payroll_enrolled), 0)::int AS t, MAX(p.payroll_dataset_date)::text AS d ' +
+        'FROM companies c ' + payrollJoin('c') + eWhere + ' AND p.payroll_dataset_date = (' +
+        'SELECT MAX(p.payroll_dataset_date) FROM companies c2 ' + payrollJoin('c2') +
+        (ids ? 'WHERE c2.id = ANY($1) AND c2.active IS NOT FALSE' : 'WHERE c2.active IS NOT FALSE') + ')',
         eParams);
     } catch (e) { console.error('Enrolled last payroll error:', e); }
     res.json({
@@ -1714,7 +1814,8 @@ app.get('/api/billing', requireAuth, async (req, res) => {
           'SELECT company_code AS code, MAX(ein) AS ein FROM invoices WHERE company_code = ANY($1) AND ein IS NOT NULL GROUP BY company_code', [needCodes]);
         o.rows.forEach(function (m) { if (m.ein && !found[m.code]) found[m.code] = m.ein; });
         const c = await getPool().query(
-          'SELECT company_code AS code, payroll_ein AS ein FROM companies WHERE company_code = ANY($1) AND payroll_ein IS NOT NULL', [needCodes]);
+          'SELECT DISTINCT ON (company_code) company_code AS code, ein FROM payroll_company_summary ' +
+          'WHERE company_code = ANY($1) AND ein IS NOT NULL ORDER BY company_code, dataset_date DESC NULLS LAST, imported_at DESC, id DESC', [needCodes]);
         c.rows.forEach(function (m) { if (m.ein && !found[m.code]) found[m.code] = m.ein; });
         rows.forEach(function (row) { if (!row.ein && found[String(row.company_code)]) row.ein = found[String(row.company_code)]; });
       }
@@ -2349,59 +2450,62 @@ app.post('/api/admin/jobs/payroll-import', requireAdmin, async (req, res) => {
     }
     const groups = cached.groups;
     const db = getPool();
-    await db.query('DELETE FROM payroll_company_summary');
-    let imported = 0;
-    for (const g of groups) {
-      await db.query(
-        'INSERT INTO payroll_company_summary (case_number, ein, employer_name, employer_location, state, zip, pay_schedule, period_year, period_month, period_day, employee_count, eligible_count, ineligible_count, opt_out_count, enrolled_count, new_count, total_gross_wages, total_net_pay, total_premium, total_admin_fee, total_benefit, total_claim, total_fica_savings, file_name) ' +
-        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)',
-        [g.case_number, g.ein, g.employer_name, g.employer_location, g.state, g.zip, g.pay_schedule,
-         g.period_year, g.period_month, g.period_day, g.employee_count, g.eligible_count, g.ineligible_count,
-         g.opt_out_count, g.enrolled_count, g.new_count, g.total_gross_wages, g.total_net_pay, g.total_premium,
-         g.total_admin_fee, g.total_benefit, g.total_claim, g.total_fica_savings, g.file_name]);
-      imported++;
-    }
-    // v5.34: push the per-company payroll numbers onto the companies table via
-    // the EIN <-> account cross-reference, so the Companies page (and everything
-    // downstream of companies.payroll_*) picks them up.
-    let companiesUpdated = 0, xrefMissed = 0;
+    // v6.12.0: payroll_company_summary IS the payroll table. Each import
+    // appends one row per case for EACH company the case belongs to,
+    // stamped with the company code and the dataset date; nothing is
+    // pushed onto companies anymore (readers take the latest row).
+    // Re-importing on the same day replaces that day's rows; earlier
+    // datasets stay as history. Unmatched cases are stored unstamped.
+    const acctByTin = {};
+    const xr = await db.query('SELECT DISTINCT tin, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL');
+    xr.rows.forEach(function (r) {
+      const n = normEin(r.tin);
+      if (!n || !r.acct) return;
+      if (!acctByTin[n]) acctByTin[n] = [];
+      acctByTin[n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
+    });
+    // v6.9.0: fall back to the companies table's own EIN when the
+    // cross-reference has no entry for it - every company carries an EIN,
+    // so a payroll row whose EIN matches a company always lands.
+    const ce = await db.query('SELECT company_code, ein FROM companies WHERE ein IS NOT NULL');
+    ce.rows.forEach(function (r) {
+      const n = normEin(r.ein);
+      if (!n || !r.company_code) return;
+      if (!acctByTin[n]) acctByTin[n] = [];
+      if (acctByTin[n].indexOf(r.company_code) === -1) acctByTin[n].push(r.company_code);
+    });
+    const coSet = {};
+    const allCos = await db.query('SELECT company_code FROM companies');
+    allCos.rows.forEach(function (r) { coSet[String(r.company_code)] = true; });
+    let imported = 0, companiesUpdated = 0, xrefMissed = 0;
+    const stamped = {};
+    const client = await db.connect();
     try {
-      const acctByTin = {};
-      const xr = await db.query('SELECT DISTINCT tin, acct FROM ein_account_xref WHERE tin IS NOT NULL AND acct IS NOT NULL');
-      xr.rows.forEach(function (r) {
-        const n = normEin(r.tin);
-        if (!n || !r.acct) return;
-        if (!acctByTin[n]) acctByTin[n] = [];
-        acctByTin[n].push(String(r.acct).trim().replace(/^['"]+|['"]+$/g, ''));
-      });
-      // v6.9.0: fall back to the companies table's own EIN when the
-      // cross-reference has no entry for it - every company carries an EIN,
-      // so a payroll row whose EIN matches a company always lands.
-      const ce = await db.query('SELECT company_code, ein FROM companies WHERE ein IS NOT NULL');
-      ce.rows.forEach(function (r) {
-        const n = normEin(r.ein);
-        if (!n || !r.company_code) return;
-        if (!acctByTin[n]) acctByTin[n] = [];
-        if (acctByTin[n].indexOf(r.company_code) === -1) acctByTin[n].push(r.company_code);
-      });
+      await client.query('BEGIN');
+      await client.query('DELETE FROM payroll_company_summary WHERE dataset_date = CURRENT_DATE');
       for (const g of groups) {
-        const en = normEin(g.ein);
-        const accts = acctByTin[en] || [];
-        if (!accts.length) { xrefMissed++; continue; }
-        const notEnrolled = Math.max(g.eligible_count - g.enrolled_count - g.new_count, 0);
-        for (const acct of accts) {
-          const up = await db.query(
-            'UPDATE companies SET payroll_total = $1, payroll_qualified = $2, payroll_ineligible = $3, ' +
-            'payroll_opted_out = $4, payroll_enrolled = $5, payroll_not_enrolled = $6, payroll_new_qualified = $7, ' +
-            'payroll_bill_premium = $8, payroll_bill_claims = $9, payroll_bill_admin = $10, payroll_bill_savings = $11, ' +
-            'payroll_pay_schedule = $12, payroll_ein = $13, payroll_dataset_date = CURRENT_DATE ' +
-            'WHERE company_code = $14',
-            [g.employee_count, g.eligible_count, g.ineligible_count, g.opt_out_count, g.enrolled_count, notEnrolled,
-             g.new_count, g.bill_premium, g.bill_claims, g.bill_admin, g.bill_savings, g.pay_schedule, g.ein, acct]);
-          if (up.rowCount > 0) companiesUpdated++;
+        const accts = (acctByTin[normEin(g.ein)] || []).filter(function (a) { return coSet[a]; });
+        const periodEnd = payrollPeriodEnd(g);
+        const targets = accts.length ? accts : [null];
+        if (!accts.length) xrefMissed++;
+        for (const acct of targets) {
+          await client.query(
+            'INSERT INTO payroll_company_summary (case_number, ein, employer_name, employer_location, state, zip, pay_schedule, period_year, period_month, period_day, employee_count, eligible_count, ineligible_count, opt_out_count, enrolled_count, new_count, total_gross_wages, total_net_pay, total_premium, total_admin_fee, total_benefit, total_claim, total_fica_savings, file_name, company_code, dataset_date, period_end, bill_premium, bill_claims, bill_admin, bill_savings) ' +
+            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,CURRENT_DATE,$26,$27,$28,$29,$30)',
+            [g.case_number, g.ein, g.employer_name, g.employer_location, g.state, g.zip, g.pay_schedule,
+             g.period_year, g.period_month, g.period_day, g.employee_count, g.eligible_count, g.ineligible_count,
+             g.opt_out_count, g.enrolled_count, g.new_count, g.total_gross_wages, g.total_net_pay, g.total_premium,
+             g.total_admin_fee, g.total_benefit, g.total_claim, g.total_fica_savings, g.file_name, acct, periodEnd,
+             g.bill_premium, g.bill_claims, g.bill_admin, g.bill_savings]);
+          if (acct && !stamped[acct]) { stamped[acct] = true; companiesUpdated++; }
         }
+        imported++;
       }
-    } catch (e) { console.error('Payroll companies update error:', e.message); }
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (e2) {}
+      throw e;
+    } finally { client.release(); }
     payrollPreviewCache.delete(previewToken);
     res.json({ ok: true, imported: imported, companies_updated: companiesUpdated, xref_missed: xrefMissed });
   } catch (error) { console.error('Payroll import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
