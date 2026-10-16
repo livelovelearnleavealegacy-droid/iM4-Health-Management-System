@@ -2010,7 +2010,7 @@ function viewAdminCompanies() {
         }
         return '<tr data-status="' + status + '" data-name="' + esc(String(c.company_name || '').toLowerCase()) + '" data-code="' + esc(c.company_code) + '">' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td>' + '<td style="white-space:nowrap;min-width:100px;">' + esc(c.ein || '') + '</td>' + '<td>' + esc(c.company_name) + '</td>' +
-          cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) +
+          cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) + cell(c.billing_email) +
           '<td>' + statusHtml + '</td>' +
           '<td id="ach-' + esc(c.company_code) + '"><span class="muted">...</span></td>' + actions + '</tr>';
       }).join('');
@@ -2032,10 +2032,11 @@ function viewAdminCompanies() {
         fld('co-f-city', 'Company City', '') +
         fld('co-f-state', 'Company State', '') +
         fld('co-f-zip', 'Company Zip', '') +
+        fld('co-f-billing-email', 'Billing Email', '', 'name@example.com') +
         '<label style="display:block;margin:0 10px 8px 0;">Company Status<br>' +
         '<select id="co-f-status"><option value="ACTIVE">ACTIVE</option><option value="PENDING">PENDING</option><option value="TERMED">TERMED</option></select></label>' +
         '</div>' +
-        '<p class="muted">All fields are required. Parent: pick an existing Parent Code &mdash; the Parent Name comes from the Parent page and cannot be changed here. To add, rename, or delete a Parent, use the Parent page. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
+        '<p class="muted">All fields are required except Billing Email, which is optional. Parent: pick an existing Parent Code &mdash; the Parent Name comes from the Parent page and cannot be changed here. To add, rename, or delete a Parent, use the Parent page. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
         '<div id="co-editor-out"></div>' +
         '<button class="btn btn-primary" id="co-save">Save</button> ' +
         '<button class="btn" id="co-cancel">Cancel</button>' +
@@ -2058,8 +2059,8 @@ function viewAdminCompanies() {
           '</select></label></div>' +
         '</div>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
-        '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th style="white-space:nowrap;min-width:100px;">EIN</th><th>Company Name</th>' +
-        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th><th>ACH</th>' +
+        '<tr><th>Parent Code</th><th>Parent Name</th><th>Code</th><th style="white-space:nowrap;min-width:100px;">EIN</th><th>Name</th>' +
+        '<th>Address</th><th>City</th><th>State</th><th>Zip</th><th>Billing Email</th><th>Status</th><th>ACH</th>' +
         (canMaintain ? '<th>Actions</th>' : '') + '</tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>' +
         '<input type="file" id="coAchFile" style="display:none;">',
@@ -2214,6 +2215,7 @@ function viewAdminCompanies() {
           document.getElementById('co-f-city').value = c ? (c.city || '') : '';
           document.getElementById('co-f-state').value = c ? (c.state || '') : '';
           document.getElementById('co-f-zip').value = c ? (c.zip || '') : '';
+          document.getElementById('co-f-billing-email').value = c ? (c.billing_email || '') : '';
           document.getElementById('co-f-status').value = statusOf(c || {});
           // Parent Code: Admin and Onboarding both pick from existing
           // Parents (v6.7). Company Code stays Admin-only.
@@ -2244,6 +2246,9 @@ function viewAdminCompanies() {
           };
           var missing = Object.keys(v).filter(function (k) { return !v[k]; });
           if (missing.length) { out.innerHTML = errorHtml('All fields are required — some are still blank.'); return; }
+          var billingEmail = document.getElementById('co-f-billing-email').value.trim();
+          if (billingEmail && billingEmail.indexOf('@') === -1) { out.innerHTML = errorHtml('Billing Email must be a valid email address.'); return; }
+          v.billing_email = billingEmail;
           if (!/^\d{4}$/.test(v.company_code)) { out.innerHTML = errorHtml('Company Code must be four numbers.'); return; }
           if (!/^\d{2}-\d{7}$/.test(v.ein)) { out.innerHTML = errorHtml('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).'); return; }
           out.innerHTML = '<p class="muted">Saving...</p>';
@@ -2478,7 +2483,7 @@ function viewParentPage() {
     }
     render(shell(
       '<h2>Parent</h2>' +
-      '<p class="muted">Parent Codes are created during the Onboarding process (Highest Parent Code + 1). Only an Admin can add a Parent manually, or change a Parent Code or Parent Name, or delete a Parent. Onboarding and Top Dog can only view the Parent page.</p>' +
+      '<p class="muted">Parent Codes are created during the Onboarding process (Highest Parent Code + 1). Only an Admin can add a Parent manually, or change a Parent Code or Parent Name, or delete a Parent. Onboarding and Top Dog can only view the Parent page. Parent Status is determined by the system from the parent\'s companies: a parent with no companies is PENDING; if any of its companies is ACTIVE, the parent is ACTIVE; if every company is TERMED, the parent is TERMED; in all other cases (for example, all companies PENDING, or a mix of PENDING and TERMED) the parent is PENDING.</p>' +
       '<div id="parentMsg"></div>' +
       (isAdmin
         ? '<p><button class="btn btn-primary" id="np_open">Add Parent</button></p>' +

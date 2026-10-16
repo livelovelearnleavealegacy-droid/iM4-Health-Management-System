@@ -3419,7 +3419,8 @@ function companyFieldValues(b) {
     city: t(b.city || b.company_city),
     state: t(b.state || b.company_state).toUpperCase(),
     zip: t(b.zip || b.company_zip),
-    company_status: t(b.company_status).toUpperCase()
+    company_status: t(b.company_status).toUpperCase(),
+    billing_email: t(b.billing_email)
   };
 }
 function companyFieldErrors(v) {
@@ -3434,6 +3435,7 @@ function companyFieldErrors(v) {
   if (!v.state) errs.push('Company State is required.');
   if (!v.zip) errs.push('Company Zip is required.');
   if (['ACTIVE', 'PENDING', 'TERMED'].indexOf(v.company_status) === -1) errs.push('Company Status must be ACTIVE, PENDING, or TERMED.');
+  if (v.billing_email && v.billing_email.indexOf('@') === -1) errs.push('Billing Email must be a valid email address.');
   return errs;
 }
 
@@ -3451,9 +3453,9 @@ app.post('/api/admin/companies', requireAdmin, async (req, res) => {
     const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
     if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
     const r = await db.query(
-      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status]);
+      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, billing_email) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null]);
     res.json({ success: true, company: r.rows[0] });
   } catch (error) {
     console.error('Admin create company error:', error);
@@ -3495,8 +3497,8 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
       }
       const r = await client.query(
         'UPDATE companies SET company_code = $1, company_name = $2, parent_company_code = $3, parent_company_name = $4, ' +
-        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10 WHERE company_code = $11 RETURNING *',
-        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, code]);
+        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, billing_email = $11 WHERE company_code = $12 RETURNING *',
+        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, code]);
       await client.query('COMMIT');
       res.json({ success: true, company: r.rows[0] });
     } catch (txErr) {
