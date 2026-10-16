@@ -3425,7 +3425,7 @@ function companyFieldValues(b) {
     city: t(b.city || b.company_city),
     state: t(b.state || b.company_state).toUpperCase(),
     zip: t(b.zip || b.company_zip),
-    company_status: t(b.company_status).toUpperCase(),
+    company_status: t(b.company_status).toUpperCase() || 'ACTIVE',
     billing_email: t(b.billing_email),
     pay_frequency: t(b.pay_frequency),
     version: t(b.version),
@@ -3433,17 +3433,16 @@ function companyFieldValues(b) {
   };
 }
 function companyFieldErrors(v) {
+  // v6.15.1 (Leroy): the only required company fields are Parent Code,
+  // Parent Name, Company Code, EIN, and Company Name. Everything else is
+  // optional; format rules still apply to any value that is provided.
   const errs = [];
   if (!/^PC\d{4}$/.test(v.parent_code)) errs.push('Parent Code must be "PC" plus four numbers (for example PC0007).');
   if (!v.parent_name) errs.push('Parent Name is required.');
   if (!/^\d{4}$/.test(v.company_code)) errs.push('Company Code must be four numbers.');
   if (!/^\d{2}-\d{7}$/.test(v.ein)) errs.push('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).');
   if (!v.company_name) errs.push('Company Name is required.');
-  if (!v.address_1) errs.push('Company Address 1 is required.');
-  if (!v.city) errs.push('Company City is required.');
-  if (!v.state) errs.push('Company State is required.');
-  if (!v.zip) errs.push('Company Zip is required.');
-  if (['ACTIVE', 'PENDING', 'TERMED'].indexOf(v.company_status) === -1) errs.push('Company Status must be ACTIVE, PENDING, or TERMED.');
+  if (v.company_status && ['ACTIVE', 'PENDING', 'TERMED'].indexOf(v.company_status) === -1) errs.push('Company Status must be ACTIVE, PENDING, or TERMED.');
   if (v.billing_email && v.billing_email.indexOf('@') === -1) errs.push('Billing Email must be a valid email address.');
   return errs;
 }
@@ -3770,13 +3769,18 @@ function validateImport(type, rows) {
       }
       valid.push({ steward_id: stewardId, email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null, password: password });
     } else if (type === 'companies') {
+      // v6.15.1 (Leroy): required company fields are parent_company_code,
+      // parent_company_name, company_code, ein, and company_name only.
       if (!row.company_code) { e('company_code is required'); return; }
       if (!row.company_name) { e('company_name is required'); return; }
+      const parentCode = row.parent_code || row.parent_company_code;
+      const parentName = row.parent_name || row.parent_company_name;
+      if (!parentCode || !String(parentCode).trim()) { e('parent_company_code is required'); return; }
+      if (!parentName || !String(parentName).trim()) { e('parent_company_name is required'); return; }
+      if (!row.ein || !String(row.ein).trim()) { e('ein is required'); return; }
       const key = String(row.company_code).trim();
       if (seen[key]) { e('duplicate company_code in file'); return; }
       seen[key] = true;
-      const parentCode = row.parent_code || row.parent_company_code;
-      const parentName = row.parent_name || row.parent_company_name;
       let status = null;
       const statusRaw = row.company_status !== undefined && row.company_status !== null ? String(row.company_status).trim() : '';
       if (statusRaw !== '') {

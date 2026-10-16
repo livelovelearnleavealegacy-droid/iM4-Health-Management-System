@@ -2040,7 +2040,7 @@ function viewAdminCompanies() {
         '<label style="display:block;margin:0 10px 8px 0;">Company Status<br>' +
         '<select id="co-f-status"><option value="ACTIVE">ACTIVE</option><option value="PENDING">PENDING</option><option value="TERMED">TERMED</option></select></label>' +
         '</div>' +
-        '<p class="muted">All fields are required except Billing Email, Pay Frequency, Version, and Type, which are optional. Parent: pick an existing Parent Code &mdash; the Parent Name comes from the Parent page and cannot be changed here. To add, rename, or delete a Parent, use the Parent page. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
+        '<p class="muted">Required: Parent Code, Parent Name, Company Code, EIN, and Company Name. All other fields are optional. Parent: pick an existing Parent Code &mdash; the Parent Name comes from the Parent page and cannot be changed here. To add, rename, or delete a Parent, use the Parent page. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
         '<div id="co-editor-out"></div>' +
         '<button class="btn btn-primary" id="co-save">Save</button> ' +
         '<button class="btn" id="co-cancel">Cancel</button>' +
@@ -2251,8 +2251,9 @@ function viewAdminCompanies() {
             zip: document.getElementById('co-f-zip').value.trim(),
             company_status: document.getElementById('co-f-status').value
           };
-          var missing = Object.keys(v).filter(function (k) { return !v[k]; });
-          if (missing.length) { out.innerHTML = errorHtml('All fields are required — some are still blank.'); return; }
+          var requiredKeys = ['parent_code', 'parent_name', 'company_code', 'ein', 'company_name'];
+          var missing = requiredKeys.filter(function (k) { return !v[k]; });
+          if (missing.length) { out.innerHTML = errorHtml('Parent Code, Parent Name, Company Code, EIN, and Company Name are required — some are still blank.'); return; }
           var billingEmail = document.getElementById('co-f-billing-email').value.trim();
           if (billingEmail && billingEmail.indexOf('@') === -1) { out.innerHTML = errorHtml('Billing Email must be a valid email address.'); return; }
           v.billing_email = billingEmail;
