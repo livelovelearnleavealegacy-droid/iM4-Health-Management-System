@@ -435,9 +435,10 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .fullwidth { width: 100vw; margin-left: calc(50% - 50vw); padding: 0 10px; box-sizing: border-box; }
 .commissions-table { width: 100%; }
 .commissions-table th, .commissions-table td { padding: 5px 6px; }
-/* v6.8: frozen first three columns + a steward window that shows exactly
-   four steward/% pairs and scrolls horizontally for the rest. */
-.comm-scroll { overflow-x: auto; max-width: 1372px; margin: 0 auto; }
+/* v6.8: frozen first three columns + a steward window that scrolls
+   horizontally for the rest. Window width set to show exactly two
+   steward/% pairs (v6.9.1, Leroy: narrower). */
+.comm-scroll { overflow-x: auto; max-width: 892px; margin: 0 auto; }
 .commissions-table { table-layout: fixed; width: max-content; }
 .commissions-table th, .commissions-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .commissions-table .cm-code { width: 95px; }
