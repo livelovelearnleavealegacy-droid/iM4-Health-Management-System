@@ -891,7 +891,9 @@ function viewImplementations() {
 
 // ---------------------------------------------------------------- 12-week plan timeline
 function timelineHtml(t) {
-  if (!t || !t.started) return '<p class="muted">The timeline clock starts the first time this project enters Initiation.</p>';
+  if (!t || !t.started) return '<div class="card" style="border:2px solid #c0392b;">' +
+    '<h3 style="color:#c0392b;margin-top:0;">Missing Start Date</h3>' +
+    '<p>No dates are assigned to this plan yet. Add the <b>Implementation Start Date</b> on the GitHub Kanban board and the 12-week schedule will be dated from that day.</p></div>';
   var blocks = t.blocks.map(function (b) {
     var cls = 'tl-block' + (b.current ? ' tl-current' : '') + (b.done ? ' tl-done' : '');
     return '<div class="' + cls + '">' +

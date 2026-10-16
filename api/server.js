@@ -298,6 +298,7 @@ async function migrate() {
     ['implementations', 'payroll_frequency', 'TEXT'],
     ['implementations', 'total_employees', 'INT'],
     ['implementations', 'qualified_employee_count', 'INT'],
+    ['implementations', 'impl_start_date', 'DATE'],
     ['implementations', 'notes', 'TEXT']
   ];
   for (const [table, col, def] of cols) {
@@ -1256,7 +1257,7 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
     const impl = r.rows[0];
     const msgs = await getPool().query(
       'SELECT m.*, s.first_name, s.last_name, s.name AS steward_legacy_name FROM messages m LEFT JOIN stewards s ON s.id = m.steward_id ' +
-      'WHERE m.implementation_id = $1 ORDER BY COALESCE(m.github_created_at, m.created_at)',
+      'WHERE m.implementation_id = $1 ORDER BY COALESCE(m.github_created_at, m.created_at) DESC, m.id DESC',
       [req.params.id]);
     const sums = await getPool().query(
       'SELECT update_date, body, created_at FROM implementation_updates WHERE implementation_id = $1 ORDER BY update_date DESC LIMIT 10',
@@ -4330,7 +4331,7 @@ app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
 
 // ---------------------------------------------------------------- github mirror sync (link-only) + stage learning
 async function fetchProjectItems() {
-  const query = `query($after: String) { organization(login: "` + GITHUB_ORG + `") { projectV2(number: ` + GITHUB_PROJECT + `) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } } } } } } } }`;
+  const query = `query($after: String) { organization(login: "` + GITHUB_ORG + `") { projectV2(number: ` + GITHUB_PROJECT + `) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } ... on ProjectV2ItemFieldDateValue { date field { ... on ProjectV2Field { name } } } } } } } } } }`;
   const all = [];
   let after = null;
   for (;;) {
@@ -4377,23 +4378,19 @@ function normalizeStage(raw) {
   return s;
 }
 
-// Build the 12-week timeline for one implementation. The clock starts the
-// first time the project entered Initiation (falls back to the earliest
-// recorded stage entry for older projects).
+// Build the 12-week timeline for one implementation. v6.5 (Leroy): the
+// clock starts on the GitHub Kanban board's "Implementation Start Date"
+// (implementations.impl_start_date, kept current by the kanban sync).
+// When that field is empty, no dates are assigned to the plan.
 async function buildTimeline(db, implId) {
   const DAY = 24 * 60 * 60 * 1000;
-  let r = await db.query(
-    "SELECT MIN(entered_at) AS initiation_at FROM stage_history WHERE implementation_id = $1 AND stage = 'Initiation'",
-    [implId]);
-  let start = (r.rows[0] && r.rows[0].initiation_at) ? new Date(r.rows[0].initiation_at) : null;
-  if (!start) {
-    const e = await db.query(
-      'SELECT MIN(entered_at) AS first_at FROM stage_history WHERE implementation_id = $1', [implId]);
-    if (e.rows[0] && e.rows[0].first_at) start = new Date(e.rows[0].first_at);
-  }
-  if (!start || isNaN(start.getTime())) return { started: false, blocks: [] };
-  const st = await db.query('SELECT stage FROM implementations WHERE id = $1', [implId]);
+  const st = await db.query('SELECT stage, impl_start_date FROM implementations WHERE id = $1', [implId]);
   const currentStage = st.rows.length ? String(st.rows[0].stage || '') : '';
+  const rawStart = st.rows.length ? st.rows[0].impl_start_date : null;
+  if (!rawStart) return { started: false, missingStartDate: true, blocks: [] };
+  const startStr = rawStart instanceof Date ? rawStart.toISOString().slice(0, 10) : String(rawStart).slice(0, 10);
+  const start = new Date(startStr + 'T00:00:00Z');
+  if (isNaN(start.getTime())) return { started: false, missingStartDate: true, blocks: [] };
   const today = new Date();
   const weekElapsed = Math.max(0, Math.floor((today.getTime() - start.getTime()) / (7 * DAY)));
   const curStageIdx = STAGES.indexOf(currentStage);
@@ -4509,6 +4506,7 @@ async function runGithubSync() {
       for (const v of item.fieldValues.nodes) {
         if (v.__typename === 'ProjectV2ItemFieldSingleSelectValue') fields[v.field.name] = v.name;
         else if (v.__typename === 'ProjectV2ItemFieldNumberValue') fields[v.field.name] = v.number;
+        else if (v.__typename === 'ProjectV2ItemFieldDateValue') fields[v.field.name] = v.date;
       }
       const status = fields['Status'] || '';
       if (status === 'Hold' || status === 'Dead') { skippedHoldDead++; continue; }
@@ -4522,18 +4520,27 @@ async function runGithubSync() {
       const issueNumber = (item.content && item.content.__typename === 'Issue') ? item.content.number : null;
       const repo = (item.content && item.content.repository) ? item.content.repository.nameWithOwner : null;
       const stage = normalizeStage(status);
+      // v6.5 (Leroy): the 12-week plan clock starts on the board's
+      // "Implementation Start Date" field (a date field; may be empty).
+      let implStartDate = null;
+      for (const k of Object.keys(fields)) {
+        if (String(k).trim().toLowerCase() === 'implementation start date' && fields[k]) {
+          implStartDate = String(fields[k]).slice(0, 10);
+        }
+      }
       const up = await db.query(
-        'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, total_employees, qualified_employee_count, updated_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()) ' +
+        'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, total_employees, qualified_employee_count, impl_start_date, updated_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()) ' +
         'ON CONFLICT (github_item_id) DO UPDATE SET company_id = EXCLUDED.company_id, stage = EXCLUDED.stage, ' +
         'status = EXCLUDED.status, github_issue_number = EXCLUDED.github_issue_number, github_repo = EXCLUDED.github_repo, ' +
         'card_title = EXCLUDED.card_title, payroll_provider = EXCLUDED.payroll_provider, ' +
         'payroll_frequency = EXCLUDED.payroll_frequency, total_employees = EXCLUDED.total_employees, ' +
-        'qualified_employee_count = EXCLUDED.qualified_employee_count, updated_at = NOW() RETURNING id',
+        'qualified_employee_count = EXCLUDED.qualified_employee_count, impl_start_date = EXCLUDED.impl_start_date, updated_at = NOW() RETURNING id',
         [companyId, stage, fields['Priority'] || 'NORMAL', item.id, issueNumber, repo,
           fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null,
           fields['Total Employees'] != null ? Math.trunc(fields['Total Employees']) : null,
-          fields['Qualified Employee Count'] != null ? Math.trunc(fields['Qualified Employee Count']) : null]);
+          fields['Qualified Employee Count'] != null ? Math.trunc(fields['Qualified Employee Count']) : null,
+          implStartDate]);
       await trackStage(db, up.rows[0].id, stage);
       syncedIds.push(item.id);
       synced++;
