@@ -1997,7 +1997,7 @@ function viewAdminCompanies() {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
       function parentCode(c) { return c.parent_company_code; }
       function parentName(c) { return c.parent_company_name; }
-      function statusOf(c) { return c.company_status || (c.active === false ? 'TERMED' : 'ACTIVE'); }
+      function statusOf(c) { return c.company_status || 'ACTIVE'; }
       var byCode = {};
       list.forEach(function (c) { byCode[c.company_code] = c; });
       var rows = list.map(function (c) {

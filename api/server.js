@@ -272,7 +272,6 @@ async function migrate() {
     ['companies', 'parent_company_name', 'TEXT'],
 
 
-    ['companies', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE'],
     ['implementations', 'github_item_id', 'TEXT UNIQUE'],
     ['implementations', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['implementations', 'updated_at', 'TIMESTAMPTZ DEFAULT NOW()'],
@@ -289,11 +288,8 @@ async function migrate() {
   for (const [table, col, def] of cols) {
     await db.query('ALTER TABLE ' + table + ' ADD COLUMN IF NOT EXISTS ' + col + ' ' + def);
   }
-  // v5.46: company_status backfill - termed companies (active = FALSE) are
-  // TERMED; everything else stays ACTIVE. All write paths keep the two in
-  // sync (company_status is the source of truth at the edges; the boolean
-  // keeps driving the existing visibility/billing filters).
-  await db.query("UPDATE companies SET company_status = 'TERMED' WHERE active = FALSE AND company_status <> 'TERMED'");
+  // (The v5.46 company_status backfill that ran here referenced the active
+  // boolean; v6.13.0 removed both - see the reconcile block below.)
   // v5: "parent" renamed to "ee" on import headings; carry existing values over.
   // v6.11.0 (Leroy): consolidate the parent fields into parent_company_code /
   // parent_company_name and drop the legacy ee_* columns for good. Copies
@@ -511,6 +507,17 @@ async function migrate() {
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
     "WHERE (last_name IS NULL OR last_name = '') AND name IS NOT NULL AND POSITION(' ' IN name) > 0");
+  // ---- v6.13.0 (Leroy): the companies.active boolean is redundant with
+  // company_status. One-time reconcile in Leroy's order: where
+  // company_status has a value it stays; where it is blank, active decides
+  // (yes = ACTIVE, no = TERMED, neither = PENDING). Then drop the column;
+  // every filter and writer uses company_status from here on.
+  const legacyActive = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'companies' AND column_name = 'active'");
+  if (legacyActive.rows.length) {
+    await db.query("UPDATE companies SET company_status = CASE WHEN active IS TRUE THEN 'ACTIVE' WHEN active IS FALSE THEN 'TERMED' ELSE 'PENDING' END " +
+      "WHERE company_status IS NULL OR company_status = ''");
+    await db.query('ALTER TABLE companies DROP COLUMN active');
+  }
   // ---- v6.12.0 (Leroy): payroll data moves OFF companies into
   // payroll_company_summary, which becomes the payroll table: one row per
   // case per import dataset, stamped with the company it belongs to, kept
@@ -1281,7 +1288,7 @@ app.get('/api/clients', requireAuth, async (req, res) => {
         ' OR LOWER(COALESCE(c.parent_company_code, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
-    const activeWhere = 'c.active IS NOT FALSE';
+    const activeWhere = "c.company_status <> 'TERMED'";
     where = where ? where + ' AND ' + activeWhere : 'WHERE ' + activeWhere;
     const r = await getPool().query('SELECT c.*, ' + PAYROLL_COLS + ' FROM companies c ' + payrollJoin('c') + where + ' ' + numericCodeSort('c'), params);
     const groups = groupParents(r.rows);
@@ -1703,7 +1710,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       coWhere = 'WHERE c.id = ANY($1)';
       coParams.push(ids);
     }
-    const coActive = coWhere ? coWhere + ' AND c.active IS NOT FALSE' : 'WHERE c.active IS NOT FALSE';
+    const coActive = coWhere ? coWhere + " AND c.company_status <> 'TERMED'" : "WHERE c.company_status <> 'TERMED'";
     const tc = await db.query('SELECT COUNT(*)::int AS c FROM companies c ' + coActive, coParams);
     const tl = await db.query(
       'SELECT COALESCE(SUM(COALESCE(p.payroll_qualified, p.payroll_total - COALESCE(p.payroll_ineligible, 0) - COALESCE(p.payroll_opted_out, 0))), 0)::int AS t ' +
@@ -1717,7 +1724,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       stWhere = 'WHERE c.id = ANY($1)';
       stParams.push(ids);
     }
-    const stActive = stWhere ? stWhere + ' AND c.active IS NOT FALSE' : 'WHERE c.active IS NOT FALSE';
+    const stActive = stWhere ? stWhere + " AND c.company_status <> 'TERMED'" : "WHERE c.company_status <> 'TERMED'";
     const st = await db.query(
       'SELECT i.stage AS stage, COUNT(*)::int AS count FROM implementations i ' +
       'JOIN companies c ON c.id = i.company_id ' + stActive + ' GROUP BY i.stage ORDER BY i.stage', stParams);
@@ -1730,7 +1737,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         bWhere = 'WHERE company_code = ANY($1)';
         bParams.push(codes);
       }
-      const bActive = "NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.active = FALSE)";
+      const bActive = "NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.company_status = 'TERMED')";
       const b = await db.query(
         "SELECT status, COUNT(*)::int AS count, COALESCE(SUM(total_invoice), 0)::float AS total FROM invoices " +
         (bWhere ? bWhere + ' AND ' + bActive : 'WHERE ' + bActive) + ' GROUP BY status', bParams);
@@ -1744,7 +1751,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     // latest payroll row (payrollJoin), same as the old companies columns.
     let enrolledLast = { rows: [] };
     try {
-      let eWhere = 'WHERE p.payroll_dataset_date IS NOT NULL AND c.active IS NOT FALSE';
+      let eWhere = "WHERE p.payroll_dataset_date IS NOT NULL AND c.company_status <> 'TERMED'";
       const eParams = [];
       if (ids) {
         eParams.push(ids);
@@ -1754,7 +1761,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         'SELECT COALESCE(SUM(p.payroll_enrolled), 0)::int AS t, MAX(p.payroll_dataset_date)::text AS d ' +
         'FROM companies c ' + payrollJoin('c') + eWhere + ' AND p.payroll_dataset_date = (' +
         'SELECT MAX(p.payroll_dataset_date) FROM companies c2 ' + payrollJoin('c2') +
-        (ids ? 'WHERE c2.id = ANY($1) AND c2.active IS NOT FALSE' : 'WHERE c2.active IS NOT FALSE') + ')',
+        (ids ? "WHERE c2.id = ANY($1) AND c2.company_status <> 'TERMED'" : "WHERE c2.company_status <> 'TERMED'") + ')',
         eParams);
     } catch (e) { console.error('Enrolled last payroll error:', e); }
     res.json({
@@ -1784,7 +1791,7 @@ app.get('/api/billing', requireAuth, async (req, res) => {
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
-    let where = "WHERE status = $1 AND NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.active = FALSE)";
+    let where = "WHERE status = $1 AND NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.company_status = 'TERMED')";
     if (status === 'open') where += ' AND is_estimate = FALSE';
     const params = [status];
     const btype = req.query.type === 'F' || req.query.type === 'S' ? req.query.type : null;
@@ -2713,7 +2720,7 @@ async function estimateUnpaidBills(db, maxStaleDays) {
     "SELECT company_code, company_name, payroll_date, bill_mode, lives_count, total_invoice " +
     "FROM invoices WHERE bill_type = 'F' AND status = 'paid' AND payroll_date IS NOT NULL " +
     "ORDER BY company_code, payroll_date");
-  const inactive = await db.query("SELECT company_code FROM companies WHERE active = FALSE");
+  const inactive = await db.query("SELECT company_code FROM companies WHERE company_status = 'TERMED'");
   const inactiveSet = {};
   inactive.rows.forEach(function (r) { inactiveSet[r.company_code] = true; });
   const all = await db.query("SELECT company_code, payroll_date FROM invoices WHERE bill_type = 'F' AND payroll_date IS NOT NULL");
@@ -3386,7 +3393,8 @@ app.get('/api/admin/companies', requireCompaniesAccess, async (req, res) => {
 // Set a company's status (admin/top dog). Accepts { company_status:
 // 'ACTIVE' | 'TERMED' | 'PENDING' } or the legacy { active: true/false }.
 // Termed companies keep all their data but are hidden from steward views
-// and billing; the boolean stays in sync (active = status is not TERMED).
+// and billing. (v6.13.0: the old active boolean column is gone; status is
+// the only source of truth.)
 app.post('/api/admin/companies/:code/active', requireAdminOrTopDog, async (req, res) => {
   try {
     const code = String(req.params.code || '').trim();
@@ -3404,10 +3412,10 @@ app.post('/api/admin/companies/:code/active', requireAdminOrTopDog, async (req, 
       status = active ? 'ACTIVE' : 'TERMED';
     }
     const r = await getPool().query(
-      'UPDATE companies SET company_status = $1, active = $2 WHERE company_code = $3 RETURNING company_code, company_status, active',
-      [status, status !== 'TERMED', code]);
+      'UPDATE companies SET company_status = $1 WHERE company_code = $2 RETURNING company_code, company_status',
+      [status, code]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Company not found' });
-    res.json({ success: true, company_code: r.rows[0].company_code, company_status: r.rows[0].company_status, active: r.rows[0].active });
+    res.json({ success: true, company_code: r.rows[0].company_code, company_status: r.rows[0].company_status });
   } catch (error) {
     console.error('Admin set company status error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -3465,9 +3473,9 @@ app.post('/api/admin/companies', requireAdmin, async (req, res) => {
     const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
     if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
     const r = await db.query(
-      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED']);
+      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status]);
     res.json({ success: true, company: r.rows[0] });
   } catch (error) {
     console.error('Admin create company error:', error);
@@ -3509,8 +3517,8 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
       }
       const r = await client.query(
         'UPDATE companies SET company_code = $1, company_name = $2, parent_company_code = $3, parent_company_name = $4, ' +
-        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, active = $11 WHERE company_code = $12 RETURNING *',
-        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.company_status !== 'TERMED', code]);
+        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10 WHERE company_code = $11 RETURNING *',
+        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, code]);
       await client.query('COMMIT');
       res.json({ success: true, company: r.rows[0] });
     } catch (txErr) {
@@ -3801,7 +3809,6 @@ function validateImport(type, rows) {
         parent_company_code: parentCode ? String(parentCode).trim() : null,
         parent_company_name: parentName ? String(parentName).trim() : null,
         company_status: status,
-        active: status === null ? null : (status !== 'TERMED'),
         ein: txt(row.ein),
         address_1: txt(row.company_address_1 || row.address_1 || row['address 1'] || row['company address 1']),
         city: txt(row.company_city || row.city),
@@ -3933,12 +3940,12 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
               [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.ein, c.address_1, c.city, c.state, c.zip]);
           } else {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, company_status, active, ein, address_1, city, state, zip) ' +
-              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ' +
+              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, company_status, ein, address_1, city, state, zip) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
               'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' +
-              'company_status = EXCLUDED.company_status, active = EXCLUDED.active, ' + detailSets,
-              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.company_status, c.active, c.ein, c.address_1, c.city, c.state, c.zip]);
+              'company_status = EXCLUDED.company_status, ' + detailSets,
+              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.company_status, c.ein, c.address_1, c.city, c.state, c.zip]);
           }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
@@ -3991,7 +3998,7 @@ app.get('/api/admin/export/:type', requireAdmin, async (req, res) => {
       rows = (await db.query(
         "SELECT parent_company_code AS parent_code, parent_company_name AS parent_name, company_code, ein, company_name, " +
         "address_1 AS company_address_1, city AS company_city, state AS company_state, zip AS company_zip, " +
-        "COALESCE(company_status, CASE WHEN active = FALSE THEN 'TERMED' ELSE 'ACTIVE' END) AS company_status " +
+        "company_status " +
         'FROM companies ORDER BY company_code')).rows;
     } else if (type === 'assignments') {
       headers = ['steward_id', 'company_code'];
@@ -4136,7 +4143,7 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT co.company_code, co.company_name, co.ein, co.company_status, co.active, c.steward_code, c.pct, ' +
+      'SELECT co.company_code, co.company_name, co.ein, co.company_status, c.steward_code, c.pct, ' +
       's.first_name, s.last_name, s.email ' +
       'FROM companies co ' +
       'LEFT JOIN commissions c ON c.company_code = co.company_code ' +
@@ -4151,7 +4158,7 @@ app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req,
           company_code: code,
           company_name: row.company_name || code,
           ein: row.ein || '',
-          company_status: row.company_status || (row.active === false ? 'TERMED' : 'ACTIVE'),
+          company_status: row.company_status || 'ACTIVE',
           stewards: []
         };
         order.push(code);
@@ -6636,8 +6643,8 @@ app.post('/api/onboarding/:id/process-submit-companies', requireOnboarder, async
       [record.parent_code, record.parent_name]);
     for (const co of out.companies) {
       await client.query(
-        'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +
-        'VALUES ($3, $4, $1, $2, $5, $6, $7, $8, $9, $10, TRUE)',
+        'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status) ' +
+        'VALUES ($3, $4, $1, $2, $5, $6, $7, $8, $9, $10)',
         [record.parent_code, record.parent_name, co.company_code, co.company_name, co.ein, co.company_address_1, co.company_city, co.company_state, co.company_zip, co.company_status]);
     }
     await client.query('UPDATE onboarding_clients SET companies_json = $1, wizard_step = 4, payroll_provider = COALESCE(NULLIF($2, \'\'), payroll_provider) WHERE id = $3',
