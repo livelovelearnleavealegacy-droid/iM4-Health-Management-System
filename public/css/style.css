@@ -438,8 +438,9 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 /* v6.8: frozen first three columns + a steward window that scrolls
    horizontally for the rest. Window width set to show exactly two
    steward/% pairs (v6.9.1, Leroy: narrower). */
-.comm-scroll { overflow-x: auto; max-width: 892px; margin: 0 auto; }
+.comm-scroll { overflow-x: auto; max-width: 900px; margin: 0 auto; }
 .commissions-table { table-layout: fixed; width: max-content; }
+.commissions-table th, .commissions-table td { box-sizing: border-box; }
 .commissions-table th, .commissions-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .commissions-table .cm-code { width: 95px; }
 .commissions-table .cm-name { width: 200px; }
