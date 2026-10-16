@@ -456,6 +456,12 @@ async function migrate() {
     'created_by INT REFERENCES stewards(id), ' +
     'created_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_email TEXT');
+  // v6.15.0 (Leroy): company-level pay_frequency, version, and type (from
+  // his master spreadsheet), displayed on the Companies page and accepted
+  // by the companies import.
+  await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS pay_frequency TEXT');
+  await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS version TEXT');
+  await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS type TEXT');
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ar_hold BOOLEAN NOT NULL DEFAULT FALSE');
   await db.query('CREATE TABLE IF NOT EXISTS payroll_company_summary (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -3420,7 +3426,10 @@ function companyFieldValues(b) {
     state: t(b.state || b.company_state).toUpperCase(),
     zip: t(b.zip || b.company_zip),
     company_status: t(b.company_status).toUpperCase(),
-    billing_email: t(b.billing_email)
+    billing_email: t(b.billing_email),
+    pay_frequency: t(b.pay_frequency),
+    version: t(b.version),
+    type: t(b.type)
   };
 }
 function companyFieldErrors(v) {
@@ -3453,9 +3462,9 @@ app.post('/api/admin/companies', requireAdmin, async (req, res) => {
     const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
     if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
     const r = await db.query(
-      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, billing_email) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null]);
+      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, billing_email, pay_frequency, version, type) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
+      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null]);
     res.json({ success: true, company: r.rows[0] });
   } catch (error) {
     console.error('Admin create company error:', error);
@@ -3497,8 +3506,8 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
       }
       const r = await client.query(
         'UPDATE companies SET company_code = $1, company_name = $2, parent_company_code = $3, parent_company_name = $4, ' +
-        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, billing_email = $11 WHERE company_code = $12 RETURNING *',
-        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, code]);
+        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, billing_email = $11, pay_frequency = $12, version = $13, type = $14 WHERE company_code = $15 RETURNING *',
+        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null, code]);
       await client.query('COMMIT');
       res.json({ success: true, company: r.rows[0] });
     } catch (txErr) {
@@ -3793,7 +3802,10 @@ function validateImport(type, rows) {
         address_1: txt(row.company_address_1 || row.address_1 || row['address 1'] || row['company address 1']),
         city: txt(row.company_city || row.city),
         state: txt(row.company_state || row.state),
-        zip: txt(row.company_zip || row.zip || row.zipcode)
+        zip: txt(row.company_zip || row.zip || row.zipcode),
+        pay_frequency: txt(row.pay_frequency || row['pay frequency'] || row.pay_schedule || row['pay schedule']),
+        version: txt(row.version),
+        type: txt(row.type)
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
@@ -3910,22 +3922,25 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
             'address_1 = COALESCE(EXCLUDED.address_1, companies.address_1), ' +
             'city = COALESCE(EXCLUDED.city, companies.city), ' +
             'state = COALESCE(EXCLUDED.state, companies.state), ' +
-            'zip = COALESCE(EXCLUDED.zip, companies.zip)';
+            'zip = COALESCE(EXCLUDED.zip, companies.zip), ' +
+            'pay_frequency = COALESCE(EXCLUDED.pay_frequency, companies.pay_frequency), ' +
+            'version = COALESCE(EXCLUDED.version, companies.version), ' +
+            'type = COALESCE(EXCLUDED.type, companies.type)';
           if (c.company_status === null || c.company_status === undefined) {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip) ' +
-              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ' +
+              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, pay_frequency, version, type) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
               'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' + detailSets,
-              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.ein, c.address_1, c.city, c.state, c.zip]);
+              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.ein, c.address_1, c.city, c.state, c.zip, c.pay_frequency, c.version, c.type]);
           } else {
             await db.query(
-              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, company_status, ein, address_1, city, state, zip) ' +
-              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ' +
+              'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, company_status, ein, address_1, city, state, zip, pay_frequency, version, type) ' +
+              'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ' +
               'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
               'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' +
               'company_status = EXCLUDED.company_status, ' + detailSets,
-              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.company_status, c.ein, c.address_1, c.city, c.state, c.zip]);
+              [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, c.company_status, c.ein, c.address_1, c.city, c.state, c.zip, c.pay_frequency, c.version, c.type]);
           }
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
