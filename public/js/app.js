@@ -355,6 +355,12 @@ function syncTopScrollbars() {
     inner.style.width = sc.scrollWidth + 'px';
     bar.appendChild(inner);
     sc.parentNode.insertBefore(bar, sc);
+    // The top bar is exactly as wide as the table window it mirrors, and
+    // aligned with it (v6.8.4) — never wider than the table.
+    var cs = window.getComputedStyle(sc);
+    bar.style.width = sc.clientWidth + 'px';
+    bar.style.marginLeft = cs.marginLeft;
+    bar.style.marginRight = cs.marginRight;
     var lock = false;
     bar.onscroll = function () { if (!lock) { lock = true; sc.scrollLeft = bar.scrollLeft; lock = false; } };
     sc.onscroll = function () { if (!lock) { lock = true; bar.scrollLeft = sc.scrollLeft; lock = false; } };
