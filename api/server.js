@@ -658,22 +658,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (remove after use): per-column populated counts for companies.
-app.get('/api/temp-companies-probe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const cols = ['id','company_code','company_name','company_status','ein','address_1','city','state','zip',
-      'parent_company_code','parent_company_name','ee_company_code','ee_company_name','billing_email',
-      'github_issue_number','payroll_total','payroll_ineligible','payroll_opted_out','payroll_qualified',
-      'payroll_enrolled','payroll_not_enrolled','payroll_new_qualified','payroll_bill_premium',
-      'payroll_bill_claims','payroll_bill_admin','payroll_bill_savings','payroll_pay_schedule','payroll_ein',
-      'payroll_dataset_date','active','created_at'];
-    const parts = cols.map(function (c) { return 'COUNT(' + c + ')::int AS "' + c + '"'; });
-    const r = await getPool().query('SELECT COUNT(*)::int AS total, ' + parts.join(', ') + ' FROM companies');
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
