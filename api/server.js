@@ -381,6 +381,32 @@ async function migrate() {
     'uploaded_by INT REFERENCES stewards(id), ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  // v6.6 (Leroy): Parent page — parents get their own table (Parent Code +
+  // Parent Name are parent-level data) plus two file slots per parent.
+  await db.query('CREATE TABLE IF NOT EXISTS parents (' +
+    'parent_code TEXT PRIMARY KEY, ' +
+    'parent_name TEXT NOT NULL, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS parent_documents (' +
+    'parent_code TEXT NOT NULL, ' +
+    'doc_kind TEXT NOT NULL CHECK (doc_kind IN (' + "'master_application', 'pre_implementation_checklist'" + ')), ' +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'PRIMARY KEY (parent_code, doc_kind))');
+  // Seed parents from the parent codes already carried by companies.
+  await db.query('INSERT INTO parents (parent_code, parent_name) ' +
+    'SELECT ee_company_code, MAX(ee_company_name) FROM companies ' +
+    "WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' AND ee_company_name IS NOT NULL AND ee_company_name <> '' " +
+    'GROUP BY ee_company_code ON CONFLICT (parent_code) DO NOTHING');
+  await db.query('INSERT INTO parents (parent_code, parent_name) ' +
+    'SELECT parent_company_code, MAX(parent_company_name) FROM companies ' +
+    "WHERE parent_company_code IS NOT NULL AND parent_company_code <> '' AND parent_company_name IS NOT NULL AND parent_company_name <> '' " +
+    'GROUP BY parent_company_code ON CONFLICT (parent_code) DO NOTHING');
   await db.query('ALTER TABLE onboarding_documents DROP CONSTRAINT IF EXISTS onboarding_documents_doc_type_check');
   await db.query("ALTER TABLE onboarding_documents ADD CONSTRAINT onboarding_documents_doc_type_check " +
     "CHECK (doc_type IN ('master_application', 'pre_implementation', 'commission_sheet', 'w9', 'ach', 'soluta_billing_intake', 'docusign_package'))");
@@ -589,6 +615,15 @@ function requireAdminOrOnboarding(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
     if (r !== 'admin' && r !== 'onboarding') return res.status(403).json({ error: 'Admin or Onboarding only' });
+    next();
+  });
+}
+
+// Parent page (v6.6, Leroy): visible to Admin, Top Dog, and Onboarding only.
+function requireParentViewer(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding') return res.status(403).json({ error: 'Parent page is available to Admin, Top Dog, and Onboarding only' });
     next();
   });
 }
@@ -1180,6 +1215,205 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
     console.error('Load parent error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ---------------------------------------------------------------- parent page (v6.6, Leroy)
+// One row per Parent: Parent Code + Parent Name (the parent-level data
+// points), a system-derived Parent Status, and two file slots (Master
+// Application, Pre-implementation Checklist). Visible to Admin, Top Dog,
+// and Onboarding; only Admin can add/edit/delete.
+// Parent Status rules (Leroy): no companies tied -> Pending; exactly one
+// company -> that company's status; several -> Active when at least one
+// child is Active, Termed only when every child is Termed, else Pending.
+function parentStatusOf(counts) {
+  if (!counts || !counts.total) return 'PENDING';
+  if (counts.active > 0) return 'ACTIVE';
+  if (counts.termed === counts.total) return 'TERMED';
+  return 'PENDING';
+}
+
+async function parentCodeSet(db) {
+  const r = await db.query(
+    'SELECT parent_code AS code FROM parents ' +
+    "UNION SELECT ee_company_code FROM companies WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' " +
+    "UNION SELECT parent_company_code FROM companies WHERE parent_company_code IS NOT NULL AND parent_company_code <> ''");
+  const set = {};
+  r.rows.forEach(function (x) { if (x.code) set[String(x.code)] = true; });
+  return set;
+}
+
+async function listParents(db) {
+  const codes = await parentCodeSet(db);
+  const nameRows = await db.query(
+    'SELECT code, MAX(name) AS name FROM (' +
+    'SELECT parent_code AS code, parent_name AS name FROM parents ' +
+    'UNION ALL SELECT ee_company_code, ee_company_name FROM companies ' +
+    "WHERE ee_company_code IS NOT NULL AND ee_company_code <> '' " +
+    'UNION ALL SELECT parent_company_code, parent_company_name FROM companies ' +
+    "WHERE parent_company_code IS NOT NULL AND parent_company_code <> '') u GROUP BY code");
+  const names = {};
+  nameRows.rows.forEach(function (x) { if (x.code && x.name) names[String(x.code)] = x.name; });
+  const tableNames = await db.query('SELECT parent_code, parent_name FROM parents');
+  tableNames.rows.forEach(function (x) { names[String(x.parent_code)] = x.parent_name; });
+  // Child counts per parent: a company ties to its ee (parent) code first,
+  // matching parentKey() everywhere else in the app.
+  const countsRows = await db.query(
+    'SELECT pcode, COUNT(*)::int AS total, ' +
+    "COUNT(*) FILTER (WHERE company_status = 'ACTIVE')::int AS active, " +
+    "COUNT(*) FILTER (WHERE company_status = 'PENDING')::int AS pending, " +
+    "COUNT(*) FILTER (WHERE company_status = 'TERMED')::int AS termed " +
+    'FROM (SELECT CASE WHEN ee_company_code IS NOT NULL AND ee_company_code <> ' + "''" + ' THEN ee_company_code ' +
+    "WHEN parent_company_code IS NOT NULL AND parent_company_code <> '' THEN parent_company_code END AS pcode, company_status FROM companies) s " +
+    'WHERE pcode IS NOT NULL GROUP BY pcode');
+  const counts = {};
+  countsRows.rows.forEach(function (x) { counts[String(x.pcode)] = x; });
+  const docRows = await db.query('SELECT parent_code, doc_kind, file_name, updated_at FROM parent_documents');
+  const docs = {};
+  docRows.rows.forEach(function (x) {
+    const k = String(x.parent_code);
+    if (!docs[k]) docs[k] = {};
+    docs[k][x.doc_kind] = { file_name: x.file_name, updated_at: x.updated_at };
+  });
+  return Object.keys(codes).map(function (code) {
+    const c = counts[code] || { total: 0, active: 0, pending: 0, termed: 0 };
+    return {
+      parent_code: code,
+      parent_name: names[code] || code,
+      company_count: c.total,
+      counts: c,
+      parent_status: parentStatusOf(c),
+      master_application: (docs[code] && docs[code].master_application) || null,
+      pre_implementation_checklist: (docs[code] && docs[code].pre_implementation_checklist) || null
+    };
+  }).sort(function (a, b) { return String(a.parent_name).localeCompare(String(b.parent_name)); });
+}
+
+app.get('/api/parent-page', requireParentViewer, async (req, res) => {
+  try {
+    res.json(await listParents(getPool()));
+  } catch (error) { console.error('Parent page list error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/parent-page', requireAdmin, async (req, res) => {
+  const db = getPool();
+  try {
+    const name = String((req.body || {}).parent_name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Parent Name is required' });
+    let code = String((req.body || {}).parent_code || '').trim();
+    if (!code) {
+      // Auto-assign: highest PC#### in use + 1, like the Onboarding process.
+      const set = await parentCodeSet(db);
+      let max = 0;
+      Object.keys(set).forEach(function (c) {
+        const m = /^PC(\d+)$/i.exec(c);
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+      });
+      code = 'PC' + String(max + 1).padStart(4, '0');
+    }
+    const set = await parentCodeSet(db);
+    if (set[code]) return res.status(400).json({ error: 'Parent Code ' + code + ' is already in use.' });
+    const co = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (co.rows.length) return res.status(400).json({ error: 'Parent Code ' + code + ' matches an existing Company Code.' });
+    await db.query('INSERT INTO parents (parent_code, parent_name) VALUES ($1, $2)', [code, name]);
+    res.json({ ok: true, parent_code: code });
+  } catch (error) { console.error('Parent add error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.put('/api/parent-page/:code', requireAdmin, async (req, res) => {
+  const db = getPool();
+  const client = await db.connect();
+  try {
+    const oldCode = String(req.params.code || '').trim();
+    const newCode = String((req.body || {}).parent_code || '').trim();
+    const newName = String((req.body || {}).parent_name || '').trim();
+    if (!newCode || !newName) { client.release(); return res.status(400).json({ error: 'Parent Code and Parent Name are both required' }); }
+    const set = await parentCodeSet(db);
+    if (!set[oldCode]) { client.release(); return res.status(404).json({ error: 'Parent not found' }); }
+    if (newCode !== oldCode) {
+      if (set[newCode]) { client.release(); return res.status(400).json({ error: 'Parent Code ' + newCode + ' is already in use.' }); }
+      const co = await db.query('SELECT company_code FROM companies WHERE company_code = $1', [newCode]);
+      if (co.rows.length) { client.release(); return res.status(400).json({ error: 'Parent Code ' + newCode + ' matches an existing Company Code.' }); }
+    }
+    await client.query('BEGIN');
+    // Make sure the parent has a concrete row before cascading.
+    await client.query('INSERT INTO parents (parent_code, parent_name) VALUES ($1, $2) ON CONFLICT (parent_code) DO NOTHING', [oldCode, newName]);
+    if (newCode !== oldCode) {
+      await client.query('UPDATE companies SET ee_company_code = $1 WHERE ee_company_code = $2', [newCode, oldCode]);
+      await client.query('UPDATE companies SET parent_company_code = $1 WHERE parent_company_code = $2', [newCode, oldCode]);
+      await client.query('UPDATE parent_documents SET parent_code = $1 WHERE parent_code = $2', [newCode, oldCode]);
+      await client.query('UPDATE parents SET parent_code = $1, updated_at = NOW() WHERE parent_code = $2', [newCode, oldCode]);
+    }
+    await client.query('UPDATE parents SET parent_name = $1, updated_at = NOW() WHERE parent_code = $2', [newName, newCode]);
+    await client.query('UPDATE companies SET ee_company_name = $1 WHERE ee_company_code = $2', [newName, newCode]);
+    await client.query('UPDATE companies SET parent_company_name = $1 WHERE parent_company_code = $2', [newName, newCode]);
+    await client.query('COMMIT');
+    client.release();
+    res.json({ ok: true, parent_code: newCode });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    client.release();
+    console.error('Parent edit error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/parent-page/:code', requireAdmin, async (req, res) => {
+  const db = getPool();
+  try {
+    const code = String(req.params.code || '').trim();
+    const tied = await db.query(
+      'SELECT COUNT(*)::int AS n FROM companies WHERE ee_company_code = $1 OR parent_company_code = $1', [code]);
+    if (tied.rows[0].n > 0) {
+      return res.status(400).json({ error: tied.rows[0].n + ' companies are still tied to this parent. Reassign or remove those companies first, then delete the parent.' });
+    }
+    await db.query('DELETE FROM parent_documents WHERE parent_code = $1', [code]);
+    await db.query('DELETE FROM parents WHERE parent_code = $1', [code]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Parent delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+const PARENT_DOC_KINDS = ['master_application', 'pre_implementation_checklist'];
+
+app.post('/api/parent-page/:code/documents/:kind', requireAdmin, handleUpload('file'), async (req, res) => {
+  const db = getPool();
+  try {
+    const code = String(req.params.code || '').trim();
+    const kind = String(req.params.kind || '').trim();
+    if (PARENT_DOC_KINDS.indexOf(kind) === -1) return res.status(400).json({ error: 'Unknown document kind' });
+    const set = await parentCodeSet(db);
+    if (!set[code]) return res.status(404).json({ error: 'Parent not found' });
+    if (!req.file) return res.status(400).json({ error: 'A file is required' });
+    await db.query('INSERT INTO parents (parent_code, parent_name) ' +
+      'SELECT $1, COALESCE((SELECT MAX(ee_company_name) FROM companies WHERE ee_company_code = $1), ' +
+      '(SELECT MAX(parent_company_name) FROM companies WHERE parent_company_code = $1), $1) ' +
+      'ON CONFLICT (parent_code) DO NOTHING', [code]);
+    await db.query(
+      'INSERT INTO parent_documents (parent_code, doc_kind, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6) ' +
+      'ON CONFLICT (parent_code, doc_kind) DO UPDATE SET file_name = EXCLUDED.file_name, mime_type = EXCLUDED.mime_type, file_data = EXCLUDED.file_data, uploaded_by = EXCLUDED.uploaded_by, updated_at = NOW()',
+      [code, kind, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    res.json({ ok: true, file_name: req.file.originalname });
+  } catch (error) { console.error('Parent doc upload error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/parent-page/:code/documents/:kind/download', requireParentViewer, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT file_name, mime_type, file_data FROM parent_documents WHERE parent_code = $1 AND doc_kind = $2',
+      [String(req.params.code || '').trim(), String(req.params.kind || '').trim()]);
+    if (!r.rows.length) return res.status(404).json({ error: 'No file on record for this parent' });
+    const f = r.rows[0];
+    res.set('Content-Type', f.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename=\"' + String(f.file_name).replace(/\"/g, '') + '\"');
+    res.send(f.file_data);
+  } catch (error) { console.error('Parent doc download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/parent-page/:code/documents/:kind', requireAdmin, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM parent_documents WHERE parent_code = $1 AND doc_kind = $2',
+      [String(req.params.code || '').trim(), String(req.params.kind || '').trim()]);
+    res.json({ ok: true });
+  } catch (error) { console.error('Parent doc delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Child detail: full payroll, stewards, implementation cards.
@@ -6123,6 +6357,8 @@ app.post('/api/onboarding/:id/process-submit-companies', requireOnboarder, async
     });
     if (blocking.length) { client.release(); return res.status(400).json({ error: 'Cannot submit yet. ' + blocking.join(' ') }); }
     await client.query('BEGIN');
+    await client.query('INSERT INTO parents (parent_code, parent_name) VALUES ($1, $2) ON CONFLICT (parent_code) DO NOTHING',
+      [record.parent_code, record.parent_name]);
     for (const co of out.companies) {
       await client.query(
         'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, active) ' +

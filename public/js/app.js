@@ -237,6 +237,7 @@ function navLinks() {
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/commissions', 'Commissions']);
+    links.push(['#/parent-page', 'Parent']);
   }
   if (role === 'admin' || role === 'top_dog') {
     links.push(['#/admin/assignments', 'Assignments']);
@@ -2033,6 +2034,222 @@ var IMPORT_FORMATS = {
   commissions: 'Excel sheet: COMPANY_CODE, STEWARD #1, #1 %, STEWARD #2, #2 %, and so on. Agent cells look like "155026 - RLJAT" (the number is the Steward ID). % cells are decimals (0.125 = 12.5%) and each company must add up to 1.0 (100%). Every company must already be on the Companies table and every steward on the Stewards table, or the import is refused. A pasted CSV also works in the wide pair format (company_code, then steward_id,pct pairs with percents adding to 100). The import replaces the commissions for every company in the file.'
 };
 
+// ---------------------------------------------------------------- parent page (v6.6)
+// Parent-level data only: Parent Code, Parent Name, a system-derived
+// Parent Status, and two files per parent (Master Application,
+// Pre-implementation Checklist). Admin edits; Top Dog + Onboarding view.
+function viewParentPage() {
+  requireUser(function () {
+    var role = activeRole();
+    if (role !== 'admin' && role !== 'top_dog' && role !== 'onboarding') { location.hash = '#/dashboard'; return; }
+    var isAdmin = role === 'admin';
+    var all = [];
+    var statusFilter = 'active_pending';
+    var query = '';
+    var exactCode = null;
+    var editingCode = null;
+    var pendingDoc = null;
+
+    function parentStatusHtml(s) {
+      var color = s === 'ACTIVE' ? '#2e7d32' : (s === 'PENDING' ? '#b8860b' : '#888');
+      return '<span class="dot" style="background:' + color + ';"></span> ' + esc(s);
+    }
+    function docCell(p, kind) {
+      var doc = p[kind];
+      if (doc) {
+        var h = '<div>' + esc(doc.file_name) + '</div>' +
+          '<button class="btn btn-small" data-doc-dl="' + kind + '" data-code="' + esc(p.parent_code) + '">Download</button>';
+        if (isAdmin) {
+          h += ' <button class="btn btn-small" data-doc-up="' + kind + '" data-code="' + esc(p.parent_code) + '">Replace</button>' +
+            ' <button class="btn btn-small" data-doc-del="' + kind + '" data-code="' + esc(p.parent_code) + '">Delete</button>';
+        }
+        return h;
+      }
+      if (isAdmin) return '<button class="btn btn-small" data-doc-up="' + kind + '" data-code="' + esc(p.parent_code) + '">Upload</button>';
+      return '<span class="muted">&mdash;</span>';
+    }
+    function visibleRows() {
+      return all.filter(function (p) {
+        if (statusFilter === 'active' && p.parent_status !== 'ACTIVE') return false;
+        if (statusFilter === 'pending' && p.parent_status !== 'PENDING') return false;
+        if (statusFilter === 'termed' && p.parent_status !== 'TERMED') return false;
+        if (statusFilter === 'active_pending' && p.parent_status === 'TERMED') return false;
+        if (exactCode) return p.parent_code === exactCode;
+        if (query) {
+          var q = query.toLowerCase();
+          return p.parent_name.toLowerCase().indexOf(q) !== -1 || p.parent_code.toLowerCase().indexOf(q) !== -1;
+        }
+        return true;
+      });
+    }
+    function rowHtml(p) {
+      if (editingCode === p.parent_code) {
+        return '<tr><td><input id="pe_code" value="' + esc(p.parent_code) + '"></td>' +
+          '<td><input id="pe_name" value="' + esc(p.parent_name) + '" style="width:95%;"></td>' +
+          '<td>' + parentStatusHtml(p.parent_status) + '</td><td>' + p.company_count + '</td>' +
+          '<td colspan="2" class="muted">Editing &mdash; files are managed after saving.</td>' +
+          '<td><button class="btn btn-small btn-primary" id="pe_save">Save</button> <button class="btn btn-small" id="pe_cancel">Cancel</button></td></tr>';
+      }
+      return '<tr><td><b>' + esc(p.parent_code) + '</b></td><td>' + esc(p.parent_name) + '</td>' +
+        '<td>' + parentStatusHtml(p.parent_status) + '</td><td>' + p.company_count + '</td>' +
+        '<td>' + docCell(p, 'master_application') + '</td>' +
+        '<td>' + docCell(p, 'pre_implementation_checklist') + '</td>' +
+        '<td>' + (isAdmin
+          ? '<button class="btn btn-small" data-edit="' + esc(p.parent_code) + '">Edit</button> <button class="btn btn-small" data-del="' + esc(p.parent_code) + '">Delete</button>'
+          : '<span class="muted">View only</span>') + '</td></tr>';
+    }
+    function paintSuggest() {
+      var box = document.getElementById('parentSuggest');
+      if (!box) return;
+      if (!query || exactCode) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      var q = query.toLowerCase();
+      var matches = all.filter(function (p) { return p.parent_name.toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
+      if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      box.innerHTML = matches.map(function (p) {
+        return '<div data-suggest="' + esc(p.parent_code) + '" style="padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee;">' +
+          esc(p.parent_name) + ' <span class="muted">(' + esc(p.parent_code) + ')</span></div>';
+      }).join('');
+      box.style.display = 'block';
+      box.querySelectorAll('[data-suggest]').forEach(function (el) {
+        el.onclick = function () {
+          var code = el.getAttribute('data-suggest');
+          var p = all.filter(function (x) { return x.parent_code === code; })[0];
+          exactCode = code;
+          query = p ? p.parent_name : code;
+          document.getElementById('parentSearch').value = query;
+          paint();
+        };
+      });
+    }
+    function paint() {
+      var rows = visibleRows();
+      var tbody = document.getElementById('parentRows');
+      if (!tbody) return;
+      tbody.innerHTML = rows.length ? rows.map(rowHtml).join('') : '<tr><td colspan="7" class="muted">No parents match.</td></tr>';
+      document.getElementById('parentCount').textContent = rows.length + ' of ' + all.length + ' parents shown';
+      var ex = document.getElementById('parentExact');
+      if (exactCode) {
+        var p = all.filter(function (x) { return x.parent_code === exactCode; })[0];
+        ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(p ? p.parent_name : exactCode) + '</b> (' + esc(exactCode) + ')</span> ' +
+          '<button class="btn btn-small" id="parentClear">Clear</button>';
+        document.getElementById('parentClear').onclick = function () {
+          exactCode = null; query = '';
+          document.getElementById('parentSearch').value = '';
+          paint();
+        };
+      } else { ex.innerHTML = ''; }
+      wireRows();
+      paintSuggest();
+    }
+    function wireRows() {
+      document.querySelectorAll('[data-edit]').forEach(function (b) {
+        b.onclick = function () { editingCode = b.getAttribute('data-edit'); paint(); };
+      });
+      document.querySelectorAll('[data-del]').forEach(function (b) {
+        b.onclick = function () {
+          var code = b.getAttribute('data-del');
+          var p = all.filter(function (x) { return x.parent_code === code; })[0];
+          if (!window.confirm('Delete parent ' + (p ? p.parent_name : code) + ' (' + code + ')? This works only when no companies are tied to the parent.')) return;
+          api.del('/api/parent-page/' + encodeURIComponent(code)).then(function () { load(); })
+            .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
+        };
+      });
+      document.querySelectorAll('[data-doc-dl]').forEach(function (b) {
+        b.onclick = function () {
+          downloadFile('/api/parent-page/' + encodeURIComponent(b.getAttribute('data-code')) + '/documents/' + b.getAttribute('data-doc-dl') + '/download');
+        };
+      });
+      document.querySelectorAll('[data-doc-up]').forEach(function (b) {
+        b.onclick = function () {
+          pendingDoc = { code: b.getAttribute('data-code'), kind: b.getAttribute('data-doc-up') };
+          document.getElementById('parentDocFile').click();
+        };
+      });
+      document.querySelectorAll('[data-doc-del]').forEach(function (b) {
+        b.onclick = function () {
+          if (!window.confirm('Delete this file?')) return;
+          api.del('/api/parent-page/' + encodeURIComponent(b.getAttribute('data-code')) + '/documents/' + b.getAttribute('data-doc-del'))
+            .then(function () { load(); })
+            .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
+        };
+      });
+      var save = document.getElementById('pe_save');
+      if (save) save.onclick = function () {
+        var body = {
+          parent_code: document.getElementById('pe_code').value.trim(),
+          parent_name: document.getElementById('pe_name').value.trim()
+        };
+        api.put('/api/parent-page/' + encodeURIComponent(editingCode), body).then(function () {
+          editingCode = null; load();
+        }).catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
+      };
+      var cancel = document.getElementById('pe_cancel');
+      if (cancel) cancel.onclick = function () { editingCode = null; paint(); };
+    }
+    function load() {
+      api.get('/api/parent-page').then(function (rows) { all = rows; paint(); })
+        .catch(function (err) { render(shell(errorHtml(err.message), '#/parent-page')); });
+    }
+    render(shell(
+      '<h2>Parent</h2>' +
+      '<p class="muted">Parent Codes are created during the Onboarding process (Highest Parent Code + 1). Only an Admin can add a Parent manually, or change a Parent Code or Parent Name, or delete a Parent. Onboarding and Top Dog can only view the Parent page.</p>' +
+      '<div id="parentMsg"></div>' +
+      (isAdmin
+        ? '<div class="card"><h3>Add Parent</h3>' +
+          '<label>Parent Code <input id="np_code" placeholder="Blank = next PC code"></label> ' +
+          '<label>Parent Name <input id="np_name"></label> ' +
+          '<button class="btn btn-primary" id="np_add">Add Parent</button></div>'
+        : '') +
+      '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
+        '<div style="position:relative;flex:1;min-width:260px;">' +
+          '<label>Search <input id="parentSearch" type="text" placeholder="Start typing a parent name..." autocomplete="off"></label>' +
+          '<div id="parentSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
+          '<div id="parentExact" style="margin-top:4px;"></div>' +
+        '</div>' +
+        '<div><label>Status <select id="parentStatusFilter">' +
+          '<option value="active">Active</option>' +
+          '<option value="pending">Pending</option>' +
+          '<option value="termed">Termed</option>' +
+          '<option value="active_pending" selected>Active &amp; Pending</option>' +
+          '<option value="all">All</option>' +
+        '</select></label></div>' +
+      '</div>' +
+      '<p class="muted" id="parentCount"></p>' +
+      '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+      '<th>Parent Code</th><th>Parent Name</th><th>Parent Status</th><th>Companies</th>' +
+      '<th>Master Application</th><th>Pre-implementation Checklist</th><th>Actions</th>' +
+      '</tr></thead><tbody id="parentRows"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody></table></div>' +
+      '<input type="file" id="parentDocFile" style="display:none;">',
+      '#/parent-page'));
+    document.getElementById('parentSearch').addEventListener('input', function (e) {
+      query = e.target.value; exactCode = null; paint();
+    });
+    document.getElementById('parentStatusFilter').onchange = function (e) { statusFilter = e.target.value; paint(); };
+    document.getElementById('parentDocFile').onchange = function (e) {
+      var f = e.target.files[0];
+      if (!f || !pendingDoc) return;
+      var fd = new FormData();
+      fd.append('file', f);
+      uploadFile('/api/parent-page/' + encodeURIComponent(pendingDoc.code) + '/documents/' + pendingDoc.kind, fd)
+        .then(function () { pendingDoc = null; e.target.value = ''; load(); })
+        .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
+    };
+    if (isAdmin) {
+      document.getElementById('np_add').onclick = function () {
+        var body = {
+          parent_code: document.getElementById('np_code').value.trim(),
+          parent_name: document.getElementById('np_name').value.trim()
+        };
+        api.post('/api/parent-page', body).then(function () {
+          document.getElementById('parentMsg').innerHTML = okHtml('Parent added.');
+          load();
+        }).catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
+      };
+    }
+    load();
+  });
+}
+
 // ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
 function viewAdminJobs() {
   requireUser(function () {
@@ -3534,6 +3751,7 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'assignments') return viewAdminAssignments();
   if (pathParts[0] === 'admin' && pathParts[1] === 'commissions') return viewAdminCommissions();
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
+  if (pathParts[0] === 'parent-page') return viewParentPage();
   if (pathParts[0] === 'tickets') {
     if (pathParts[1] === 'new') return viewNewTicket();
     if (pathParts[1]) return viewTicketDetail(pathParts[1]);
