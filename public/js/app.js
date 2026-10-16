@@ -1250,7 +1250,11 @@ function viewAdminCommissions() {
     var ar = activeRole();
     if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
     var canEdit = ar === 'admin' || ar === 'onboarding';
+    var isAdmin = ar === 'admin';
     var SLOTS = 7;
+    var cmQuery = '';
+    var cmExact = null;
+    var cmStatusFilter = 'active';
     function fmtDec(p) { return String(Math.round((Number(p) / 100) * 1000000) / 1000000); }
     function fmtTotal(sum) { return String(Math.round(sum * 100) / 100) + '%'; }
     var schedStatus = {};
@@ -1269,27 +1273,30 @@ function viewAdminCommissions() {
     function renderList(list) {
         var byCode = {};
         list.forEach(function (c) { byCode[c.company_code] = c; });
-        var head = '<tr><th>COMPANY_CODE</th><th>COMPANY_NAME</th><th>EIN</th>';
+        var head = '<tr><th class="frz frz1 cm-code">COMPANY_CODE</th><th class="frz frz2 cm-name">COMPANY_NAME</th><th class="frz frz3 cm-ein">EIN</th>';
         for (var i = 0; i < SLOTS; i++) {
-          head += '<th>STEWARD #' + (i + 1) + '</th><th>#' + (i + 1) + ' %</th>';
+          head += '<th class="cm-id">STEWARD #' + (i + 1) + '</th><th class="cm-pct">#' + (i + 1) + ' %</th>';
         }
-        head += '<th>Total %</th>' + (canEdit ? '<th>Commission Schedule</th><th>Edit</th>' : '') + '</tr>';
+        head += '<th class="cm-total">Total %</th><th class="cm-status">Company Status</th>' +
+          (canEdit ? '<th class="cm-sched">Commission Schedule</th><th class="cm-act">Edit</th>' : '') +
+          (isAdmin ? '<th class="cm-act">Delete</th>' : '') + '</tr>';
         var rows = list.map(function (c) {
-          var cells = '<td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td><td>' + esc(c.ein || '') + '</td>';
+          var cells = '<td class="frz frz1"><b>' + esc(c.company_code) + '</b></td><td class="frz frz2">' + esc(c.company_name) + '</td><td class="frz frz3">' + esc(c.ein || '') + '</td>';
           for (var i = 0; i < SLOTS; i++) {
             var s = c.stewards[i];
             if (s) {
-              cells += '<td>' + esc(s.steward_code + (s.name ? ' - ' + s.name : '')) + '</td><td>' + esc(fmtDec(s.pct)) + '</td>';
+              cells += '<td class="cm-id">' + esc(s.steward_code + (s.name ? ' - ' + s.name : '')) + '</td><td class="cm-pct">' + esc(fmtDec(s.pct)) + '</td>';
             } else {
-              cells += '<td></td><td></td>';
+              cells += '<td class="cm-id"></td><td class="cm-pct"></td>';
             }
           }
           var sum = c.stewards.reduce(function (a, s) { return a + Number(s.pct); }, 0);
           var totalCell;
-          if (c.stewards.length === 0) totalCell = '<td class="muted">&mdash;</td>';
-          else if (Math.abs(sum - 100) <= 0.01) totalCell = '<td style="color:#137333;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
-          else totalCell = '<td style="color:#b3261e;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
+          if (c.stewards.length === 0) totalCell = '<td class="cm-total muted">&mdash;</td>';
+          else if (Math.abs(sum - 100) <= 0.01) totalCell = '<td class="cm-total" style="color:#137333;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
+          else totalCell = '<td class="cm-total" style="color:#b3261e;"><b>' + esc(fmtTotal(sum)) + '</b></td>';
           cells += totalCell;
+          cells += '<td class="cm-status">' + (c.company_status === 'TERMED' ? '<b>TERMED</b>' : esc(c.company_status || '')) + '</td>';
           if (canEdit) {
             var sfn = schedStatus[c.company_code];
             var sc = '<span style="white-space:nowrap;"><button class="btn btn-small" data-sched-up="' + esc(c.company_code) + '">' + (sfn ? 'Replace' : 'Upload') + '</button>';
@@ -1299,10 +1306,13 @@ function viewAdminCommissions() {
             }
             sc += '</span>';
             if (sfn) sc += '<div class="muted" style="font-size:11px;">' + esc(sfn) + '</div>';
-            cells += '<td>' + sc + '</td>';
-            cells += '<td><button class="btn btn-small" data-editcm="' + esc(c.company_code) + '">Edit</button></td>';
+            cells += '<td class="cm-sched">' + sc + '</td>';
+            cells += '<td class="cm-act"><button class="btn btn-small" data-editcm="' + esc(c.company_code) + '">Edit</button></td>';
           }
-          return '<tr>' + cells + '</tr>';
+          if (isAdmin) {
+            cells += '<td class="cm-act"><button class="btn btn-small btn-danger" data-delcm="' + esc(c.company_code) + '">Delete</button></td>';
+          }
+          return '<tr data-status="' + esc(c.company_status || '') + '" data-name="' + esc(String(c.company_name || '').toLowerCase()) + '" data-code="' + esc(c.company_code) + '">' + cells + '</tr>';
         }).join('');
         var slotRow = function (i) {
           return '<div class="form-inline" style="margin-bottom:6px;">' +
@@ -1321,12 +1331,95 @@ function viewAdminCommissions() {
           '<button class="btn" id="cm-cancel">Cancel</button></div>';
         render(shell(
           '<h2>Commissions</h2>' +
-          '<p class="muted">Companies appear as they are added to the Company table. Onboarding and Admin can edit Steward IDs and Percentages. No one can delete a company from this page.</p>' +
+          '<p class="muted">Companies appear as they are added to the Company table. Onboarding and Admin can edit Steward IDs and Percentages. An Admin can delete a company\'s commission row (all of its splits) &mdash; the company itself is not deleted. No one can delete a company from this page.</p>' +
+          '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
+            '<div style="position:relative;flex:1;min-width:260px;">' +
+              '<label>Search <input id="cmSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"></label>' +
+              '<div id="cmSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
+              '<div id="cmExact" style="margin-top:4px;"></div>' +
+            '</div>' +
+            '<div><label>Status <select id="cmStatusFilter">' +
+              '<option value="active" selected>Active</option>' +
+              '<option value="pending">Pending</option>' +
+              '<option value="termed">Termed</option>' +
+              '<option value="active_pending">Active &amp; Pending</option>' +
+              '<option value="all">All</option>' +
+            '</select></label></div>' +
+          '</div>' +
           (canEdit ? editor : '') +
           '<div id="cm-sched-out"></div>' +
-          '<div class="fullwidth"><table class="data-table commissions-table"><thead>' + head + '</thead>' +
-          '<tbody>' + rows + '</tbody></table></div>',
+          '<div class="fullwidth"><div class="comm-scroll"><table class="data-table commissions-table"><thead>' + head + '</thead>' +
+          '<tbody id="cmrows">' + rows + '</tbody></table></div></div>',
           '#/admin/commissions'));
+        // Search + status filter (Parent-page style, v6.8). Rows are hidden
+        // in place so the editor and button wiring are untouched.
+        (function () {
+          var searchEl = document.getElementById('cmSearch');
+          var statusEl = document.getElementById('cmStatusFilter');
+          searchEl.value = cmQuery;
+          statusEl.value = cmStatusFilter;
+          function paintSuggest() {
+            var box = document.getElementById('cmSuggest');
+            if (!cmQuery || cmExact) { box.style.display = 'none'; box.innerHTML = ''; return; }
+            var q = cmQuery.toLowerCase();
+            var matches = list.filter(function (c) { return String(c.company_name || '').toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
+            if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+            box.innerHTML = matches.map(function (c) {
+              return '<div data-cmsuggest="' + esc(c.company_code) + '" style="padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee;">' +
+                esc(c.company_name) + ' <span class="muted">(' + esc(c.company_code) + ')</span></div>';
+            }).join('');
+            box.style.display = 'block';
+            box.querySelectorAll('[data-cmsuggest]').forEach(function (el) {
+              el.onclick = function () {
+                cmExact = el.getAttribute('data-cmsuggest');
+                var cc = byCode[cmExact] || {};
+                cmQuery = cc.company_name || cmExact;
+                searchEl.value = cmQuery;
+                apply();
+              };
+            });
+          }
+          function apply() {
+            document.querySelectorAll('#cmrows tr').forEach(function (tr) {
+              var s = tr.getAttribute('data-status');
+              var show = cmStatusFilter === 'all' ||
+                (cmStatusFilter === 'active' && s === 'ACTIVE') ||
+                (cmStatusFilter === 'pending' && s === 'PENDING') ||
+                (cmStatusFilter === 'termed' && s === 'TERMED') ||
+                (cmStatusFilter === 'active_pending' && s !== 'TERMED');
+              if (show && cmExact) show = tr.getAttribute('data-code') === cmExact;
+              else if (show && cmQuery) {
+                var q = cmQuery.toLowerCase();
+                show = (tr.getAttribute('data-name') || '').indexOf(q) !== -1 || (tr.getAttribute('data-code') || '').toLowerCase().indexOf(q) !== -1;
+              }
+              tr.style.display = show ? '' : 'none';
+            });
+            var ex = document.getElementById('cmExact');
+            if (cmExact) {
+              var cc = byCode[cmExact] || {};
+              ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(cc.company_name || cmExact) + '</b> (' + esc(cmExact) + ')</span> ' +
+                '<button class="btn btn-small" id="cmClear">Clear</button>';
+              document.getElementById('cmClear').onclick = function () {
+                cmExact = null; cmQuery = ''; searchEl.value = ''; apply();
+              };
+            } else { ex.innerHTML = ''; }
+            paintSuggest();
+          }
+          searchEl.addEventListener('input', function (e) { cmQuery = e.target.value; cmExact = null; apply(); });
+          statusEl.onchange = function (e) { cmStatusFilter = e.target.value; apply(); };
+          apply();
+        })();
+        if (isAdmin) {
+          document.querySelectorAll('[data-delcm]').forEach(function (b) {
+            b.onclick = function () {
+              var code = b.getAttribute('data-delcm');
+              var c = byCode[code] || {};
+              if (!window.confirm('Delete the commission row for ' + code + ' — ' + (c.company_name || '') + '? All of its steward splits are removed. The company itself stays.')) return;
+              api.del('/api/admin/commissions/' + encodeURIComponent(code)).then(function () { load(); })
+                .catch(function (err) { alert(err.message); });
+            };
+          });
+        }
         if (canEdit) {
           var stewardNames = {};
           api.get('/api/admin/stewards').then(function (sts) {

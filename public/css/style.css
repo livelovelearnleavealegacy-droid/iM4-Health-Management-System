@@ -435,3 +435,22 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .fullwidth { width: 100vw; margin-left: calc(50% - 50vw); padding: 0 10px; box-sizing: border-box; }
 .commissions-table { width: 100%; }
 .commissions-table th, .commissions-table td { padding: 5px 6px; }
+/* v6.8: frozen first three columns + a steward window that shows exactly
+   four steward/% pairs and scrolls horizontally for the rest. */
+.comm-scroll { overflow-x: auto; max-width: 1372px; }
+.commissions-table { table-layout: fixed; width: max-content; }
+.commissions-table th, .commissions-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.commissions-table .cm-code { width: 95px; }
+.commissions-table .cm-name { width: 200px; }
+.commissions-table .cm-ein { width: 105px; }
+.commissions-table .cm-id { width: 185px; }
+.commissions-table .cm-pct { width: 55px; }
+.commissions-table .cm-total { width: 70px; }
+.commissions-table .cm-status { width: 95px; }
+.commissions-table .cm-sched { width: 230px; }
+.commissions-table .cm-act { width: 64px; }
+.commissions-table .frz { position: sticky; z-index: 2; background: #fff; }
+.commissions-table th.frz { z-index: 3; background: var(--ink); }
+.commissions-table .frz1 { left: 0; }
+.commissions-table .frz2 { left: 95px; }
+.commissions-table .frz3 { left: 295px; box-shadow: 2px 0 4px rgba(0, 0, 0, 0.18); }

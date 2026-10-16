@@ -3985,7 +3985,7 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT co.company_code, co.company_name, co.ein, c.steward_code, c.pct, ' +
+      'SELECT co.company_code, co.company_name, co.ein, co.company_status, co.active, c.steward_code, c.pct, ' +
       's.first_name, s.last_name, s.email ' +
       'FROM companies co ' +
       'LEFT JOIN commissions c ON c.company_code = co.company_code ' +
@@ -4000,6 +4000,7 @@ app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req,
           company_code: code,
           company_name: row.company_name || code,
           ein: row.ein || '',
+          company_status: row.company_status || (row.active === false ? 'TERMED' : 'ACTIVE'),
           stewards: []
         };
         order.push(code);
@@ -4017,6 +4018,18 @@ app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req,
     console.error('Commissions by company error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// v6.8 (Leroy): an Admin can delete a company's whole commission row (all
+// of its splits) from the Commissions page. The company itself stays.
+app.delete('/api/admin/commissions/:code', requireAdmin, async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const co = await getPool().query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (!co.rows.length) return res.status(404).json({ error: 'Company not found' });
+    const r = await getPool().query('DELETE FROM commissions WHERE company_code = $1', [code]);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (error) { console.error('Commission row delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ------------------------------------------------- v5.51: save one company's commissions (Commissions page editor)
