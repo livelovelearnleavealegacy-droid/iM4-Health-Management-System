@@ -738,27 +738,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (remove after use): payroll snapshot, works on old and new schema.
-app.get('/api/temp-payroll-snap', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const has = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'companies' AND column_name = 'payroll_total'");
-    let companies;
-    if (has.rows.length) {
-      companies = await db.query('SELECT company_code, payroll_total, payroll_qualified, payroll_ineligible, payroll_opted_out, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_bill_premium::float AS bp, payroll_bill_claims::float AS bc, payroll_bill_admin::float AS ba, payroll_bill_savings::float AS bs, payroll_pay_schedule, payroll_ein, payroll_dataset_date::text AS dataset_date FROM companies WHERE payroll_total IS NOT NULL OR payroll_enrolled IS NOT NULL ORDER BY company_code');
-    } else {
-      companies = await db.query(
-        'SELECT c.company_code, p.employee_count AS payroll_total, p.eligible_count AS payroll_qualified, p.ineligible_count AS payroll_ineligible, p.opt_out_count AS payroll_opted_out, p.enrolled_count AS payroll_enrolled, ' +
-        'GREATEST(p.eligible_count - p.enrolled_count - p.new_count, 0) AS payroll_not_enrolled, p.new_count AS payroll_new_qualified, p.bill_premium::float AS bp, p.bill_claims::float AS bc, p.bill_admin::float AS ba, p.bill_savings::float AS bs, p.pay_schedule AS payroll_pay_schedule, p.ein AS payroll_ein, p.dataset_date::text AS dataset_date ' +
-        'FROM companies c JOIN LATERAL (SELECT * FROM payroll_company_summary s WHERE s.company_code = c.company_code ORDER BY s.dataset_date DESC NULLS LAST, s.imported_at DESC, s.id DESC LIMIT 1) p ON TRUE ORDER BY c.company_code');
-    }
-    const sum = await db.query('SELECT COUNT(*)::int AS rows FROM payroll_company_summary');
-    const cols = await db.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' ORDER BY ordinal_position");
-    res.json({ mode: has.rows.length ? 'old' : 'new', companies: companies.rows, summary_rows: sum.rows[0].rows, companies_columns: cols.rows.map(function (r) { return r.column_name; }) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
