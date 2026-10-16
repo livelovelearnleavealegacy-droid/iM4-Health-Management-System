@@ -666,18 +666,6 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
-// TEMP PROBE (remove after use): verify the ee -> parent_company migration.
-app.get('/api/temp-parent-probe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const cols = await db.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' ORDER BY ordinal_position");
-    const counts = await db.query("SELECT COUNT(*)::int AS total, COUNT(parent_company_code)::int AS with_code, COUNT(parent_company_name)::int AS with_name, COUNT(DISTINCT parent_company_code)::int AS distinct_parents FROM companies");
-    const sample = await db.query('SELECT company_code, parent_company_code, parent_company_name FROM companies ORDER BY company_code LIMIT 3');
-    res.json({ columns: cols.rows.map(function (r) { return r.column_name; }), counts: counts.rows[0], sample: sample.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
