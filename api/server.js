@@ -658,6 +658,51 @@ function displayName(u) {
   return full || u.name || u.email;
 }
 
+// TEMP PROBE (v6.8.5 diagnostics, remove after use): EIN format stats for
+// the payroll matching investigation. Sync-secret gated, aggregated only.
+app.get('/api/temp-ein-probe', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const out = {};
+    const x = await db.query("SELECT COUNT(*)::int AS n, COUNT(DISTINCT regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g'))::int AS distinct_n FROM ein_account_xref WHERE tin IS NOT NULL");
+    out.xref = x.rows[0];
+    const xl = await db.query("SELECT length(regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g')) AS len, COUNT(*)::int AS n FROM ein_account_xref WHERE tin IS NOT NULL GROUP BY 1 ORDER BY 1");
+    out.xref_len_dist = xl.rows;
+    const xs = await db.query("SELECT tin FROM ein_account_xref WHERE tin IS NOT NULL ORDER BY tin LIMIT 5");
+    out.xref_samples = xs.rows.map(function (r) { return r.tin; });
+    const ps = await db.query('SELECT COUNT(*)::int AS n, MAX(file_name) AS latest_file FROM payroll_company_summary');
+    out.summary = ps.rows[0];
+    const pl = await db.query("SELECT length(ein) AS len, COUNT(*)::int AS n FROM payroll_company_summary WHERE ein IS NOT NULL GROUP BY 1 ORDER BY 1");
+    out.summary_ein_len_dist = pl.rows;
+    const pss = await db.query('SELECT ein FROM payroll_company_summary WHERE ein IS NOT NULL ORDER BY ein LIMIT 5');
+    out.summary_samples = pss.rows.map(function (r) { return r.ein; });
+    const co = await db.query("SELECT COUNT(*)::int AS total, COUNT(ein)::int AS with_ein, COUNT(payroll_ein)::int AS with_payroll_ein FROM companies");
+    out.companies = co.rows[0];
+    const cs = await db.query('SELECT ein FROM companies WHERE ein IS NOT NULL ORDER BY ein LIMIT 5');
+    out.company_ein_samples = cs.rows.map(function (r) { return r.ein; });
+    // Match simulation: summary EINs vs xref set, raw-normalized vs zero-padded.
+    const xr = await db.query("SELECT DISTINCT regexp_replace(tin, '[^0-9a-zA-Z]', '', 'g') AS n FROM ein_account_xref WHERE tin IS NOT NULL");
+    const setRaw = {}, setPad = {};
+    xr.rows.forEach(function (r) {
+      if (!r.n) return;
+      setRaw[r.n] = true;
+      const p = /^[0-9]+$/.test(r.n) && r.n.length < 9 ? r.n.padStart(9, '0') : r.n;
+      setPad[p] = true;
+    });
+    const sm = await db.query('SELECT DISTINCT ein FROM payroll_company_summary WHERE ein IS NOT NULL');
+    let mRaw = 0, mPad = 0;
+    sm.rows.forEach(function (r) {
+      const n = String(r.ein).replace(/[^0-9a-zA-Z]/g, '');
+      if (setRaw[n]) mRaw++;
+      const p = /^[0-9]+$/.test(n) && n.length < 9 ? n.padStart(9, '0') : n;
+      if (setPad[p]) mPad++;
+    });
+    out.match_sim = { summary_distinct_eins: sm.rows.length, matched_raw_normalized: mRaw, matched_with_zero_pad: mPad };
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 function publicUser(u, roles, activeRole) {
   const r = roles || u.roles || [u.role || 'steward'];
   const a = activeRole || u.activeRole || pickActiveRole(r);
