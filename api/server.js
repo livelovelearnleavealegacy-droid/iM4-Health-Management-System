@@ -1386,12 +1386,15 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 // v6.1 (Leroy): Billing page open to every role. Scoping is enforced
 // inside via getVisibleCodes: full-visibility roles see all companies;
 // stewards/service/client see only their assigned companies.
+// v6.2 (Leroy): Open Bills reports only imported, known bills —
+// estimated bills (is_estimate) are never returned for status=open.
 app.get('/api/billing', requireAuth, async (req, res) => {
   try {
     const status = req.query.status === 'paid' ? 'paid' : 'open';
     const codes = await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
     let where = "WHERE status = $1 AND NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.active = FALSE)";
+    if (status === 'open') where += ' AND is_estimate = FALSE';
     const params = [status];
     const btype = req.query.type === 'F' || req.query.type === 'S' ? req.query.type : null;
     if (btype) {
@@ -2338,37 +2341,13 @@ async function estimateUnpaidBills(db, maxStaleDays) {
 }
 
 app.post('/api/admin/jobs/ftj-estimate-preview', requireAdmin, async (req, res) => {
-  try {
-    const maxStale = req.body && req.body.max_stale_days;
-    const r = await estimateUnpaidBills(getPool(), maxStale);
-    let total = 0;
-    r.accounts.forEach(function (a) { total += a.estimates.length; });
-    res.json({ ok: true, total_estimates: total, accounts: r.accounts,
-      skipped_stale: r.skipped_stale, skipped_inactive: r.skipped_inactive, max_stale_days: r.max_stale_days });
-  } catch (error) { console.error('FTJ estimate preview error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+  // v6.2 (Leroy): estimates retired — Open Bills reports imported bills only.
+  return res.status(400).json({ error: 'Estimates are retired: the Billing page now reports only imported bills. Existing estimates can be removed with Delete all estimates.' });
 });
 
 app.post('/api/admin/jobs/ftj-estimate-create', requireAdmin, async (req, res) => {
-  try {
-    const db = getPool();
-    const r = await estimateUnpaidBills(db, req.body && req.body.max_stale_days);
-    const accounts = r.accounts;
-    let created = 0, skipped = 0;
-    for (const a of accounts) {
-      for (const d of a.estimates) {
-        const chk = await db.query(
-          "SELECT id FROM invoices WHERE company_code = $1 AND payroll_date = $2 AND bill_type = 'F'",
-          [a.company_code, d]);
-        if (chk.rows.length > 0) { skipped++; continue; }
-        await db.query(
-          "INSERT INTO invoices (company_code, company_name, payroll_date, lives_count, total_invoice, status, paid_date, bill_type, is_estimate) " +
-          "VALUES ($1, $2, $3, $4, $5, 'open', NULL, 'F', TRUE)",
-          [a.company_code, a.company_name, d, a.lives_count, a.total_invoice]);
-        created++;
-      }
-    }
-    res.json({ ok: true, created: created, skipped: skipped });
-  } catch (error) { console.error('FTJ estimate create error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
+  // v6.2 (Leroy): estimates retired — Open Bills reports imported bills only.
+  return res.status(400).json({ error: 'Estimates are retired: the Billing page now reports only imported bills. Existing estimates can be removed with Delete all estimates.' });
 });
 
 // Delete all open estimated bills (is_estimate). Real paid bills are never touched.

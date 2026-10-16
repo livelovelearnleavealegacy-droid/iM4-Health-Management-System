@@ -553,9 +553,8 @@ function viewBilling() {
           var topBody = topCodes.map(function (code) {
             var bills = openByCo[code];
             var all = bills.concat(paidByCo[code] || []);
-            var b030 = 0, b3160 = 0, b61 = 0, tot61 = 0, estCount = 0;
+            var b030 = 0, b3160 = 0, b61 = 0, tot61 = 0;
             bills.forEach(function (r) {
-              if (r.is_estimate) estCount++;
               var n = daysPast(r.payroll_date);
               if (n <= 30) b030++;
               else if (n <= 60) b3160++;
@@ -563,8 +562,7 @@ function viewBilling() {
             });
             var lastPaid = paidByCo[code] ? latestOf(paidByCo[code]) : null;
             var paidTo = lastPaid ? (lastPaid.payroll_end_date || lastPaid.payroll_date || null) : null;
-            var status = '<span class="dot ' + (b61 > 0 ? 'dot-red' : (b3160 > 0 ? 'dot-yellow' : 'dot-green')) + '"></span>' +
-              (estCount > 0 ? ' est.' : '');
+            var status = '<span class="dot ' + (b61 > 0 ? 'dot-red' : (b3160 > 0 ? 'dot-yellow' : 'dot-green')) + '"></span>';
             return '<tr><td><b>' + esc(code) + '</b></td>' +
               cell(firstVal(all, 'company_name')) +
               cell(firstVal(all, 'ein')) +
@@ -592,6 +590,7 @@ function viewBilling() {
           render(shell(
             '<h2>Billing</h2><div id="msg"></div>' +
             '<h3>Open Bills (' + topCodes.length + ' companies)</h3>' +
+            '<p class="muted">Open bills only being reported by new billing system.</p>' +
             (topCodes.length === 0
               ? '<p class="muted">No open bills.</p>'
               : '<div class="table-scroll" style="max-height:430px;overflow-y:auto;"><table class="data-table"><thead>' +
@@ -600,6 +599,7 @@ function viewBilling() {
                 '<th># Bills 61+ days</th><th>Total $ 61+ days</th><th>Status</th></tr>' +
                 '</thead><tbody>' + topBody + '</tbody></table></div>') +
             '<h3 style="margin-top:22px;">Paid Bills — Last Invoice Paid (' + botCodes.length + ' companies)</h3>' +
+            '<p class="muted">Paid bills reported by both old and new billing systems. Only the most recent paid bill for each company is displayed.</p>' +
             (botCodes.length === 0
               ? '<p class="muted">No paid bills.</p>'
               : '<div class="table-scroll" style="max-height:340px;overflow-y:auto;"><table class="data-table"><thead>' +
@@ -2077,7 +2077,7 @@ function viewAdminJobs() {
       '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div>' +
-      '<hr><p class="muted"><b>Unpaid estimates.</b> Projects unpaid F bills from each account\u2019s last paid bill and payroll frequency. Estimates appear on the Billing tab as pending bills marked \u201cest\u201d. Re-running never duplicates; importing a newer report replaces estimates with the real paid bills.</p>' +
+      '<hr><p class="muted"><b>Unpaid estimates — retired.</b> The Billing page now reports only bills imported into the system, so estimates are no longer created or shown. Any estimates already in the system can be removed with Delete all estimates.</p>' +
       '<label>Only accounts paid within the last <input id="ftjestdays" type="number" value="90" min="1" max="3650" style="width: 70px;"> days</label> ' +
       '<button class="btn btn-primary" id="ftjest">Preview estimates</button> ' +
       '<button class="btn btn-small" id="ftjestclear">Delete all estimates</button><div id="ftjestout"></div></div>' +
