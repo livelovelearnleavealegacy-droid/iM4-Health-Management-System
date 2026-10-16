@@ -2329,10 +2329,12 @@ function viewParentPage() {
       '<p class="muted">Parent Codes are created during the Onboarding process (Highest Parent Code + 1). Only an Admin can add a Parent manually, or change a Parent Code or Parent Name, or delete a Parent. Onboarding and Top Dog can only view the Parent page.</p>' +
       '<div id="parentMsg"></div>' +
       (isAdmin
-        ? '<div class="card"><h3>Add Parent</h3>' +
+        ? '<p><button class="btn btn-primary" id="np_open">Add Parent</button></p>' +
+          '<div class="card" id="np_card" style="display:none;"><h3>Add Parent</h3>' +
           '<label>Parent Code <input id="np_code" placeholder="Blank = next PC code"></label> ' +
           '<label>Parent Name <input id="np_name"></label> ' +
-          '<button class="btn btn-primary" id="np_add">Add Parent</button></div>'
+          '<button class="btn btn-primary" id="np_add">Add Parent</button> ' +
+          '<button class="btn" id="np_cancel">Cancel</button></div>'
         : '') +
       '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
         '<div style="position:relative;flex:1;min-width:260px;">' +
@@ -2369,6 +2371,24 @@ function viewParentPage() {
         .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
     };
     if (isAdmin) {
+      var npCard = document.getElementById('np_card');
+      var npOpen = document.getElementById('np_open');
+      function closeNpForm() {
+        npCard.style.display = 'none';
+        npOpen.style.display = '';
+        document.getElementById('np_code').value = '';
+        document.getElementById('np_name').value = '';
+      }
+      npOpen.onclick = function () {
+        npCard.style.display = '';
+        npOpen.style.display = 'none';
+        document.getElementById('parentMsg').innerHTML = '';
+        document.getElementById('np_name').focus();
+      };
+      document.getElementById('np_cancel').onclick = function () {
+        document.getElementById('parentMsg').innerHTML = '';
+        closeNpForm();
+      };
       document.getElementById('np_add').onclick = function () {
         var body = {
           parent_code: document.getElementById('np_code').value.trim(),
@@ -2376,6 +2396,7 @@ function viewParentPage() {
         };
         api.post('/api/parent-page', body).then(function () {
           document.getElementById('parentMsg').innerHTML = okHtml('Parent added.');
+          closeNpForm();
           load();
         }).catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
       };
