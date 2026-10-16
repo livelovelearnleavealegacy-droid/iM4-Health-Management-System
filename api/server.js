@@ -388,6 +388,14 @@ async function migrate() {
     'parent_name TEXT NOT NULL, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS company_ach_documents (' +
+    'company_code TEXT PRIMARY KEY, ' +
+    'file_name TEXT NOT NULL, ' +
+    'mime_type TEXT, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'uploaded_by INT REFERENCES stewards(id), ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
   await db.query('CREATE TABLE IF NOT EXISTS parent_documents (' +
     'parent_code TEXT NOT NULL, ' +
     'doc_kind TEXT NOT NULL CHECK (doc_kind IN (' + "'master_application', 'pre_implementation_checklist'" + ')), ' +
@@ -615,6 +623,15 @@ function requireAdminOrOnboarding(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
     if (r !== 'admin' && r !== 'onboarding') return res.status(403).json({ error: 'Admin or Onboarding only' });
+    next();
+  });
+}
+
+// Companies maintenance pages (v6.7): Admin, Top Dog, and Onboarding.
+function requireAdminTopDogOnboarding(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding') return res.status(403).json({ error: 'Available to Admin, Top Dog, and Onboarding only' });
     next();
   });
 }
@@ -1232,6 +1249,21 @@ function parentStatusOf(counts) {
   return 'PENDING';
 }
 
+// The canonical Parent for a code: { code, name } from the Parent page's
+// data (parents table name wins, else the name companies carry), or null
+// when the code is not an existing Parent Code.
+async function canonicalParent(db, code) {
+  if (!code) return null;
+  const set = await parentCodeSet(db);
+  if (!set[String(code)]) return null;
+  const t = await db.query('SELECT parent_name FROM parents WHERE parent_code = $1', [String(code)]);
+  if (t.rows.length) return { code: String(code), name: t.rows[0].parent_name };
+  const c = await db.query(
+    'SELECT MAX(name) AS name FROM (SELECT ee_company_name AS name FROM companies WHERE ee_company_code = $1 ' +
+    'UNION ALL SELECT parent_company_name FROM companies WHERE parent_company_code = $1) u', [String(code)]);
+  return { code: String(code), name: (c.rows.length && c.rows[0].name) || String(code) };
+}
+
 async function parentCodeSet(db) {
   const r = await db.query(
     'SELECT parent_code AS code FROM parents ' +
@@ -1299,7 +1331,10 @@ app.post('/api/parent-page', requireAdmin, async (req, res) => {
   try {
     const name = String((req.body || {}).parent_name || '').trim();
     if (!name) return res.status(400).json({ error: 'Parent Name is required' });
-    let code = String((req.body || {}).parent_code || '').trim();
+    let code = String((req.body || {}).parent_code || '').trim().toUpperCase();
+    if (code && !/^PC\d{4}$/.test(code)) {
+      return res.status(400).json({ error: 'Parent Code must be "PC" plus four numbers (for example PC0007).' });
+    }
     if (!code) {
       // Auto-assign: highest PC#### in use + 1, like the Onboarding process.
       const set = await parentCodeSet(db);
@@ -3268,6 +3303,11 @@ function companyFieldErrors(v) {
 app.post('/api/admin/companies', requireAdmin, async (req, res) => {
   try {
     const v = companyFieldValues(req.body || {});
+    // v6.7 (Leroy): the Parent must already exist on the Parent page; the
+    // Parent Name always comes from the Parent page, never from this form.
+    const canon = await canonicalParent(getPool(), v.parent_code);
+    if (!canon) return res.status(400).json({ error: 'Parent Code ' + (v.parent_code || '(blank)') + ' is not on the Parent page. Parent Codes and Names are managed on the Parent page only.' });
+    v.parent_name = canon.name;
     const errs = companyFieldErrors(v);
     if (errs.length) return res.status(400).json({ error: errs.join(' ') });
     const db = getPool();
@@ -3288,15 +3328,17 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
   try {
     const code = String(req.params.code || '').trim();
     const v = companyFieldValues(req.body || {});
+    // v6.7 (Leroy): Admin and Onboarding may reassign a company to another
+    // EXISTING Parent Code; the Parent Name always comes from the Parent
+    // page. Creating or renaming Parents happens only on the Parent page.
+    const canon = await canonicalParent(getPool(), v.parent_code);
+    if (!canon) return res.status(400).json({ error: 'Parent Code ' + (v.parent_code || '(blank)') + ' is not on the Parent page. Parent Codes and Names are managed on the Parent page only.' });
+    v.parent_name = canon.name;
     const errs = companyFieldErrors(v);
     if (errs.length) return res.status(400).json({ error: errs.join(' ') });
     const db = getPool();
     const cur = await db.query('SELECT company_code, parent_company_code, ee_company_code FROM companies WHERE company_code = $1', [code]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Company not found' });
-    const curParent = (cur.rows[0].parent_company_code || cur.rows[0].ee_company_code || '');
-    if (v.parent_code !== curParent && (!req.user || req.user.activeRole !== 'admin')) {
-      return res.status(403).json({ error: 'Only an Admin can change a Parent Code.' });
-    }
     const codeChange = v.company_code !== code;
     if (codeChange) {
       if (!req.user || req.user.activeRole !== 'admin') {
@@ -3436,6 +3478,51 @@ app.delete('/api/admin/companies/:code/commission-schedule', requireAdminOrOnboa
     await getPool().query('DELETE FROM company_documents WHERE company_code = $1', [String(req.params.code || '').trim()]);
     res.json({ ok: true });
   } catch (error) { console.error('Schedule delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ACH Authorization file per company (v6.7, Leroy): one stored file per
+// company on the Companies maintenance page. Upload/replace/delete by the
+// page's editors (Admin + Onboarding); view/download by Admin, Top Dog,
+// and Onboarding. The file is stored as-is (never parsed).
+app.get('/api/admin/companies/ach-documents-status', requireAdminTopDogOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT company_code, file_name FROM company_ach_documents ORDER BY company_code');
+    const map = {};
+    r.rows.forEach(function (x) { map[x.company_code] = x.file_name; });
+    res.json(map);
+  } catch (error) { console.error('ACH status error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/admin/companies/:code/ach-document', requireAdminOrOnboarding, handleUpload('file'), async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    const co = await getPool().query('SELECT company_code FROM companies WHERE company_code = $1', [code]);
+    if (!co.rows.length) return res.status(404).json({ error: 'Company not found' });
+    if (!req.file) return res.status(400).json({ error: 'A file is required' });
+    await getPool().query(
+      'INSERT INTO company_ach_documents (company_code, file_name, mime_type, file_data, uploaded_by) VALUES ($1, $2, $3, $4, $5) ' +
+      'ON CONFLICT (company_code) DO UPDATE SET file_name = EXCLUDED.file_name, mime_type = EXCLUDED.mime_type, file_data = EXCLUDED.file_data, uploaded_by = EXCLUDED.uploaded_by, updated_at = NOW()',
+      [code, req.file.originalname, req.file.mimetype, req.file.buffer, req.user.id]);
+    res.json({ ok: true, file_name: req.file.originalname });
+  } catch (error) { console.error('ACH upload error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/admin/companies/:code/ach-document/download', requireAdminTopDogOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT file_name, mime_type, file_data FROM company_ach_documents WHERE company_code = $1', [String(req.params.code || '').trim()]);
+    if (!r.rows.length) return res.status(404).json({ error: 'No ACH Authorization on file for this company' });
+    const f = r.rows[0];
+    res.set('Content-Type', f.mime_type || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename=\"' + String(f.file_name).replace(/\"/g, '') + '\"');
+    res.send(f.file_data);
+  } catch (error) { console.error('ACH download error:', error); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/admin/companies/:code/ach-document', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    await getPool().query('DELETE FROM company_ach_documents WHERE company_code = $1', [String(req.params.code || '').trim()]);
+    res.json({ ok: true });
+  } catch (error) { console.error('ACH delete error:', error); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/admin/assignments', requireAdminOrTopDog, async (req, res) => {

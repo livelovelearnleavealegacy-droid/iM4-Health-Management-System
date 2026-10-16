@@ -1844,10 +1844,11 @@ function viewAdminCompanies() {
           actions = '<td style="white-space:nowrap;"><button class="btn btn-small" data-edit="' + esc(c.company_code) + '">Edit</button>' +
             (isAdmin ? ' <button class="btn btn-small" data-del="' + esc(c.company_code) + '">Delete</button>' : '') + '</td>';
         }
-        return '<tr data-status="' + status + '">' + cell(parentCode(c)) + cell(parentName(c)) +
+        return '<tr data-status="' + status + '" data-name="' + esc(String(c.company_name || '').toLowerCase()) + '" data-code="' + esc(c.company_code) + '">' + cell(parentCode(c)) + cell(parentName(c)) +
           '<td><b>' + esc(c.company_code) + '</b></td>' + cell(c.ein) + '<td>' + esc(c.company_name) + '</td>' +
           cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) +
-          '<td>' + statusHtml + '</td>' + actions + '</tr>';
+          '<td>' + statusHtml + '</td>' +
+          '<td id="ach-' + esc(c.company_code) + '"><span class="muted">...</span></td>' + actions + '</tr>';
       }).join('');
       var fld = function (id, label, val, ph) {
         return '<label style="display:block;margin:0 10px 8px 0;">' + label + '<br>' +
@@ -1856,8 +1857,10 @@ function viewAdminCompanies() {
       var editor =
         '<div class="card" id="co-editor" style="display:none;"><div class="card-title" id="co-editor-title">Add Company</div>' +
         '<div style="display:flex;flex-wrap:wrap;">' +
-        fld('co-f-parent-code', 'Parent Code', '', 'PC0007') +
-        fld('co-f-parent-name', 'Parent Name', '') +
+        '<label style="display:block;margin:0 10px 8px 0;">Parent Code<br>' +
+        '<select id="co-f-parent-code" style="min-width:170px;"></select></label>' +
+        '<label style="display:block;margin:0 10px 8px 0;">Parent Name (from the Parent page)<br>' +
+        '<input id="co-f-parent-name" type="text" value="" readonly style="min-width:170px;background:#f2f2f2;"></label>' +
         fld('co-f-code', 'Company Code', '', 'four numbers') +
         fld('co-f-ein', 'EIN', '', '47-5096437') +
         fld('co-f-name', 'Company Name', '') +
@@ -1868,48 +1871,181 @@ function viewAdminCompanies() {
         '<label style="display:block;margin:0 10px 8px 0;">Company Status<br>' +
         '<select id="co-f-status"><option value="ACTIVE">ACTIVE</option><option value="PENDING">PENDING</option><option value="TERMED">TERMED</option></select></label>' +
         '</div>' +
-        '<p class="muted">All fields are required. Parent Code is "PC" plus four numbers and can be shared by many companies. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
+        '<p class="muted">All fields are required. Parent: pick an existing Parent Code &mdash; the Parent Name comes from the Parent page and cannot be changed here. To add, rename, or delete a Parent, use the Parent page. Company Code is four numbers and must be unique. EIN is two numbers, a dash, and seven more numbers. EIN and Zip are stored as text, so leading zeros are kept.</p>' +
         '<div id="co-editor-out"></div>' +
         '<button class="btn btn-primary" id="co-save">Save</button> ' +
         '<button class="btn" id="co-cancel">Cancel</button>' +
         '</div>';
       render(shell(
         '<h2>Companies</h2>' +
-        '<p class="muted">Only an Admin can add a company, change a Parent Code or Company Code, or delete a company. Onboarding can edit the other fields. Top Dog can view only. New accounts also arrive automatically from the Onboarding process, with Parent and Company Codes assigned.</p>' +
+        '<p class="muted">Only an Admin can add a company, change a Company Code, or delete a company. Admin and Onboarding can reassign a company to another existing Parent by picking its Parent Code &mdash; Parent Codes and Parent Names themselves are managed on the Parent page, and the Parent Name shown here is the one from the Parent page. Top Dog can view only. New accounts also arrive automatically from the Onboarding process, with Parent and Company Codes assigned.</p>' +
         (isAdmin ? '<p><button class="btn btn-primary" id="co-add">Add Company</button></p>' : '') + (canMaintain ? editor : '') +
-        '<p class="muted">' +
-        'Show: <label><input type="radio" name="cfilter" value="active"> Active</label> ' +
-        '<label><input type="radio" name="cfilter" value="pending"> Pending</label> ' +
-        '<label><input type="radio" name="cfilter" value="termed"> Termed</label> ' +
-        '<label><input type="radio" name="cfilter" value="actpend" checked> Active &amp; Pending</label> ' +
-        '<label><input type="radio" name="cfilter" value="all"> All</label></p>' +
+        '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-top:14px;">' +
+          '<div style="position:relative;flex:1;min-width:260px;">' +
+            '<label>Search <input id="coSearch" type="text" placeholder="Start typing a company name..." autocomplete="off"></label>' +
+            '<div id="coSuggest" style="position:absolute;left:0;right:0;top:100%;background:#fff;border:1px solid #ccc;z-index:5;display:none;"></div>' +
+            '<div id="coExact" style="margin-top:4px;"></div>' +
+          '</div>' +
+          '<div><label>Status <select id="coStatusFilter">' +
+            '<option value="active">Active</option>' +
+            '<option value="pending">Pending</option>' +
+            '<option value="termed">Termed</option>' +
+            '<option value="active_pending" selected>Active &amp; Pending</option>' +
+            '<option value="all">All</option>' +
+          '</select></label></div>' +
+        '</div>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Company Code</th><th>EIN</th><th>Company Name</th>' +
-        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th>' +
+        '<th>Company Address 1</th><th>Company City</th><th>Company State</th><th>Company Zip</th><th>Company Status</th><th>ACH</th>' +
         (canMaintain ? '<th>Actions</th>' : '') + '</tr></thead>' +
-        '<tbody id="companyrows">' + rows + '</tbody></table></div>',
+        '<tbody id="companyrows">' + rows + '</tbody></table></div>' +
+        '<input type="file" id="coAchFile" style="display:none;">',
         '#/admin/companies'));
+      // Search + status filter, operated like the Parent page (v6.7):
+      // type-ahead suggestions on the left, status dropdown on the right.
+      var coQuery = '';
+      var coExact = null;
+      var parentsList = [];
+      var parentNameByCode = {};
       function applyCompanyFilter() {
-        var v = document.querySelector('input[name="cfilter"]:checked').value;
+        var v = document.getElementById('coStatusFilter').value;
         document.querySelectorAll('#companyrows tr').forEach(function (tr) {
           var s = tr.getAttribute('data-status');
           var show = v === 'all' || (v === 'active' && s === 'ACTIVE') || (v === 'pending' && s === 'PENDING') ||
-            (v === 'termed' && s === 'TERMED') || (v === 'actpend' && s !== 'TERMED');
+            (v === 'termed' && s === 'TERMED') || (v === 'active_pending' && s !== 'TERMED');
+          if (show && coExact) show = tr.getAttribute('data-code') === coExact;
+          else if (show && coQuery) {
+            var q = coQuery.toLowerCase();
+            show = (tr.getAttribute('data-name') || '').indexOf(q) !== -1 || (tr.getAttribute('data-code') || '').toLowerCase().indexOf(q) !== -1;
+          }
           tr.style.display = show ? '' : 'none';
         });
+        var ex = document.getElementById('coExact');
+        if (coExact) {
+          var cc = byCode[coExact] || {};
+          ex.innerHTML = '<span class="muted">Showing only: <b>' + esc(cc.company_name || coExact) + '</b> (' + esc(coExact) + ')</span> ' +
+            '<button class="btn btn-small" id="coClear">Clear</button>';
+          document.getElementById('coClear').onclick = function () {
+            coExact = null; coQuery = '';
+            document.getElementById('coSearch').value = '';
+            applyCompanyFilter();
+          };
+        } else { ex.innerHTML = ''; }
+        paintCoSuggest();
       }
-      document.querySelectorAll('input[name="cfilter"]').forEach(function (r) {
-        r.onchange = applyCompanyFilter;
+      function paintCoSuggest() {
+        var box = document.getElementById('coSuggest');
+        if (!coQuery || coExact) { box.style.display = 'none'; box.innerHTML = ''; return; }
+        var q = coQuery.toLowerCase();
+        var matches = list.filter(function (c) { return String(c.company_name || '').toLowerCase().indexOf(q) !== -1; }).slice(0, 10);
+        if (!matches.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+        box.innerHTML = matches.map(function (c) {
+          return '<div data-cosuggest="' + esc(c.company_code) + '" style="padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee;">' +
+            esc(c.company_name) + ' <span class="muted">(' + esc(c.company_code) + ')</span></div>';
+        }).join('');
+        box.style.display = 'block';
+        box.querySelectorAll('[data-cosuggest]').forEach(function (el) {
+          el.onclick = function () {
+            coExact = el.getAttribute('data-cosuggest');
+            var cc = byCode[coExact] || {};
+            coQuery = cc.company_name || coExact;
+            document.getElementById('coSearch').value = coQuery;
+            applyCompanyFilter();
+          };
+        });
+      }
+      document.getElementById('coSearch').addEventListener('input', function (e) {
+        coQuery = e.target.value; coExact = null; applyCompanyFilter();
       });
+      document.getElementById('coStatusFilter').onchange = applyCompanyFilter;
       applyCompanyFilter();
+      // Parents (for the editor's Parent Code dropdown) — the same list the
+      // Parent page shows.
+      api.get('/api/parent-page').then(function (ps) {
+        parentsList = ps || [];
+        parentsList.forEach(function (p) { parentNameByCode[p.parent_code] = p.parent_name; });
+      }).catch(function () {});
+      // ACH Authorization column: paint each cell from the status map.
+      var pendingAch = null;
+      function paintAch(achMap) {
+        list.forEach(function (c) {
+          var td = document.getElementById('ach-' + c.company_code);
+          if (!td) return;
+          var fname = achMap[c.company_code];
+          if (fname) {
+            var h = '<div>' + esc(fname) + '</div>' +
+              '<button class="btn btn-small" data-ach-dl="' + esc(c.company_code) + '">Download</button>';
+            if (canMaintain) {
+              h += ' <button class="btn btn-small" data-ach-up="' + esc(c.company_code) + '">Replace</button>' +
+                ' <button class="btn btn-small" data-ach-del="' + esc(c.company_code) + '">Delete</button>';
+            }
+            td.innerHTML = h;
+          } else if (canMaintain) {
+            td.innerHTML = '<button class="btn btn-small" data-ach-up="' + esc(c.company_code) + '">Upload</button>';
+          } else {
+            td.innerHTML = '<span class="muted">&mdash;</span>';
+          }
+        });
+        tdWireAch();
+      }
+      function tdWireAch() {
+        document.querySelectorAll('[data-ach-dl]').forEach(function (b) {
+          b.onclick = function () { downloadFile('/api/admin/companies/' + encodeURIComponent(b.getAttribute('data-ach-dl')) + '/ach-document/download'); };
+        });
+        document.querySelectorAll('[data-ach-up]').forEach(function (b) {
+          b.onclick = function () { pendingAch = b.getAttribute('data-ach-up'); document.getElementById('coAchFile').click(); };
+        });
+        document.querySelectorAll('[data-ach-del]').forEach(function (b) {
+          b.onclick = function () {
+            if (!window.confirm('Delete the ACH Authorization file for company ' + b.getAttribute('data-ach-del') + '?')) return;
+            api.del('/api/admin/companies/' + encodeURIComponent(b.getAttribute('data-ach-del')) + '/ach-document')
+              .then(function () { viewAdminCompanies(); })
+              .catch(function (err) { alert(err.message); });
+          };
+        });
+      }
+      document.getElementById('coAchFile').onchange = function (e) {
+        var f = e.target.files[0];
+        if (!f || !pendingAch) return;
+        var fd = new FormData();
+        fd.append('file', f);
+        uploadFile('/api/admin/companies/' + encodeURIComponent(pendingAch) + '/ach-document', fd)
+          .then(function () { pendingAch = null; e.target.value = ''; viewAdminCompanies(); })
+          .catch(function (err) { alert(err.message); });
+      };
+      api.get('/api/admin/companies/ach-documents-status').then(paintAch)
+        .catch(function () { paintAch({}); });
       if (canMaintain) {
         var editingCode = null;
         var editorEl = document.getElementById('co-editor');
+        function fillParentName() {
+          var sel = document.getElementById('co-f-parent-code');
+          document.getElementById('co-f-parent-name').value = parentNameByCode[sel.value] || '';
+        }
         function openEditor(c) {
+          if (!parentsList.length) {
+            api.get('/api/parent-page').then(function (ps) {
+              parentsList = ps || [];
+              parentsList.forEach(function (p) { parentNameByCode[p.parent_code] = p.parent_name; });
+              openEditor(c);
+            }).catch(function () { openEditor(c); });
+            return;
+          }
           editingCode = c ? c.company_code : null;
           document.getElementById('co-editor-title').textContent = c ? ('Edit Company ' + c.company_code) : 'Add Company';
-          document.getElementById('co-f-parent-code').value = c ? (parentCode(c) || '') : '';
-          document.getElementById('co-f-parent-name').value = c ? (parentName(c) || '') : '';
+          var sel = document.getElementById('co-f-parent-code');
+          var cur = c ? (parentCode(c) || '') : '';
+          var opts = '<option value="">Select a Parent Code</option>' + parentsList.map(function (p) {
+            return '<option value="' + esc(p.parent_code) + '">' + esc(p.parent_code) + ' &mdash; ' + esc(p.parent_name) + '</option>';
+          }).join('');
+          if (cur && !parentNameByCode[cur]) {
+            opts += '<option value="' + esc(cur) + '">' + esc(cur) + ' &mdash; ' + esc(parentName(c) || cur) + '</option>';
+            parentNameByCode[cur] = parentName(c) || cur;
+          }
+          sel.innerHTML = opts;
+          sel.value = cur;
+          sel.onchange = fillParentName;
+          fillParentName();
           document.getElementById('co-f-code').value = c ? c.company_code : '';
           document.getElementById('co-f-ein').value = c ? (c.ein || '') : '';
           document.getElementById('co-f-name').value = c ? c.company_name : '';
@@ -1918,10 +2054,9 @@ function viewAdminCompanies() {
           document.getElementById('co-f-state').value = c ? (c.state || '') : '';
           document.getElementById('co-f-zip').value = c ? (c.zip || '') : '';
           document.getElementById('co-f-status').value = statusOf(c || {});
-          if (!isAdmin) {
-            document.getElementById('co-f-parent-code').disabled = true;
-            document.getElementById('co-f-code').disabled = true;
-          }
+          // Parent Code: Admin and Onboarding both pick from existing
+          // Parents (v6.7). Company Code stays Admin-only.
+          document.getElementById('co-f-code').disabled = !isAdmin;
           document.getElementById('co-editor-out').innerHTML = '';
           editorEl.style.display = '';
           editorEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1948,7 +2083,6 @@ function viewAdminCompanies() {
           };
           var missing = Object.keys(v).filter(function (k) { return !v[k]; });
           if (missing.length) { out.innerHTML = errorHtml('All fields are required — some are still blank.'); return; }
-          if (!/^PC\d{4}$/i.test(v.parent_code)) { out.innerHTML = errorHtml('Parent Code must be "PC" plus four numbers (for example PC0007).'); return; }
           if (!/^\d{4}$/.test(v.company_code)) { out.innerHTML = errorHtml('Company Code must be four numbers.'); return; }
           if (!/^\d{2}-\d{7}$/.test(v.ein)) { out.innerHTML = errorHtml('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).'); return; }
           out.innerHTML = '<p class="muted">Saving...</p>';
