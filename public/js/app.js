@@ -89,10 +89,13 @@ function downloadOnboardingDoc(clientId, docId, fileName) {
   }).catch(function (err) { alert(err.message); });
 }
 
-function enrolledLine(enrolled, hasPayroll) {
+// Card numbers line (v6.4, Leroy): enrolled when known; otherwise the
+// eligible count from the latest payroll data; otherwise "Eligible TBD"
+// (replaces the old "No payroll data yet").
+function enrolledLine(enrolled, eligible, hasPayroll) {
   if (enrolled !== null && enrolled !== undefined) return '<span><b>' + enrolled + '</b> enrolled</span>';
-  if (hasPayroll) return '';
-  return '<span class="muted">No payroll data yet</span>';
+  if (eligible !== null && eligible !== undefined) return '<span>Eligible <b>' + eligible + '</b></span>';
+  return '<span class="muted">Eligible TBD</span>';
 }
 
 function rollLine(total, eligible, enrolled, hasPayroll) {
@@ -146,7 +149,7 @@ function companyCard(o) {
   return '<a class="' + cls + '" href="' + o.link + '">' +
     '<div class="card-code">' + esc(o.code) + '</div>' +
     '<div class="card-title">' + esc(o.name) + '</div>' +
-    '<div class="card-numbers">' + enrolledLine(o.enrolled, o.hasPayroll) + '</div>' +
+    '<div class="card-numbers">' + enrolledLine(o.enrolled, o.eligible, o.hasPayroll) + '</div>' +
     invoiceLine(o.openCount, o.openTotal, o.oldestOpen) +
     (o.sub ? '<div class="muted">' + o.sub + '</div>' : '') + '</a>';
 }
@@ -763,7 +766,7 @@ function viewParent(code) {
       render(shell(
         '<p><a href="#/clients">&larr; Companies</a></p>' +
         '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
-        '<div class="rollup"><b>Roll-up:</b> ' + enrolledLine(p.enrolled, p.has_payroll) + '</div>' +
+        '<div class="rollup"><b>Roll-up:</b> ' + enrolledLine(p.enrolled, p.eligible, p.has_payroll) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Companies</h3><div class="card-grid">' + childCards + '</div>' +
         '<h3>Implementations</h3>' +
@@ -791,12 +794,9 @@ function payrollTable(c) {
   var premLessClaims = hasBill ? (+prem - +claims) : null;
   var netSavings = (hasBill && admin !== null && admin !== undefined) ? (+savings - +admin) : null;
   var totalDue = (premLessClaims !== null && admin !== null && admin !== undefined) ? (premLessClaims + +admin) : null;
-  var html = '<h3>Payroll Summary</h3><table class="data-table"><tbody>' +
+  var html = '<h3>Last Payroll Summary</h3><table class="data-table"><tbody>' +
     row('Employer Name', c.company_name) +
-    row('Group', c.payroll_ein) +
     row('Payroll Frequency', c.payroll_pay_schedule) +
-    '</tbody></table>' +
-    '<h3>Plan Selection Results</h3><table class="data-table"><tbody>' +
     row('Total Employees', c.payroll_total) +
     row('Ineligible', c.payroll_ineligible) +
     row('Opted-Out', c.payroll_opted_out) +
@@ -834,7 +834,7 @@ function viewChild(id) {
         : '<p><a href="#/clients">&larr; Companies</a></p>';
       render(shell(parentLink +
         '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
-        '<h3>Last payroll</h3>' + payrollTable(c) +
+        payrollTable(c) +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
         '<h3>Implementations</h3>' +
         (implCards ? '<div class="card-grid">' + implCards + '</div>' : '<p class="muted">No implementations on the kanban for this company yet.</p>'),

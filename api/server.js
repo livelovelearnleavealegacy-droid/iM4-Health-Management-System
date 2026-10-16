@@ -1070,10 +1070,11 @@ function groupParents(rows) {
 
 // Open-invoice stats per company code: count, total, and oldest open payroll
 // date (arrears are measured from the oldest unpaid bill).
+// v6.4 (Leroy): estimates excluded so card numbers match the Billing tab.
 async function openInvoiceStats(db) {
   const inv = await db.query(
     "SELECT company_code, COUNT(*)::int AS open_count, COALESCE(SUM(total_invoice), 0)::float AS open_total, " +
-    "MIN(payroll_date)::text AS oldest_open FROM invoices WHERE status = 'open' GROUP BY company_code");
+    "MIN(payroll_date)::text AS oldest_open FROM invoices WHERE status = 'open' AND is_estimate = FALSE GROUP BY company_code");
   const map = {};
   inv.rows.forEach(function (x) { map[String(x.company_code)] = x; });
   return map;
