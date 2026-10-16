@@ -313,7 +313,29 @@ function render(html) {
       links[i].onclick = function () { hm.classList.remove('open'); };
     }
   }
+  syncTopScrollbars();
   window.scrollTo(0, 0);
+}
+
+// v6.8.2 (Leroy): every horizontally scrollable table also gets a scrollbar
+// at the TOP, attached above its column headings, synced both ways with
+// the container's own bottom scrollbar.
+function syncTopScrollbars() {
+  document.querySelectorAll('.table-scroll, .comm-scroll').forEach(function (sc) {
+    if (sc.dataset.topbar) return;
+    if (sc.scrollWidth <= sc.clientWidth + 1) return;
+    sc.dataset.topbar = '1';
+    var bar = document.createElement('div');
+    bar.className = 'top-scroll';
+    var inner = document.createElement('div');
+    inner.style.height = '1px';
+    inner.style.width = sc.scrollWidth + 'px';
+    bar.appendChild(inner);
+    sc.parentNode.insertBefore(bar, sc);
+    var lock = false;
+    bar.onscroll = function () { if (!lock) { lock = true; sc.scrollLeft = bar.scrollLeft; lock = false; } };
+    sc.onscroll = function () { if (!lock) { lock = true; bar.scrollLeft = sc.scrollLeft; lock = false; } };
+  });
 }
 
 function errorHtml(msg) {
@@ -1415,7 +1437,7 @@ function viewAdminCommissions() {
               var code = b.getAttribute('data-delcm');
               var c = byCode[code] || {};
               if (!window.confirm('Delete the commission row for ' + code + ' — ' + (c.company_name || '') + '? All of its steward splits are removed. The company itself stays.')) return;
-              api.del('/api/admin/commissions/' + encodeURIComponent(code)).then(function () { load(); })
+              api.delete('/api/admin/commissions/' + encodeURIComponent(code)).then(function () { load(); })
                 .catch(function (err) { alert(err.message); });
             };
           });
@@ -2088,7 +2110,7 @@ function viewAdminCompanies() {
         document.querySelectorAll('[data-ach-del]').forEach(function (b) {
           b.onclick = function () {
             if (!window.confirm('Delete the ACH Authorization file for company ' + b.getAttribute('data-ach-del') + '?')) return;
-            api.del('/api/admin/companies/' + encodeURIComponent(b.getAttribute('data-ach-del')) + '/ach-document')
+            api.delete('/api/admin/companies/' + encodeURIComponent(b.getAttribute('data-ach-del')) + '/ach-document')
               .then(function () { viewAdminCompanies(); })
               .catch(function (err) { alert(err.message); });
           };
@@ -2364,7 +2386,7 @@ function viewParentPage() {
           var code = b.getAttribute('data-del');
           var p = all.filter(function (x) { return x.parent_code === code; })[0];
           if (!window.confirm('Delete parent ' + (p ? p.parent_name : code) + ' (' + code + ')? This works only when no companies are tied to the parent.')) return;
-          api.del('/api/parent-page/' + encodeURIComponent(code)).then(function () { load(); })
+          api.delete('/api/parent-page/' + encodeURIComponent(code)).then(function () { load(); })
             .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
         };
       });
@@ -2382,7 +2404,7 @@ function viewParentPage() {
       document.querySelectorAll('[data-doc-del]').forEach(function (b) {
         b.onclick = function () {
           if (!window.confirm('Delete this file?')) return;
-          api.del('/api/parent-page/' + encodeURIComponent(b.getAttribute('data-code')) + '/documents/' + b.getAttribute('data-doc-del'))
+          api.delete('/api/parent-page/' + encodeURIComponent(b.getAttribute('data-code')) + '/documents/' + b.getAttribute('data-doc-del'))
             .then(function () { load(); })
             .catch(function (err) { document.getElementById('parentMsg').innerHTML = errorHtml(err.message); });
         };

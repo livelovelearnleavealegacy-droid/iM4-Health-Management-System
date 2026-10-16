@@ -454,3 +454,5 @@ a.card:hover { text-decoration: none; border-color: var(--primary); box-shadow: 
 .commissions-table .frz1 { left: 0; }
 .commissions-table .frz2 { left: 95px; }
 .commissions-table .frz3 { left: 295px; box-shadow: 2px 0 4px rgba(0, 0, 0, 0.18); }
+/* v6.8.2: synced top scrollbar above wide tables (see syncTopScrollbars). */
+.top-scroll { overflow-x: auto; overflow-y: hidden; height: 16px; }
