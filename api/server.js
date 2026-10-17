@@ -4670,7 +4670,7 @@ async function resolveReferralPeriod(db, appliedISO, userId, cache) {
       : { skip: 'The ' + label + ' period is locked' };
   } else {
     const win = referralMonthWindow();
-    if (key === win.current || key === win.previous) {
+    if (key >= win.previous) {
       const ins = await db.query("INSERT INTO referral_fee_periods (label, status, created_by) VALUES ($1, 'open', $2) RETURNING id", [label, userId || null]);
       out = { periodId: ins.rows[0].id, label: label, created: true };
     } else {
