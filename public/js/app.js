@@ -1408,6 +1408,7 @@ function viewReferralFees() {
     var isAdmin = ar === 'admin';
     var periods = [];
     var selectedId = null;
+    var flash = '';
 
     function money(v) { return fmtMoney(Number(v) || 0); }
     function pctText(v) {
@@ -1431,8 +1432,10 @@ function viewReferralFees() {
           '<label>Period label <input id="rf-label" type="text" value="' + esc(defLabel) + '" style="min-width:200px;"></label> ' +
           '<button class="btn btn-primary" id="rf-create">Start build</button><div id="rf-create-out"></div></div>';
       }
+      var flashHtml = flash ? okHtml(flash) : '';
+      flash = '';
       render(shell(
-        '<h2>Referral Fees</h2>' + startBuild +
+        '<h2>Referral Fees</h2>' + flashHtml + startBuild +
         '<div style="margin:10px 0;">' + (tabs || '<span class="muted">No referral fee periods yet.</span>') + '</div>' +
         '<div id="rf-period"></div>',
         '#/referral-fees'));
@@ -1488,6 +1491,10 @@ function viewReferralFees() {
           html += '<p style="margin-top:10px;"><label>FTJ file (Premium Applied Report) <input type="file" id="rf-file" accept=".xlsx,.xls"></label> ' +
             '<button class="btn btn-primary" id="rf-load">Upload &amp; calculate</button></p><div id="rf-load-out"></div>';
         }
+        if (isAdmin) {
+          html += '<p style="margin-top:10px;"><button class="btn btn-small btn-danger" id="rf-delete">Delete this entire period</button> ' +
+            '<span class="muted">Deletes the month with everything calculated in it. Cannot be undone - the month can be calculated again from a fresh import afterwards.</span></p>';
+        }
         html += '</div>';
         if (d.rows && d.rows.length) {
           html += '<div class="card"><div class="card-title">Pending Commissions</div>' +
@@ -1514,6 +1521,21 @@ function viewReferralFees() {
           html += '<div class="card"><div class="card-title">Pending Commissions</div><p class="muted">Nothing calculated yet. Load a source file from the Jobs page (Referral Fee import card) or above.</p></div>';
         }
         box.innerHTML = html;
+        var delBtn = document.getElementById('rf-delete');
+        if (delBtn) delBtn.onclick = function () {
+          var seen = {};
+          (d.rows || []).forEach(function (r) { seen[r.company_code + '|' + String(r.modal_date).slice(0, 10)] = 1; });
+          var nLines = Object.keys(seen).length;
+          var msg = 'Delete the entire period "' + p.label + '"?' + NL + NL +
+            'This removes ' + nLines + ' calculated payroll dates and ' + (d.rows || []).length + ' pending rows, plus the import history and the rounding adjustment. This cannot be undone.' + NL + NL +
+            'The month can be calculated again from a fresh import afterwards.';
+          if (!confirm(msg)) return;
+          api.delete('/api/admin/referral-fees/periods/' + selectedId).then(function (r) {
+            flash = 'Deleted period "' + r.label + '": ' + r.lines_deleted + ' calculated payroll dates and ' + r.rows_deleted + ' pending rows removed.';
+            selectedId = null;
+            loadPeriods();
+          }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
+        };
         var lb = document.getElementById('rf-load');
         if (lb) lb.onclick = function () {
           var fi = document.getElementById('rf-file');

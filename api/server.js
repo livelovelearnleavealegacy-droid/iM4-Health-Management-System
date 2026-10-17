@@ -4615,6 +4615,36 @@ app.post('/api/admin/referral-fees/periods', requireAdmin, async (req, res) => {
   }
 });
 
+// Delete an entire period (v6.18.2, Leroy): the period and everything
+// calculated in it - lines, pending rows, import history, and the
+// rounding adjustment all cascade away. The freed (company, payroll
+// date) pairs are no longer marked calculated, so the month can be
+// imported and calculated fresh afterwards.
+async function deleteReferralPeriod(db, periodId) {
+  const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
+  if (!per.rows.length) return null;
+  const counts = await db.query(
+    'SELECT (SELECT COUNT(*) FROM referral_fee_lines WHERE period_id = $1) AS lines, ' +
+    '(SELECT COUNT(*) FROM referral_fee_pending WHERE period_id = $1) AS pending_rows', [periodId]);
+  await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [periodId]);
+  return {
+    label: per.rows[0].label,
+    lines_deleted: parseInt(counts.rows[0].lines, 10),
+    rows_deleted: parseInt(counts.rows[0].pending_rows, 10)
+  };
+}
+
+app.delete('/api/admin/referral-fees/periods/:id', requireAdmin, async (req, res) => {
+  try {
+    const out = await deleteReferralPeriod(getPool(), req.params.id);
+    if (!out) return res.status(404).json({ error: 'Period not found' });
+    res.json(Object.assign({ success: true }, out));
+  } catch (error) {
+    console.error('Referral period delete error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // One period: its imports (with skip reports) and its pending commissions table.
 // Payee display (v6.18.1, Leroy): the Referral Fees table's Payee column
 // follows the Stewards page - when a steward's Payee is Company, show
@@ -4687,6 +4717,47 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.18.2 probe (remove after verification): build a throwaway
+// period with one line, one pending row, and an adjustment, delete it
+// through the real delete path, and confirm everything is gone -
+// including that the freed (company, payroll date) can be inserted
+// again (no longer marked calculated).
+app.post('/api/admin/probe-rf-delete', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE DELETE TEST') RETURNING id");
+    const pid = per.rows[0].id;
+    const line = await db.query(
+      "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
+      "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
+    await db.query(
+      'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [line.rows[0].id, pid, 'TESTX', 155026, 'RLJAT', 100, 184.60]);
+    await db.query(
+      'INSERT INTO referral_fee_adjustments (period_id, steward_id, steward_name, amount) VALUES ($1, $2, $3, $4)',
+      [pid, 155026, 'RLJAT', -0.01]);
+    const out = await deleteReferralPeriod(db, pid);
+    const left = await db.query(
+      'SELECT (SELECT COUNT(*) FROM referral_fee_periods WHERE id = $1) AS periods, ' +
+      '(SELECT COUNT(*) FROM referral_fee_lines WHERE period_id = $1) AS lines, ' +
+      '(SELECT COUNT(*) FROM referral_fee_pending WHERE period_id = $1) AS pending_rows, ' +
+      '(SELECT COUNT(*) FROM referral_fee_adjustments WHERE period_id = $1) AS adjustments', [pid]);
+    let reinsert = 'failed';
+    const per2 = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE DELETE TEST 2') RETURNING id");
+    try {
+      await db.query(
+        "INSERT INTO referral_fee_lines (period_id, source, company_code, modal_date, admin_fee, enrolled) VALUES ($1, 'F', 'TESTX', '2026-01-05', 1, 1)",
+        [per2.rows[0].id]);
+      reinsert = 'ok';
+    } catch (e) { reinsert = 'blocked: ' + e.message; }
+    await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [per2.rows[0].id]);
+    res.json({ deleted: out, left: left.rows[0], reinsert_after_delete: reinsert });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 
