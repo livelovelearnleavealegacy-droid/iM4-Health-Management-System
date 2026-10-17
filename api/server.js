@@ -5269,12 +5269,12 @@ app.post('/api/admin/probe-octload', async (req, res) => {
       '(SELECT COUNT(*) FROM referral_fee_statements st WHERE st.period_id = p.id) AS statements ' +
       'FROM referral_fee_periods p ORDER BY p.id');
     const imports = await db.query(
-      'SELECT id, period_id, source, file_name, groups_seen, lines_created, duplicates_ignored, rows_created, skipped, imported_at FROM referral_fee_imports ORDER BY id DESC LIMIT 5');
+      'SELECT id, period_id, source, file_name, groups_seen, lines_created, duplicates_ignored, rows_created, skipped FROM referral_fee_imports ORDER BY id DESC LIMIT 5');
     const impOut = imports.rows.map(function (r) {
       const tally = {};
       const sk = Array.isArray(r.skipped) ? r.skipped : [];
       sk.forEach(function (s) { const k = String(s.reason || '').slice(0, 60); tally[k] = (tally[k] || 0) + 1; });
-      return { id: r.id, period_id: r.period_id, source: r.source, file_name: r.file_name, groups_seen: r.groups_seen, lines_created: r.lines_created, duplicates_ignored: r.duplicates_ignored, rows_created: r.rows_created, imported_at: r.imported_at, skip_tally: tally, skip_sample: sk.slice(0, 5) };
+      return { id: r.id, period_id: r.period_id, source: r.source, file_name: r.file_name, groups_seen: r.groups_seen, lines_created: r.lines_created, duplicates_ignored: r.duplicates_ignored, rows_created: r.rows_created, skip_tally: tally, skip_sample: sk.slice(0, 5) };
     });
     const strobeck = await db.query(
       'SELECT period_id, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending WHERE steward_id = 153909 GROUP BY period_id');
