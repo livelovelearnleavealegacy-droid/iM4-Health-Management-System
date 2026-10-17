@@ -4348,6 +4348,8 @@ app.put('/api/admin/commissions/:code', requireAdminOrOnboarding, async (req, re
 
 // ---------------------------------------------------------------- ticket system
 // ---------------------------------------------------------------- v6.17: referral fees (commission calculation)
+// Periods, source-file imports, pending rows. FTJ (F) built first; the
+// Soluta (S) import and period lockdown + statements are later builds.
 // Statement date for a calculated line: the first of the month following
 // the applied date (Leroy). appliedISO is the group's latest Applied Date.
 function statementDateFor(appliedISO) {
