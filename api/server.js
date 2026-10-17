@@ -4524,31 +4524,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.17 loader (remove after the July 2026 load is verified): lets the
-// first period + file be loaded with the sync secret instead of an admin
-// login, through the exact same calculation path as the Jobs import.
-app.post('/api/admin/probe-rf-load', handleUpload('file'), async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    // One-time: wipe the first probe load (it carried float-rounded fees)
-    // before reloading with the corrected calculation.
-    if (req.headers['x-probe-wipe'] === 'yes') {
-      await db.query('DELETE FROM referral_fee_periods');
-    }
-    const label = String(req.headers['x-probe-label'] || 'July 2026');
-    const per = await db.query('INSERT INTO referral_fee_periods (label) VALUES ($1) RETURNING *', [label]);
-    const result = await runReferralImportF(db, req.file.buffer, req.file.originalname, per.rows[0].id, null);
-    const detail = await db.query(
-      'SELECT pp.company_code, l.company_name, l.modal_date, l.admin_fee, pp.pct, pp.referral_fee, l.enrolled, pp.steward_id, pp.steward_name, l.statement_date ' +
-      'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id WHERE pp.period_id = $1 ORDER BY pp.company_code, l.modal_date, pp.steward_id',
-      [per.rows[0].id]);
-    res.json({ period: per.rows[0], import: result, rows: detail.rows });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe load failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
