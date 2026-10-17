@@ -5254,36 +5254,24 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP W9 fix probe (remove after verification): applies Leroy's
-// resolutions for the six both-TIN W9s (Company/EIN side), the E3 and
-// One Arc ZIP corrections, and the Oliver / Nelson record renames.
-app.post('/api/admin/probe-w9fix', async (req, res) => {
+// TEMP October referral status probe (remove after use).
+app.post('/api/admin/probe-octstatus', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
     const db = getPool();
-    if (req.query.mode === 'verify') {
-      const ids = String(req.query.ids || '').split(',').map(function (x) { return parseInt(x, 10); }).filter(Boolean);
-      const r = await db.query(
-        "SELECT id, first_name, last_name, name, email, steward_company_name, zip, payee, " +
-        "CASE WHEN tax_id IS NULL THEN NULL ELSE '...' || RIGHT(tax_id, 4) END AS tax_masked " +
-        'FROM stewards WHERE id = ANY($1) ORDER BY id', [ids]);
-      return res.json(r.rows);
-    }
-    const items = (req.body && req.body.items) || [];
-    let updated = 0;
-    for (const it of items) {
-      const sets = [];
-      const vals = [];
-      const FIELDS = { payee: 'payee', tax_id: 'tax_id', company_name: 'steward_company_name', zip: 'zip', first_name: 'first_name', last_name: 'last_name', name: 'name' };
-      for (const k of Object.keys(FIELDS)) {
-        if (it[k] !== undefined && it[k] !== null) { vals.push(k === 'tax_id' ? String(it[k]).replace(/\D/g, '') : it[k]); sets.push(FIELDS[k] + ' = $' + vals.length); }
-      }
-      if (!sets.length) continue;
-      vals.push(it.steward_id);
-      await db.query('UPDATE stewards SET ' + sets.join(', ') + ' WHERE id = $' + vals.length, vals);
-      updated++;
-    }
-    res.json({ updated: updated });
+    const periods = await db.query(
+      'SELECT p.id, p.label, p.status, ' +
+      '(SELECT COUNT(*) FROM referral_fee_lines l WHERE l.period_id = p.id) AS lines, ' +
+      '(SELECT COUNT(*) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS pending_rows, ' +
+      '(SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS pending_fees ' +
+      'FROM referral_fee_periods p ORDER BY p.id');
+    const imports = await db.query(
+      'SELECT id, period_id, file_name, groups_seen, lines_created, duplicates_ignored, rows_created FROM referral_fee_imports ORDER BY id DESC LIMIT 3');
+    const strobeck = await db.query(
+      'SELECT period_id, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending WHERE steward_id = 153909 GROUP BY period_id');
+    const topStewards = await db.query(
+      'SELECT steward_id, steward_name, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending GROUP BY steward_id, steward_name ORDER BY fees DESC LIMIT 8');
+    res.json({ periods: periods.rows, imports: imports.rows, strobeck: strobeck.rows, top_stewards: topStewards.rows });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Probe failed' });
   }
