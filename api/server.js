@@ -457,6 +457,56 @@ async function migrate() {
       await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding', 'client', 'service', 'commissions'))");
     }
   } catch (e) { console.error('Commissions role migration:', e.message); }
+  // v6.17 (Leroy): referral fee (commission) calculation. A period is one
+  // build tab on the Referral Fees page; source files (F = FTJ Premium
+  // Applied Report, S = Soluta later) are validated on Jobs and calculated
+  // into pending rows - one row per company, payroll (modal) date, and
+  // steward. A (source, company, modal date) may be calculated only ONCE,
+  // ever: re-imports of an already-calculated referral fee are ignored.
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_periods (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'label TEXT NOT NULL, ' +
+    "status TEXT NOT NULL DEFAULT 'open', " +
+    'created_by INT, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'locked_at TIMESTAMPTZ)');
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_imports (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'period_id INT NOT NULL REFERENCES referral_fee_periods(id) ON DELETE CASCADE, ' +
+    "source TEXT NOT NULL DEFAULT 'F', " +
+    'file_name TEXT, ' +
+    'imported_by INT, ' +
+    'groups_seen INT DEFAULT 0, ' +
+    'lines_created INT DEFAULT 0, ' +
+    'duplicates_ignored INT DEFAULT 0, ' +
+    'rows_created INT DEFAULT 0, ' +
+    "skipped JSONB DEFAULT '[]', " +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_lines (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'period_id INT NOT NULL REFERENCES referral_fee_periods(id) ON DELETE CASCADE, ' +
+    'import_id INT REFERENCES referral_fee_imports(id) ON DELETE SET NULL, ' +
+    "source TEXT NOT NULL DEFAULT 'F', " +
+    'company_code TEXT NOT NULL, ' +
+    'company_name TEXT, ' +
+    'modal_date DATE NOT NULL, ' +
+    'applied_date DATE, ' +
+    'statement_date DATE NOT NULL, ' +
+    'bill_mode TEXT, ' +
+    'admin_fee NUMERIC NOT NULL DEFAULT 0, ' +
+    'enrolled INT NOT NULL DEFAULT 0, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'UNIQUE (source, company_code, modal_date))');
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_pending (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'line_id INT NOT NULL REFERENCES referral_fee_lines(id) ON DELETE CASCADE, ' +
+    'period_id INT NOT NULL REFERENCES referral_fee_periods(id) ON DELETE CASCADE, ' +
+    'company_code TEXT NOT NULL, ' +
+    'steward_id INT, ' +
+    'steward_name TEXT, ' +
+    'pct NUMERIC NOT NULL, ' +
+    'referral_fee NUMERIC NOT NULL, ' +
+    'created_at TIMESTAMPTZ DEFAULT NOW())');
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -748,6 +798,15 @@ function requireCommissionsPageViewer(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
     if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding' && r !== 'commissions') return res.status(403).json({ error: 'Available to Admin, Top Dog, Onboarding, and Commissions only' });
+    next();
+  });
+}
+
+// Referral Fees pages (v6.17, Leroy): Admin and the Commissions role only.
+function requireReferralViewer(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'commissions') return res.status(403).json({ error: 'Referral Fees is available to Admin and Commissions only' });
     next();
   });
 }
@@ -4288,6 +4347,196 @@ app.put('/api/admin/commissions/:code', requireAdminOrOnboarding, async (req, re
 });
 
 // ---------------------------------------------------------------- ticket system
+// ---------------------------------------------------------------- v6.17: referral fees (commission calculation)
+// Statement date for a calculated line: the first of the month following
+// the applied date (Leroy). appliedISO is the group's latest Applied Date.
+function statementDateFor(appliedISO) {
+  if (!appliedISO) return null;
+  const y = parseInt(appliedISO.slice(0, 4), 10);
+  const m = parseInt(appliedISO.slice(5, 7), 10);
+  const ny = m === 12 ? y + 1 : y;
+  const nm = m === 12 ? 1 : m + 1;
+  return ny + '-' + ('0' + nm).slice(-2) + '-01';
+}
+
+// Admin factors by Bill Mode (Leroy): Enrolled (lives) = total Admin Fee
+// divided by the factor for the pay frequency.
+const REFERRAL_FACTORS = { '1': 9.23, '2': 18.46, '3': 20, '4': 40, 'M': 40 };
+
+// Calculate one FTJ Premium Applied Report into pending referral fee rows
+// for a period. Only the Admin Fees are used (products with PRODUCT ID
+// 'ADMIN', signed amounts, so backouts net out). One calculated line per
+// (company, modal date); one pending row per steward on the company's
+// commission split, at the percentages on file when the calculation runs.
+// A (source, company, modal date) that has already been calculated - in
+// ANY period - is ignored. Groups that cannot be calculated are reported
+// in `skipped` with the reason (never silently dropped).
+async function runReferralImportF(db, buffer, fileName, periodId, userId) {
+  const bills = parsePremiumApplied(buffer);
+  const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
+  if (!per.rows.length) throw new Error('Referral fee period not found.');
+  if (per.rows[0].status !== 'open') throw new Error('That referral fee period is locked.');
+  const compR = await db.query('SELECT company_code, company_name FROM companies');
+  const compMap = {};
+  compR.rows.forEach(function (c) { compMap[c.company_code] = c; });
+  const cmR = await db.query('SELECT company_code, steward_code, pct FROM commissions ORDER BY company_code, steward_code');
+  const splitMap = {};
+  cmR.rows.forEach(function (c) {
+    if (!splitMap[c.company_code]) splitMap[c.company_code] = [];
+    splitMap[c.company_code].push(c);
+  });
+  const stR = await db.query('SELECT id, first_name, last_name, name FROM stewards');
+  const stName = {};
+  stR.rows.forEach(function (s) {
+    stName[s.id] = displayName(s) || ('Steward ' + s.id);
+  });
+  const imp = await db.query(
+    'INSERT INTO referral_fee_imports (period_id, source, file_name, imported_by, groups_seen) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [periodId, 'F', fileName || null, userId || null, bills.length]);
+  const importId = imp.rows[0].id;
+  let linesCreated = 0;
+  let duplicates = 0;
+  let rowsCreated = 0;
+  const skipped = [];
+  for (const b of bills) {
+    if (!(b.admin_fees > 0)) {
+      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Admin Fees total $0.00 in this file - nothing to calculate' });
+      continue;
+    }
+    const company = compMap[b.company_code];
+    if (!company) {
+      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Company code is not on the Companies table' });
+      continue;
+    }
+    const splits = splitMap[b.company_code] || [];
+    if (!splits.length) {
+      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'No commission split on file for this company' });
+      continue;
+    }
+    const factor = REFERRAL_FACTORS[b.bill_mode] || 0;
+    const enrolled = factor ? Math.round(b.admin_fees / factor) : (b.lives_count || 0);
+    const stmt = statementDateFor(b.paid_date);
+    const ins = await db.query(
+      'INSERT INTO referral_fee_lines (period_id, import_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (source, company_code, modal_date) DO NOTHING RETURNING id',
+      [periodId, importId, 'F', b.company_code, company.company_name, b.payroll_date, b.paid_date, stmt, b.bill_mode, b.admin_fees, enrolled]);
+    if (!ins.rows.length) { duplicates++; continue; }
+    const lineId = ins.rows[0].id;
+    linesCreated++;
+    let splitTotal = 0;
+    for (const s of splits) {
+      splitTotal += Number(s.pct);
+      const fee = Math.round(b.admin_fees * Number(s.pct)) / 100;
+      await db.query(
+        'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [lineId, periodId, b.company_code, s.steward_code, stName[s.steward_code] || ('Steward ' + s.steward_code), s.pct, fee]);
+      rowsCreated++;
+    }
+    if (Math.abs(splitTotal - 100) > 0.001) {
+      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Commission split on file totals ' + splitTotal + '% - the remaining ' + Math.round((100 - splitTotal) * 100) / 100 + '% has no steward and was not calculated' });
+    }
+  }
+  await db.query(
+    'UPDATE referral_fee_imports SET lines_created = $1, duplicates_ignored = $2, rows_created = $3, skipped = $4 WHERE id = $5',
+    [linesCreated, duplicates, rowsCreated, JSON.stringify(skipped), importId]);
+  return {
+    import_id: importId, period_id: periodId, source: 'F', file_name: fileName || null,
+    groups_seen: bills.length, lines_created: linesCreated, duplicates_ignored: duplicates,
+    rows_created: rowsCreated, skipped: skipped
+  };
+}
+
+// Periods list for the Referral Fees page: one tab per period, kept as history.
+app.get('/api/referral-fees/periods', requireReferralViewer, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT p.*, ' +
+      '(SELECT COUNT(*) FROM referral_fee_lines l WHERE l.period_id = p.id) AS line_count, ' +
+      '(SELECT COUNT(*) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS row_count, ' +
+      '(SELECT COALESCE(SUM(l.admin_fee), 0) FROM referral_fee_lines l WHERE l.period_id = p.id) AS total_admin_fees, ' +
+      '(SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS total_referral_fees ' +
+      'FROM referral_fee_periods p ORDER BY p.id');
+    res.json(r.rows);
+  } catch (error) {
+    console.error('Referral periods error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Start a referral fee build (a new period tab). Admin only.
+app.post('/api/admin/referral-fees/periods', requireAdmin, async (req, res) => {
+  try {
+    const label = (req.body && req.body.label ? String(req.body.label) : '').trim();
+    if (!label) return res.status(400).json({ error: 'A period label is required' });
+    const r = await getPool().query(
+      'INSERT INTO referral_fee_periods (label, created_by) VALUES ($1, $2) RETURNING *',
+      [label, req.user.id]);
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error('Referral period create error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// One period: its imports (with skip reports) and its pending commissions table.
+app.get('/api/referral-fees/periods/:id', requireReferralViewer, async (req, res) => {
+  try {
+    const db = getPool();
+    const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [req.params.id]);
+    if (!per.rows.length) return res.status(404).json({ error: 'Period not found' });
+    const imports = await db.query('SELECT * FROM referral_fee_imports WHERE period_id = $1 ORDER BY id', [req.params.id]);
+    const rows = await db.query(
+      'SELECT pp.id, pp.company_code, l.company_name, l.modal_date, l.admin_fee, pp.pct, pp.referral_fee, ' +
+      'l.enrolled, pp.steward_id, pp.steward_name, l.statement_date, l.source ' +
+      'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
+      'WHERE pp.period_id = $1 ORDER BY pp.company_code, l.modal_date, pp.steward_id', [req.params.id]);
+    const totals = await db.query(
+      'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS total_admin_fees, ' +
+      '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS total_referral_fees', [req.params.id]);
+    res.json({ period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: totals.rows[0] });
+  } catch (error) {
+    console.error('Referral period detail error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Upload + validate + calculate a referral fee source file (Jobs page).
+// FTJ (F) is built; the Soluta (S) import arrives with its own build.
+app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const source = String((req.body && req.body.source) || 'F').toUpperCase();
+    const periodId = parseInt(req.body && req.body.period_id, 10);
+    if (!periodId) return res.status(400).json({ error: 'Choose a referral fee period first (start a build on the Referral Fees page).' });
+    if (source !== 'F') return res.status(400).json({ error: 'The Soluta (S) referral fee import is not built yet.' });
+    const result = await runReferralImportF(getPool(), req.file.buffer, req.file.originalname, periodId, req.user.id);
+    res.json(Object.assign({ success: true }, result));
+  } catch (error) {
+    console.error('Referral import error:', error);
+    res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.17 loader (remove after the July 2026 load is verified): lets the
+// first period + file be loaded with the sync secret instead of an admin
+// login, through the exact same calculation path as the Jobs import.
+app.post('/api/admin/probe-rf-load', handleUpload('file'), async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const label = String(req.headers['x-probe-label'] || 'July 2026');
+    const per = await db.query('INSERT INTO referral_fee_periods (label) VALUES ($1) RETURNING *', [label]);
+    const result = await runReferralImportF(db, req.file.buffer, req.file.originalname, per.rows[0].id, null);
+    const detail = await db.query(
+      'SELECT pp.company_code, l.company_name, l.modal_date, l.admin_fee, pp.pct, pp.referral_fee, l.enrolled, pp.steward_id, pp.steward_name, l.statement_date ' +
+      'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id WHERE pp.period_id = $1 ORDER BY pp.company_code, l.modal_date, pp.steward_id',
+      [per.rows[0].id]);
+    res.json({ period: per.rows[0], import: result, rows: detail.rows });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe load failed' });
+  }
+});
+
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
