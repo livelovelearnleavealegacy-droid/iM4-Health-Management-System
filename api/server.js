@@ -5254,6 +5254,41 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
+// TEMP backload probe, round 2 (remove after use): adds the final two
+// September statements (Evolved Benefits file supplied by Leroy; Show
+// Me assigned to Reece West on Leroy's word) and verifies the period.
+app.post('/api/admin/probe-backload2', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'verify') {
+      const r = await db.query(
+        "SELECT st.steward_id, st.payee_name, st.total, st.enrolled, st.file_name, octet_length(st.file_data) AS bytes, md5(st.file_data) AS md5 " +
+        'FROM referral_fee_statements st JOIN referral_fee_periods p ON p.id = st.period_id WHERE p.label = $1 ORDER BY st.payee_name', ['September 2026']);
+      return res.json({ count: r.rows.length, total: r.rows.reduce(function (a, s) { return a + Number(s.total); }, 0), statements: r.rows });
+    }
+    const body = req.body || {};
+    const per = await db.query('SELECT id FROM referral_fee_periods WHERE label = $1', [body.label]);
+    if (!per.rows.length) return res.status(404).json({ error: 'Period not found' });
+    const periodId = per.rows[0].id;
+    let inserted = 0, skipped = 0;
+    for (const it of (body.items || [])) {
+      const buf = Buffer.from(String(it.file_b64 || ''), 'base64');
+      const ex = await db.query('SELECT id FROM referral_fee_statements WHERE period_id = $1 AND steward_id = $2', [periodId, it.steward_id]);
+      if (ex.rows.length || !buf.length) { skipped++; continue; }
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      await db.query(
+        'INSERT INTO referral_fee_statements (period_id, steward_id, payee_name, statement_date, total, enrolled, file_name, file_data, content_hash, generated_by) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)',
+        [periodId, it.steward_id, it.payee_name, it.statement_date, it.total, it.enrolled, it.file_name, buf, hash]);
+      inserted++;
+    }
+    res.json({ inserted: inserted, skipped: skipped });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
