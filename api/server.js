@@ -4616,25 +4616,57 @@ app.post('/api/admin/referral-fees/periods', requireAdmin, async (req, res) => {
 });
 
 // One period: its imports (with skip reports) and its pending commissions table.
+// Payee display (v6.18.1, Leroy): the Referral Fees table's Payee column
+// follows the Stewards page - when a steward's Payee is Company, show
+// their Steward Company Name; otherwise (Payee Steward, or not set yet)
+// show the steward's own name.
+function payeeDisplayName(steward, snapshotName) {
+  if (steward && steward.payee === 'Company' && steward.steward_company_name) return steward.steward_company_name;
+  if (steward) return displayName(steward) || snapshotName || '';
+  return snapshotName || '';
+}
+
+// Assemble one period's detail payload (imports, pending rows with their
+// Payee display names, totals, and the rounding adjustment - which gets
+// the same Payee treatment plus the period's statement date: the latest
+// statement date among its calculated lines).
+async function referralPeriodDetail(db, periodId) {
+  const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
+  if (!per.rows.length) return null;
+  const imports = await db.query('SELECT * FROM referral_fee_imports WHERE period_id = $1 ORDER BY id', [periodId]);
+  const rows = await db.query(
+    'SELECT pp.id, pp.company_code, l.company_name, l.modal_date, l.admin_fee, pp.pct, pp.referral_fee, ' +
+    'l.enrolled, pp.steward_id, pp.steward_name, l.statement_date, l.source, ' +
+    's.payee AS steward_payee, s.steward_company_name, s.first_name, s.last_name, s.name ' +
+    'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
+    'LEFT JOIN stewards s ON s.id = pp.steward_id ' +
+    'WHERE pp.period_id = $1 ORDER BY pp.company_code, l.modal_date, pp.steward_id', [periodId]);
+  rows.rows.forEach(function (row) {
+    row.payee_name = payeeDisplayName(
+      { payee: row.steward_payee, steward_company_name: row.steward_company_name, first_name: row.first_name, last_name: row.last_name, name: row.name },
+      row.steward_name);
+  });
+  const totals = await db.query(
+    'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS total_admin_fees, ' +
+    '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS total_referral_fees', [periodId]);
+  const adj = await db.query('SELECT * FROM referral_fee_adjustments WHERE period_id = $1', [periodId]);
+  const adjustment = adj.rows.length ? adj.rows[0] : null;
+  if (adjustment) {
+    const st = await db.query('SELECT payee, steward_company_name, first_name, last_name, name FROM stewards WHERE id = $1', [adjustment.steward_id]);
+    adjustment.payee_name = payeeDisplayName(st.rows.length ? st.rows[0] : null, adjustment.steward_name);
+    const sd = await db.query('SELECT MAX(statement_date) AS d FROM referral_fee_lines WHERE period_id = $1', [periodId]);
+    adjustment.statement_date = sd.rows[0].d;
+  }
+  const t = totals.rows[0];
+  t.net_referral_fees = Math.round((Number(t.total_referral_fees) + (adjustment ? Number(adjustment.amount) : 0)) * 100) / 100;
+  return { period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: t, adjustment: adjustment };
+}
+
 app.get('/api/referral-fees/periods/:id', requireReferralViewer, async (req, res) => {
   try {
-    const db = getPool();
-    const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [req.params.id]);
-    if (!per.rows.length) return res.status(404).json({ error: 'Period not found' });
-    const imports = await db.query('SELECT * FROM referral_fee_imports WHERE period_id = $1 ORDER BY id', [req.params.id]);
-    const rows = await db.query(
-      'SELECT pp.id, pp.company_code, l.company_name, l.modal_date, l.admin_fee, pp.pct, pp.referral_fee, ' +
-      'l.enrolled, pp.steward_id, pp.steward_name, l.statement_date, l.source ' +
-      'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
-      'WHERE pp.period_id = $1 ORDER BY pp.company_code, l.modal_date, pp.steward_id', [req.params.id]);
-    const totals = await db.query(
-      'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS total_admin_fees, ' +
-      '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS total_referral_fees', [req.params.id]);
-    const adj = await db.query('SELECT * FROM referral_fee_adjustments WHERE period_id = $1', [req.params.id]);
-    const adjustment = adj.rows.length ? adj.rows[0] : null;
-    const t = totals.rows[0];
-    t.net_referral_fees = Math.round((Number(t.total_referral_fees) + (adjustment ? Number(adjustment.amount) : 0)) * 100) / 100;
-    res.json({ period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: t, adjustment: adjustment });
+    const detail = await referralPeriodDetail(getPool(), req.params.id);
+    if (!detail) return res.status(404).json({ error: 'Period not found' });
+    res.json(detail);
   } catch (error) {
     console.error('Referral period detail error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -4655,6 +4687,25 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.18.1 probe (remove after verification): period detail payee names.
+app.get('/api/admin/probe-payee', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const d = await referralPeriodDetail(getPool(), parseInt(req.query.period, 10) || 4);
+    if (!d) return res.status(404).json({ error: 'Period not found' });
+    res.json({
+      sample_rows: d.rows.slice(0, 4).map(function (r) { return { steward_id: r.steward_id, steward_payee: r.steward_payee, payee_name: r.payee_name }; }),
+      distinct_payee_names: new Set(d.rows.map(function (r) { return r.payee_name; })).size,
+      adjustment: d.adjustment ? { steward_id: d.adjustment.steward_id, payee_name: d.adjustment.payee_name, statement_date: d.adjustment.statement_date, amount: d.adjustment.amount } : null,
+      synthetic_company: payeeDisplayName({ payee: 'Company', steward_company_name: 'ACME BENEFITS LLC', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner'),
+      synthetic_steward: payeeDisplayName({ payee: 'Steward', steward_company_name: 'ACME BENEFITS LLC', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner'),
+      synthetic_company_noname: payeeDisplayName({ payee: 'Company', steward_company_name: '', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner')
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 

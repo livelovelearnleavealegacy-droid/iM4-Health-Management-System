@@ -1493,18 +1493,19 @@ function viewReferralFees() {
           html += '<div class="card"><div class="card-title">Pending Commissions</div>' +
             '<div class="table-scroll"><table class="data-table"><thead><tr>' +
             '<th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Admin Fee</th><th>Referral Fee %</th>' +
-            '<th>Total Referral Fee</th><th>Enrolled</th><th>Steward #</th><th>Steward Name</th><th>Statement Date</th>' +
+            '<th>Total Referral Fee</th><th>Enrolled</th><th style="white-space:nowrap;">Steward #</th><th>Payee</th><th>Statement Date</th>' +
             '</tr></thead><tbody>' +
             d.rows.map(function (r) {
               return '<tr><td><b>' + esc(r.company_code) + '</b></td><td>' + esc(r.company_name || '') + '</td>' +
                 '<td>' + esc(String(r.modal_date).slice(0, 10)) + '</td><td>' + money(r.admin_fee) + '</td>' +
                 '<td>' + pctText(r.pct) + '</td><td><b>' + money(r.referral_fee) + '</b></td>' +
-                '<td>' + esc(r.enrolled) + '</td><td>' + esc(r.steward_id) + '</td><td>' + esc(r.steward_name || '') + '</td>' +
+                '<td>' + esc(r.enrolled) + '</td><td style="white-space:nowrap;">' + esc(r.steward_id) + '</td><td>' + esc(r.payee_name || r.steward_name || '') + '</td>' +
                 '<td>' + esc(String(r.statement_date).slice(0, 10)) + '</td></tr>';
             }).join('') +
             (d.adjustment ? '<tr style="background:#f4f6f8;font-style:italic;"><td></td><td>Rounding adjustment</td><td></td><td></td><td></td>' +
-              '<td><b>' + money(d.adjustment.amount) + '</b></td><td></td><td>' + esc(d.adjustment.steward_id) + '</td>' +
-              '<td>' + esc(d.adjustment.steward_name || '') + '</td><td></td></tr>' : '') +
+              '<td><b>' + money(d.adjustment.amount) + '</b></td><td></td><td style="white-space:nowrap;">' + esc(d.adjustment.steward_id) + '</td>' +
+              '<td>' + esc(d.adjustment.payee_name || d.adjustment.steward_name || '') + '</td>' +
+              '<td>' + (d.adjustment.statement_date ? esc(String(d.adjustment.statement_date).slice(0, 10)) : '') + '</td></tr>' : '') +
             '</tbody></table></div>' +
             '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(d.totals.total_admin_fees) + '</b> &nbsp; Total Referral Fees: <b>' + money(d.totals.net_referral_fees) + '</b>' +
             (d.adjustment ? ' <span class="muted">(rows ' + money(d.totals.total_referral_fees) + ' + rounding adjustment ' + money(d.adjustment.amount) + ' to ' + esc(d.adjustment.steward_name || 'RLJAT') + ')</span>' : '') +
