@@ -2484,6 +2484,7 @@ function viewAdminCompanies() {
           '<td><b>' + esc(c.company_code) + '</b></td>' + '<td style="white-space:nowrap;min-width:100px;">' + esc(c.ein || '') + '</td>' + '<td>' + esc(c.company_name) + '</td>' +
           cell(c.address_1) + cell(c.city) + cell(c.state) + cell(c.zip) + cell(c.billing_email) +
           cell(c.pay_frequency) + cell(c.version) + cell(c.type) +
+          cell(c.admin_fee === null || c.admin_fee === undefined ? '' : '$' + Number(c.admin_fee).toFixed(2)) +
           '<td>' + statusHtml + '</td>' +
           '<td id="ach-' + esc(c.company_code) + '"><span class="muted">...</span></td>' + actions + '</tr>';
       }).join('');
@@ -2509,6 +2510,7 @@ function viewAdminCompanies() {
         fld('co-f-pay-frequency', 'Pay Frequency', '', 'Bi-weekly') +
         fld('co-f-version', 'Version', '') +
         fld('co-f-type', 'Type', '') +
+        fld('co-f-admin-fee', 'Admin Fee', '', '40.00') +
         '<label style="display:block;margin:0 10px 8px 0;">Company Status<br>' +
         '<select id="co-f-status"><option value="ACTIVE">ACTIVE</option><option value="PENDING">PENDING</option><option value="TERMED">TERMED</option></select></label>' +
         '</div>' +
@@ -2536,7 +2538,7 @@ function viewAdminCompanies() {
         '</div>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
         '<tr><th>Parent Code</th><th>Parent Name</th><th>Code</th><th style="white-space:nowrap;min-width:100px;">EIN</th><th>Name</th>' +
-        '<th>Address</th><th>City</th><th>State</th><th>Zip</th><th>Billing Email</th><th>Pay Frequency</th><th>Version</th><th>Type</th><th>Status</th><th>ACH</th>' +
+        '<th>Address</th><th>City</th><th>State</th><th>Zip</th><th>Billing Email</th><th>Pay Frequency</th><th>Version</th><th>Type</th><th>Admin Fee</th><th>Status</th><th>ACH</th>' +
         (canMaintain ? '<th>Actions</th>' : '') + '</tr></thead>' +
         '<tbody id="companyrows">' + rows + '</tbody></table></div>' +
         '<input type="file" id="coAchFile" style="display:none;">',
@@ -2695,6 +2697,7 @@ function viewAdminCompanies() {
           document.getElementById('co-f-pay-frequency').value = c ? (c.pay_frequency || '') : '';
           document.getElementById('co-f-version').value = c ? (c.version || '') : '';
           document.getElementById('co-f-type').value = c ? (c.type || '') : '';
+          document.getElementById('co-f-admin-fee').value = c ? (c.admin_fee === null || c.admin_fee === undefined ? '' : c.admin_fee) : '';
           document.getElementById('co-f-status').value = statusOf(c || {});
           // Parent Code: Admin and Onboarding both pick from existing
           // Parents (v6.7). Company Code stays Admin-only.
@@ -2732,6 +2735,7 @@ function viewAdminCompanies() {
           v.pay_frequency = document.getElementById('co-f-pay-frequency').value.trim();
           v.version = document.getElementById('co-f-version').value.trim();
           v.type = document.getElementById('co-f-type').value.trim();
+          v.admin_fee = document.getElementById('co-f-admin-fee').value.trim();
           if (!/^\d{4}$/.test(v.company_code)) { out.innerHTML = errorHtml('Company Code must be four numbers.'); return; }
           if (!/^\d{2}-\d{7}$/.test(v.ein)) { out.innerHTML = errorHtml('EIN must be two numbers, a dash, and seven more numbers (for example 47-5096437).'); return; }
           out.innerHTML = '<p class="muted">Saving...</p>';

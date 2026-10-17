@@ -575,6 +575,13 @@ async function migrate() {
   await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS pay_frequency TEXT');
   await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS version TEXT');
   await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS type TEXT');
+  // v6.22 (Leroy): per-company monthly Admin Fee rate. Referral fee lives
+  // are calculated from this rate (admin fees / the rate for the pay
+  // frequency). Standard is $40; companies under the DND parent
+  // (PC0035) are $35 - their FTJ admin rows bill $16.15 biweekly
+  // ($35/month), so the $40 factor understated their lives.
+  await db.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS admin_fee NUMERIC(10,2) DEFAULT 40');
+  await db.query("UPDATE companies SET admin_fee = 35 WHERE (parent_company_code = 'PC0035' OR UPPER(TRIM(parent_company_name)) = 'DND') AND admin_fee = 40");
   await db.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ar_hold BOOLEAN NOT NULL DEFAULT FALSE');
   await db.query('CREATE TABLE IF NOT EXISTS payroll_company_summary (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -3707,7 +3714,8 @@ function companyFieldValues(b) {
     billing_email: t(b.billing_email),
     pay_frequency: t(b.pay_frequency),
     version: t(b.version),
-    type: t(b.type)
+    type: t(b.type),
+    admin_fee: (b.admin_fee === undefined || b.admin_fee === null || String(b.admin_fee).trim() === '') ? null : Number(b.admin_fee)
   };
 }
 function companyFieldErrors(v) {
@@ -3722,6 +3730,7 @@ function companyFieldErrors(v) {
   if (!v.company_name) errs.push('Company Name is required.');
   if (v.company_status && ['ACTIVE', 'PENDING', 'TERMED'].indexOf(v.company_status) === -1) errs.push('Company Status must be ACTIVE, PENDING, or TERMED.');
   if (v.billing_email && v.billing_email.indexOf('@') === -1) errs.push('Billing Email must be a valid email address.');
+  if (v.admin_fee !== null && !(isFinite(v.admin_fee) && v.admin_fee >= 0)) errs.push('Admin Fee must be a number (the monthly per-life rate, for example 40 or 35).');
   return errs;
 }
 
@@ -3739,9 +3748,9 @@ app.post('/api/admin/companies', requireAdmin, async (req, res) => {
     const dupe = await db.query('SELECT company_name FROM companies WHERE company_code = $1', [v.company_code]);
     if (dupe.rows.length) return res.status(400).json({ error: 'Company Code ' + v.company_code + ' is already in use by ' + dupe.rows[0].company_name + '. Company Codes must be unique.' });
     const r = await db.query(
-      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, billing_email, pay_frequency, version, type) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
-      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null]);
+      'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ein, address_1, city, state, zip, company_status, billing_email, pay_frequency, version, type, admin_fee) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
+      [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null, v.admin_fee === null ? 40 : v.admin_fee]);
     res.json({ success: true, company: r.rows[0] });
   } catch (error) {
     console.error('Admin create company error:', error);
@@ -3783,8 +3792,8 @@ app.put('/api/admin/companies/:code', requireAdminOrOnboarding, async (req, res)
       }
       const r = await client.query(
         'UPDATE companies SET company_code = $1, company_name = $2, parent_company_code = $3, parent_company_name = $4, ' +
-        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, billing_email = $11, pay_frequency = $12, version = $13, type = $14 WHERE company_code = $15 RETURNING *',
-        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null, code]);
+        'ein = $5, address_1 = $6, city = $7, state = $8, zip = $9, company_status = $10, billing_email = $11, pay_frequency = $12, version = $13, type = $14, admin_fee = $15 WHERE company_code = $16 RETURNING *',
+        [v.company_code, v.company_name, v.parent_code, v.parent_name, v.ein, v.address_1, v.city, v.state, v.zip, v.company_status, v.billing_email || null, v.pay_frequency || null, v.version || null, v.type || null, v.admin_fee === null ? 40 : v.admin_fee, code]);
       await client.query('COMMIT');
       res.json({ success: true, company: r.rows[0] });
     } catch (txErr) {
@@ -4544,6 +4553,18 @@ function statementDateFor(appliedISO) {
 // Admin factors by Bill Mode (Leroy): Enrolled (lives) = total Admin Fee
 // divided by the factor for the pay frequency.
 const REFERRAL_FACTORS = { '1': 9.23, '2': 18.46, '3': 20, '4': 40, 'M': 40 };
+const REFERRAL_PERIODS = { '1': 52, '2': 26, '3': 24, '4': 12, 'M': 12 };
+// Lives from a company's own monthly Admin Fee rate (v6.22, Leroy):
+// at the standard $40 rate the long-standing factors apply unchanged,
+// so standard companies' numbers never move; any other rate (DND's
+// $35) divides the admin fees by rate x 12 / periods per year. Returns
+// null for an unknown bill mode.
+function referralEnrolled(adminFee, billMode, monthlyRate) {
+  if (!REFERRAL_FACTORS[billMode]) return null;
+  const rate = Number(monthlyRate) > 0 ? Number(monthlyRate) : 40;
+  if (rate === 40) return Math.round(adminFee / REFERRAL_FACTORS[billMode]);
+  return Math.round(adminFee / (rate * 12 / REFERRAL_PERIODS[billMode]));
+}
 
 // Rounding rule (v6.17.1, Leroy): each pending row is rounded to the cent,
 // so a period's rows can total a few cents more or less than its admin
@@ -4581,7 +4602,7 @@ async function runReferralImportF(db, buffer, fileName, periodId, userId) {
   const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
   if (!per.rows.length) throw new Error('Referral fee period not found.');
   if (per.rows[0].status !== 'open') throw new Error('That referral fee period is locked.');
-  const compR = await db.query('SELECT company_code, company_name FROM companies');
+  const compR = await db.query('SELECT company_code, company_name, admin_fee FROM companies');
   const compMap = {};
   compR.rows.forEach(function (c) { compMap[c.company_code] = c; });
   const cmR = await db.query('SELECT company_code, steward_code, pct FROM commissions ORDER BY company_code, steward_code');
@@ -4618,8 +4639,8 @@ async function runReferralImportF(db, buffer, fileName, periodId, userId) {
       skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'No commission split on file for this company' });
       continue;
     }
-    const factor = REFERRAL_FACTORS[b.bill_mode] || 0;
-    const enrolled = factor ? Math.round(b.admin_fees / factor) : (b.lives_count || 0);
+    const enrolledCalc = referralEnrolled(b.admin_fees, b.bill_mode, company.admin_fee);
+    const enrolled = enrolledCalc === null ? (b.lives_count || 0) : enrolledCalc;
     const stmt = statementDateFor(b.paid_date);
     const ins = await db.query(
       'INSERT INTO referral_fee_lines (period_id, import_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) ' +
@@ -5220,6 +5241,51 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.22 probe (remove after the regeneration is verified):
+// mode=check reports the admin_fee assignments; the default run
+// executes Leroy's ordered regeneration - recompute every line's
+// enrolled from its company's Admin Fee rate, then regenerate the
+// statements for every period that has referral data.
+app.post('/api/admin/probe-adminfee', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'check') {
+      const c35 = await db.query('SELECT company_code FROM companies WHERE admin_fee = 35 ORDER BY company_code');
+      const cnt = await db.query('SELECT COUNT(*) AS n FROM companies');
+      return res.json({ companies: Number(cnt.rows[0].n), fee35_codes: c35.rows.map(function (r) { return r.company_code; }) });
+    }
+    const rates = await db.query('SELECT company_code, admin_fee FROM companies');
+    const rateMap = {};
+    rates.rows.forEach(function (r) { rateMap[r.company_code] = r.admin_fee; });
+    const periods = await db.query('SELECT DISTINCT period_id FROM referral_fee_lines ORDER BY period_id');
+    const out = [];
+    for (const p of periods.rows) {
+      const before = await db.query('SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
+      const lines = await db.query('SELECT id, admin_fee, bill_mode, company_code FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
+      for (const l of lines.rows) {
+        const e = referralEnrolled(Number(l.admin_fee), l.bill_mode, rateMap[l.company_code]);
+        if (e !== null) await db.query('UPDATE referral_fee_lines SET enrolled = $1 WHERE id = $2', [e, l.id]);
+      }
+      const after = await db.query('SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
+      const dnd = await db.query("SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1 AND company_code IN ('1085','1086','1087','1088','1089','1090','1091','1093','1095')", [p.period_id]);
+      const gen = await generateReferralStatements(db, p.period_id, null);
+      const sums = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS tot FROM referral_fee_statements WHERE period_id = $1', [p.period_id]);
+      const per = await db.query('SELECT label FROM referral_fee_periods WHERE id = $1', [p.period_id]);
+      out.push({
+        period: per.rows[0].label,
+        enrolled_before: Number(before.rows[0].t), enrolled_after: Number(after.rows[0].t),
+        dnd_lives: Number(dnd.rows[0].t),
+        gen: { created: gen.created, replaced: gen.replaced, unchanged: gen.unchanged, removed: gen.removed },
+        stmt_total: sums.rows[0].tot, stmt_count: Number(sums.rows[0].n)
+      });
+    }
+    res.json(out);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 
