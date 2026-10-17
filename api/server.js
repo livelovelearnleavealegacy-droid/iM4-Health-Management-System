@@ -5174,54 +5174,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.20 probe (remove after verification): the steward Statements
-// payload for a given steward, plus a fixture open month (future
-// statement date, so it is the current month) that flips from pending
-// to a downloadable card once statements are generated.
-app.post('/api/admin/probe-my-statements', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const stewardId = parseInt(req.query.steward, 10);
-    if (req.query.mode === 'fixture') {
-      const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE STMT PAGE') RETURNING id");
-      const pid = per.rows[0].id;
-      const line = await db.query(
-        "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
-        "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2027-01-05', '2027-01-20', '2027-02-01', '2', 184.60, 10) RETURNING id", [pid]);
-      await db.query(
-        'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [line.rows[0].id, pid, 'TESTX', stewardId, 'Probe Steward', 25, 46.15]);
-      const before = await myStatements(db, stewardId);
-      await generateReferralStatements(db, pid, null);
-      const after = await myStatements(db, stewardId);
-      await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [pid]);
-      return res.json({
-        before: {
-          pending_period: before.pending ? before.pending.period.label : null,
-          pending_total: before.pending ? before.pending.totals.referral_fees : null,
-          statements: before.statements.length
-        },
-        after: {
-          pending_period: after.pending ? after.pending.period.label : null,
-          statements: after.statements.map(function (s) {
-            return { period: s.period_label, total: s.total, enrolled: s.enrolled, file: s.file_name };
-          })
-        }
-      });
-    }
-    const out = await myStatements(db, stewardId);
-    res.json({
-      pending: out.pending ? { period: out.pending.period.label, rows: out.pending.rows.length, totals: out.pending.totals } : null,
-      statements: out.statements.map(function (s) {
-        return { period: s.period_label, total: s.total, enrolled: s.enrolled, file: s.file_name, statement_date: s.statement_date };
-      })
-    });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {

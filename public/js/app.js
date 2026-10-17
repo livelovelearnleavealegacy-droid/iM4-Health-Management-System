@@ -1467,7 +1467,7 @@ function viewMyStatements() {
               '<div class="card-title">' + esc(s.period_label) + '</div>' +
               '<p style="margin:4px 0;">' + esc(s.payee_name || '') + '<br>' +
               'Statement Date: ' + esc(String(s.statement_date).slice(0, 10)) + '<br>' +
-              'Lives: <b>' + esc(s.enrolled === null || s.enrolled === undefined ? '&mdash;' : s.enrolled) + '</b><br>' +
+              'Lives: <b>' + (s.enrolled === null || s.enrolled === undefined ? '&mdash;' : esc(s.enrolled)) + '</b><br>' +
               'Total: <b>' + money(s.total) + '</b></p>' +
               '<p style="margin:6px 0 0;"><button class="btn btn-primary btn-small" data-my-dl="' + s.id + '" data-fn="' + esc(s.file_name || '') + '">Download statement</button></p></div>';
           }).join('') + '</div>';
