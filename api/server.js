@@ -525,6 +525,23 @@ async function migrate() {
     'steward_name TEXT, ' +
     'amount NUMERIC NOT NULL DEFAULT 0, ' +
     'updated_at TIMESTAMPTZ DEFAULT NOW())');
+  // v6.19: generated referral fee statements, one per payee per period.
+  // content_hash covers everything that went into the file (statement
+  // content + the Forms template itself), so regenerating can skip
+  // unchanged statements and replace changed ones.
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_statements (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'period_id INT NOT NULL REFERENCES referral_fee_periods(id) ON DELETE CASCADE, ' +
+    'steward_id INT NOT NULL, ' +
+    'payee_name TEXT, ' +
+    'statement_date DATE, ' +
+    'total NUMERIC(14,2) NOT NULL DEFAULT 0, ' +
+    'file_name TEXT NOT NULL, ' +
+    'file_data BYTEA NOT NULL, ' +
+    'content_hash TEXT NOT NULL, ' +
+    'generated_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'generated_by INT, ' +
+    'UNIQUE (period_id, steward_id))');
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -820,11 +837,13 @@ function requireCommissionsPageViewer(req, res, next) {
   });
 }
 
-// Referral Fees pages (v6.17, Leroy): Admin and the Commissions role only.
+// Referral Fees pages (v6.17, Leroy): Admin and the Commissions role;
+// v6.19 adds Top Dog as a viewer so statements can be downloaded by
+// Admin and Top Dog, per Leroy.
 function requireReferralViewer(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
-    if (r !== 'admin' && r !== 'commissions') return res.status(403).json({ error: 'Referral Fees is available to Admin and Commissions only' });
+    if (r !== 'admin' && r !== 'commissions' && r !== 'top_dog') return res.status(403).json({ error: 'Referral Fees is available to Admin, Top Dog, and Commissions only' });
     next();
   });
 }
@@ -4703,6 +4722,360 @@ app.get('/api/referral-fees/periods/:id', requireReferralViewer, async (req, res
   }
 });
 
+// ---------------------------------------------------------------- referral fee statements (v6.19, Leroy)
+// One statement per payee per period, generated from the Forms template
+// named STATEMENT_TEMPLATE_FORM and filled with the period's pending
+// rows (the period's rounding adjustment lands on its steward's
+// statement). Statements are stored in referral_fee_statements with a
+// hash of everything that went into the file - the statement content
+// plus the template itself - so Generate skips a statement whose hash
+// is unchanged, replaces one whose content moved, and creates the rest.
+const STATEMENT_TEMPLATE_FORM = 'iM4 Health Statement Template';
+
+function stmtExcelSerial(iso) {
+  const t = Date.parse(iso + 'T00:00:00Z');
+  return Math.round((t - Date.UTC(1899, 11, 30)) / 86400000);
+}
+function stmtNum(x) { return String(Math.round(Number(x) * 100) / 100); }
+function stmtCellStyle(sheetXml, ref) {
+  const m = sheetXml.match(new RegExp('<c r="' + ref + '" s="(\\d+)"'));
+  return m ? parseInt(m[1], 10) : null;
+}
+function stmtCellXml(sheetXml, ref) {
+  const m = sheetXml.match(new RegExp('<c r="' + ref + '"[^>]*?(?:/>|>.*?</c>)'));
+  return m ? m[0] : '';
+}
+function stmtRowXml(sheetXml, r) {
+  const m = sheetXml.match(new RegExp('<row r="' + r + '"[^>]*>.*?</row>'));
+  return m ? m[0] : '';
+}
+
+// Fill the statement template (an .xlsx in Forms) for one payee. The
+// workbook package is edited in place with PizZip - only the sheet's
+// rows, a few appended cell formats, the sheet name, and the print area
+// change - so the template's logo, fonts, fills, and print settings
+// carry into every statement untouched.
+function buildStatementXlsx(templateBuf, st) {
+  const PizZip = require('pizzip');
+  const zip = new PizZip(templateBuf);
+  const sheetPath = 'xl/worksheets/sheet1.xml';
+  const sheetFile = zip.file(sheetPath);
+  if (!sheetFile) throw new Error('The statement template has no first worksheet to fill.');
+  let sheet = sheetFile.asText();
+  let styles = zip.file('xl/styles.xml').asText();
+  let wbXml = zip.file('xl/workbook.xml').asText();
+
+  const sTitle = stmtCellStyle(sheet, 'A5');
+  const sHead = stmtCellStyle(sheet, 'A12');
+  const sClient = stmtCellStyle(sheet, 'A13');
+  const sFooter = stmtCellStyle(sheet, 'A11');
+  function xfOf(idx) {
+    const blocks = styles.split('<cellXfs');
+    const seg = '<cellXfs' + blocks[blocks.length - 1];
+    const xfs = seg.match(/<xf[^>]*?(?:\/>|>.*?<\/xf>)/g) || [];
+    return xfs[idx] || '';
+  }
+  function fontIdOf(idx) {
+    const m = xfOf(idx).match(/fontId="(\d+)"/);
+    return m ? m[1] : '2';
+  }
+  const fontPlain = fontIdOf(sHead);
+  const countMatch = styles.match(/(<cellXfs count=")(\d+)(")/);
+  const baseIdx = parseInt(countMatch[2], 10);
+  function xf(numFmtId, fontId, align) {
+    return '<xf numFmtId="' + numFmtId + '" fontId="' + fontId + '" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1" applyAlignment="1"><alignment horizontal="' + align + '" vertical="center"/></xf>';
+  }
+  const S = {
+    hdrText: baseIdx,
+    hdrDate: baseIdx + 1,
+    hdrEmail: baseIdx + 2,
+    detDate: baseIdx + 3,
+    detInt: baseIdx + 4,
+    detMoney: baseIdx + 5,
+    detPct: baseIdx + 6,
+    client: sClient
+  };
+  const newXfs =
+    xf(0, fontPlain, 'left') +
+    xf(14, fontPlain, 'right') +
+    xf(49, fontPlain, 'right') +
+    xf(14, fontPlain, 'center') +
+    xf(3, fontPlain, 'center') +
+    xf(165, fontPlain, 'center') +
+    xf(10, fontPlain, 'center');
+  styles = styles.replace(/(<cellXfs count=")\d+(")/, '$1' + (baseIdx + 7) + '$2');
+  styles = styles.replace('</cellXfs>', newXfs + '</cellXfs>');
+
+  const pre = sheet.slice(0, sheet.indexOf('<sheetData>') + '<sheetData>'.length);
+  const post = sheet.slice(sheet.indexOf('</sheetData>'));
+  const keepRows = [1, 2, 3, 4, 5].map(function (r) { return stmtRowXml(sheet, r); }).join('');
+  const d6 = stmtCellXml(sheet, 'D6');
+  const d7 = stmtCellXml(sheet, 'D7');
+  const headRow = stmtRowXml(sheet, 12);
+
+  function textCell(ref, sIdx, text) {
+    return '<c r="' + ref + '" s="' + sIdx + '" t="inlineStr"><is><t>' + escXml(text) + '</t></is></c>';
+  }
+  function numCell(ref, sIdx, v) {
+    return '<c r="' + ref + '" s="' + sIdx + '"><v>' + v + '</v></c>';
+  }
+  function rowOpen(r) { return '<row r="' + r + '" spans="1:5" x14ac:dyDescent="0.25">'; }
+
+  let rows = keepRows;
+  rows += rowOpen(6) + textCell('A6', S.hdrText, st.payeeName) + d6 + numCell('E6', S.hdrDate, stmtExcelSerial(st.statementDate)) + '</row>';
+  rows += rowOpen(7) + textCell('A7', S.hdrText, st.address) + d7 + numCell('E7', S.hdrDate, stmtExcelSerial(st.monthEnding)) + '</row>';
+  rows += rowOpen(8) + textCell('A8', S.hdrText, st.cityLine) + textCell('E8', S.hdrEmail, st.email) + '</row>';
+  rows += rowOpen(9) + textCell('A9', S.hdrText, st.personName) + '</row>';
+  rows += headRow;
+  let body = '';
+  let r = 13;
+  const firstBody = r;
+  for (const cl of st.clients) {
+    body += rowOpen(r) + textCell('A' + r, S.client, cl.label) + '</row>';
+    r++;
+    for (const d of cl.rows) {
+      body += rowOpen(r) +
+        numCell('A' + r, S.detDate, stmtExcelSerial(d.date)) +
+        numCell('B' + r, S.detInt, d.enrolled) +
+        numCell('C' + r, S.detMoney, stmtNum(d.admin)) +
+        numCell('D' + r, S.detPct, stmtNum(Number(d.pct) / 100)) +
+        numCell('E' + r, S.detMoney, stmtNum(d.fee)) +
+        '</row>';
+      r++;
+    }
+  }
+  if (st.adjustment !== null && st.adjustment !== undefined && Number(st.adjustment) !== 0) {
+    body += rowOpen(r) + textCell('A' + r, S.client, 'Rounding adjustment') + numCell('E' + r, S.detMoney, stmtNum(st.adjustment)) + '</row>';
+    r++;
+  }
+  const lastBody = r - 1;
+  const totalsRow = r;
+  function sumCell(col, sIdx, cached) {
+    return '<c r="' + col + totalsRow + '" s="' + sIdx + '"><f>SUM(' + col + firstBody + ':' + col + lastBody + ')</f><v>' + cached + '</v></c>';
+  }
+  body += rowOpen(totalsRow) +
+    sumCell('B', S.detInt, st.totals.enrolled) +
+    sumCell('C', S.detMoney, stmtNum(st.totals.admin)) +
+    sumCell('E', S.detMoney, stmtNum(st.totals.fee)) +
+    '</row>';
+  const footerRow = totalsRow + 4;
+  let footer = '<row r="' + footerRow + '" spans="1:5" ht="33" customHeight="1" x14ac:dyDescent="0.25">' +
+    textCell('A' + footerRow, sFooter, 'If you have questions, please email daylynne@innovativehia.com');
+  for (const col of ['B', 'C', 'D', 'E']) footer += '<c r="' + col + footerRow + '" s="' + sFooter + '"/>';
+  footer += '</row>';
+
+  let out = pre + rows + body + footer + post;
+  out = out.replace(/<dimension ref="[^"]*"\s*\/>/, '<dimension ref="A1:E' + footerRow + '"/>');
+  out = out.replace(/<mergeCells count="\d+">.*?<\/mergeCells>/, '<mergeCells count="1"><mergeCell ref="A' + footerRow + ':E' + footerRow + '"/></mergeCells>');
+
+  const newName = String(st.sheetName || 'Statement').slice(0, 31);
+  wbXml = wbXml.replace(/<sheet name="[^"]*"/, '<sheet name="' + escXml(newName) + '"');
+  wbXml = wbXml.replace(/'[^']*'!\$A:\$E/, "'" + newName.replace(/'/g, "''") + "'!$A:$E");
+  if (/<calcPr[^>]*>/.test(wbXml)) {
+    wbXml = wbXml.replace(/<calcPr[^>]*>/, function (m) { return m.replace(/\/?>$/, '') + ' fullCalcOnLoad="1"/>'; });
+  } else {
+    wbXml = wbXml.replace('</workbook>', '<calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>');
+  }
+
+  zip.file(sheetPath, out);
+  zip.file('xl/styles.xml', styles);
+  zip.file('xl/workbook.xml', wbXml);
+  const appFile = zip.file('docProps/app.xml');
+  if (appFile) {
+    let app = appFile.asText();
+    app = app.replace(/<vt:lpstr>[^<]*<\/vt:lpstr>/, '<vt:lpstr>' + escXml(newName) + '</vt:lpstr>');
+    zip.file('docProps/app.xml', app);
+  }
+  return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// Assemble the statement content for every payee in a period from its
+// pending rows. Money is accumulated in integer cents; the period's
+// rounding adjustment is folded into its steward's statement.
+async function referralStatementContents(db, periodId) {
+  const rows = await db.query(
+    'SELECT pp.steward_id, pp.steward_name, pp.company_code, l.company_name, ' +
+    "to_char(l.modal_date, 'YYYY-MM-DD') AS modal_date, l.admin_fee, pp.pct, pp.referral_fee, l.enrolled, " +
+    "to_char(l.statement_date, 'YYYY-MM-DD') AS statement_date, " +
+    's.first_name, s.last_name, s.name, s.email, s.statement_email, s.payee, s.steward_company_name, s.address, s.city, s.state, s.zip ' +
+    'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
+    'LEFT JOIN stewards s ON s.id = pp.steward_id WHERE pp.period_id = $1 ' +
+    'ORDER BY pp.steward_id, pp.company_code, l.modal_date', [periodId]);
+  const adjRes = await db.query('SELECT * FROM referral_fee_adjustments WHERE period_id = $1', [periodId]);
+  const adjustment = adjRes.rows.length ? adjRes.rows[0] : null;
+  const bySteward = new Map();
+  for (const row of rows.rows) {
+    let c = bySteward.get(row.steward_id);
+    if (!c) {
+      const steward = {
+        payee: row.payee, steward_company_name: row.steward_company_name,
+        first_name: row.first_name, last_name: row.last_name, name: row.name
+      };
+      c = {
+        steward_id: row.steward_id,
+        first_name: row.first_name || '',
+        last_name: row.last_name || '',
+        payeeName: String(payeeDisplayName(steward, row.steward_name) || '').toUpperCase(),
+        address: String(row.address || '').toUpperCase(),
+        cityLine: String([row.city, row.state, row.zip].filter(Boolean).join(' ')).toUpperCase(),
+        email: row.statement_email || row.email || '',
+        personName: String(displayName(steward) || row.steward_name || '').toUpperCase(),
+        statementDate: row.statement_date,
+        clientMap: new Map(),
+        enrolled: 0, adminCents: 0, feeCents: 0
+      };
+      bySteward.set(row.steward_id, c);
+    }
+    if (row.statement_date > c.statementDate) c.statementDate = row.statement_date;
+    let cl = c.clientMap.get(row.company_code);
+    if (!cl) {
+      cl = { label: row.company_code + ' ' + (row.company_name || ''), rows: [] };
+      c.clientMap.set(row.company_code, cl);
+    }
+    cl.rows.push({
+      date: row.modal_date, enrolled: row.enrolled,
+      admin: Number(row.admin_fee), pct: Number(row.pct), fee: Number(row.referral_fee)
+    });
+    c.enrolled += Number(row.enrolled) || 0;
+    c.adminCents += Math.round(Number(row.admin_fee) * 100);
+    c.feeCents += Math.round(Number(row.referral_fee) * 100);
+  }
+  const out = [];
+  for (const c of bySteward.values()) {
+    let adjAmount = null;
+    if (adjustment && Number(adjustment.steward_id) === Number(c.steward_id)) {
+      adjAmount = Number(adjustment.amount);
+      c.feeCents += Math.round(adjAmount * 100);
+    }
+    const sd = new Date(c.statementDate + 'T00:00:00Z');
+    sd.setUTCDate(sd.getUTCDate() - 1);
+    out.push({
+      steward_id: c.steward_id,
+      first_name: c.first_name,
+      last_name: c.last_name,
+      payeeName: c.payeeName,
+      address: c.address,
+      cityLine: c.cityLine,
+      email: c.email,
+      personName: c.personName,
+      statementDate: c.statementDate,
+      monthEnding: sd.toISOString().slice(0, 10),
+      clients: Array.from(c.clientMap.values()),
+      adjustment: adjAmount,
+      totals: { enrolled: c.enrolled, admin: c.adminCents / 100, fee: c.feeCents / 100 }
+    });
+  }
+  return out;
+}
+
+function statementFileBase(content, collision) {
+  let base = String(content.last_name || 'Statement').replace(/[^A-Za-z0-9]+/g, '');
+  if (!base) base = 'Statement';
+  if (collision) base += String(content.first_name || '').replace(/[^A-Za-z]/g, '').charAt(0).toUpperCase();
+  return base;
+}
+
+async function generateReferralStatements(db, periodId, userId) {
+  const tpl = await db.query('SELECT file_data FROM forms WHERE name = $1', [STATEMENT_TEMPLATE_FORM]);
+  if (!tpl.rows.length) {
+    const e = new Error('Statement template not found in Forms. Upload an .xlsx named "' + STATEMENT_TEMPLATE_FORM + '" on the Forms page first.');
+    e.status = 400;
+    throw e;
+  }
+  const templateBuf = tpl.rows[0].file_data;
+  const templateHash = crypto.createHash('sha256').update(templateBuf).digest('hex');
+  const contents = await referralStatementContents(db, periodId);
+  const nameCounts = {};
+  contents.forEach(function (c) {
+    const k = String(c.last_name || '').toLowerCase();
+    nameCounts[k] = (nameCounts[k] || 0) + 1;
+  });
+  let created = 0, replaced = 0, unchanged = 0;
+  const list = [];
+  for (const c of contents) {
+    const base = statementFileBase(c, nameCounts[String(c.last_name || '').toLowerCase()] > 1);
+    const iso = c.statementDate;
+    const fileName = base + '_' + iso.slice(5, 7) + iso.slice(8, 10) + iso.slice(0, 4) + '.xlsx';
+    const hash = crypto.createHash('sha256').update(JSON.stringify({ t: templateHash, c: c })).digest('hex');
+    const ex = await db.query('SELECT id, content_hash FROM referral_fee_statements WHERE period_id = $1 AND steward_id = $2', [periodId, c.steward_id]);
+    if (ex.rows.length && ex.rows[0].content_hash === hash) {
+      unchanged++;
+      list.push({ steward_id: c.steward_id, payee_name: c.payeeName, total: c.totals.fee, status: 'unchanged' });
+      continue;
+    }
+    const buf = buildStatementXlsx(templateBuf, Object.assign({}, c, { sheetName: base }));
+    if (ex.rows.length) {
+      await db.query(
+        'UPDATE referral_fee_statements SET payee_name = $1, statement_date = $2, total = $3, file_name = $4, file_data = $5, content_hash = $6, generated_at = NOW(), generated_by = $7 WHERE id = $8',
+        [c.payeeName, c.statementDate, c.totals.fee, fileName, buf, hash, userId, ex.rows[0].id]);
+      replaced++;
+      list.push({ steward_id: c.steward_id, payee_name: c.payeeName, total: c.totals.fee, status: 'replaced' });
+    } else {
+      await db.query(
+        'INSERT INTO referral_fee_statements (period_id, steward_id, payee_name, statement_date, total, file_name, file_data, content_hash, generated_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [periodId, c.steward_id, c.payeeName, c.statementDate, c.totals.fee, fileName, buf, hash, userId]);
+      created++;
+      list.push({ steward_id: c.steward_id, payee_name: c.payeeName, total: c.totals.fee, status: 'created' });
+    }
+  }
+  return { created: created, replaced: replaced, unchanged: unchanged, total: contents.length, statements: list };
+}
+
+app.post('/api/admin/referral-fees/periods/:id/generate-statements', requireAdmin, async (req, res) => {
+  try {
+    const per = await getPool().query('SELECT id FROM referral_fee_periods WHERE id = $1', [req.params.id]);
+    if (!per.rows.length) return res.status(404).json({ error: 'Period not found' });
+    const out = await generateReferralStatements(getPool(), req.params.id, req.user.id);
+    res.json(out);
+  } catch (error) {
+    console.error('Statement generate error:', error);
+    res.status(error.status || 500).json({ error: error.status ? error.message : 'Internal server error' });
+  }
+});
+
+// The period's generated statements (no file bytes - those come from
+// the download endpoint).
+app.get('/api/referral-fees/periods/:id/statements', requireReferralViewer, async (req, res) => {
+  try {
+    const r = await getPool().query(
+      'SELECT id, steward_id, payee_name, statement_date, total, file_name, generated_at FROM referral_fee_statements WHERE period_id = $1 ORDER BY payee_name',
+      [req.params.id]);
+    res.json(r.rows);
+  } catch (error) {
+    console.error('Statement list error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Statement download: Admin and Top Dog only (Leroy).
+app.get('/api/referral-fees/statements/:sid/download', requireAuth, async (req, res) => {
+  try {
+    const role = req.user && req.user.activeRole;
+    if (role !== 'admin' && role !== 'top_dog') {
+      return res.status(403).json({ error: 'Statements can be downloaded by Admin and Top Dog only' });
+    }
+    const r = await getPool().query('SELECT file_name, file_data FROM referral_fee_statements WHERE id = $1', [req.params.sid]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Statement not found' });
+    res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.set('Content-Disposition', 'attachment; filename="' + String(r.rows[0].file_name).replace(/"/g, '') + '"');
+    res.send(r.rows[0].file_data);
+  } catch (error) {
+    console.error('Statement download error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/admin/referral-fees/statements/:sid', requireAdmin, async (req, res) => {
+  try {
+    const r = await getPool().query('DELETE FROM referral_fee_statements WHERE id = $1', [req.params.sid]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Statement not found' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Statement delete error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Upload + validate + calculate a referral fee source file (Jobs page).
 // FTJ (F) is built; the Soluta (S) import arrives with its own build.
 app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), async (req, res) => {
@@ -4734,6 +5107,52 @@ app.get('/api/admin/probe-forms', async (req, res) => {
     }
     const r = await db.query('SELECT id, name, file_name, mime_type, LENGTH(file_data) AS bytes, updated_at FROM forms ORDER BY name');
     res.json(r.rows);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
+// TEMP v6.19 statement probe (remove after verification): run the real
+// generator for a period, fetch one stored statement file, and exercise
+// create -> replace -> unchanged -> recreate on a throwaway fixture
+// period so July's real statements are only ever created once.
+app.post('/api/admin/probe-gen-statements', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'file') {
+      const r = await db.query('SELECT file_name, file_data FROM referral_fee_statements WHERE period_id = $1 AND steward_id = $2', [req.query.period, req.query.steward]);
+      if (!r.rows.length) return res.status(404).json({ error: 'No statement stored for that period + steward' });
+      return res.json({ file_name: r.rows[0].file_name, base64: r.rows[0].file_data.toString('base64') });
+    }
+    if (req.query.mode === 'fixture') {
+      const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE STMT TEST') RETURNING id");
+      const pid = per.rows[0].id;
+      const line = await db.query(
+        "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
+        "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
+      await db.query(
+        'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [line.rows[0].id, pid, 'TESTX', 153909, 'Logan Strobeck', 25, 46.15]);
+      const g1 = await generateReferralStatements(db, pid, null);
+      await db.query('UPDATE referral_fee_pending SET referral_fee = 50.00 WHERE period_id = $1', [pid]);
+      const g2 = await generateReferralStatements(db, pid, null);
+      const g3 = await generateReferralStatements(db, pid, null);
+      await db.query('DELETE FROM referral_fee_statements WHERE period_id = $1', [pid]);
+      const g4 = await generateReferralStatements(db, pid, null);
+      await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [pid]);
+      const left = await db.query('SELECT COUNT(*) AS n FROM referral_fee_statements WHERE period_id = $1', [pid]);
+      return res.json({
+        create: { created: g1.created, replaced: g1.replaced, unchanged: g1.unchanged },
+        after_change: { created: g2.created, replaced: g2.replaced, unchanged: g2.unchanged },
+        again: { created: g3.created, replaced: g3.replaced, unchanged: g3.unchanged },
+        after_delete: { created: g4.created, replaced: g4.replaced, unchanged: g4.unchanged },
+        fixture_statements_left: left.rows[0].n
+      });
+    }
+    const out = await generateReferralStatements(db, parseInt(req.query.period, 10), null);
+    const sums = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS tot FROM referral_fee_statements WHERE period_id = $1', [req.query.period]);
+    res.json({ generate: { created: out.created, replaced: out.replaced, unchanged: out.unchanged, total: out.total }, stored: sums.rows[0] });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Probe failed' });
   }

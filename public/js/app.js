@@ -251,7 +251,7 @@ function navLinks() {
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding' || role === 'commissions') {
     links.push(['#/admin/commissions', 'Commissions']);
   }
-  if (role === 'admin' || role === 'commissions') {
+  if (role === 'admin' || role === 'commissions' || role === 'top_dog') {
     links.push(['#/referral-fees', 'Referral Fees']);
   }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
@@ -1403,14 +1403,17 @@ function viewAdminStewards() {
 // One tab per referral fee period (kept as history). Source files are
 // uploaded and validated on the Jobs page (or right here, Admin only) and
 // calculated into the period's pending commissions table: one row per
-// company, payroll date, and steward. Once both sources are in, the period
-// is locked and statements are generated - that step is a later build.
-// Visible to Admin and the Commissions role only.
+// company, payroll date, and steward. Statements (v6.19) are generated
+// per payee from the Forms statement template; generating again skips
+// statements that have not changed and replaces ones that have.
+// Visible to Admin and the Commissions role; Top Dog can also view, and
+// statements can be downloaded by Admin and Top Dog only.
 function viewReferralFees() {
   requireUser(function () {
     var ar = activeRole();
-    if (ar !== 'admin' && ar !== 'commissions') { location.hash = '#/dashboard'; return; }
+    if (ar !== 'admin' && ar !== 'commissions' && ar !== 'top_dog') { location.hash = '#/dashboard'; return; }
     var isAdmin = ar === 'admin';
+    var canDownload = ar === 'admin' || ar === 'top_dog';
     var periods = [];
     var selectedId = null;
     var flash = '';
@@ -1525,7 +1528,21 @@ function viewReferralFees() {
         } else {
           html += '<div class="card"><div class="card-title">Pending Commissions</div><p class="muted">Nothing calculated yet. Load a source file from the Jobs page (Referral Fee import card) or above.</p></div>';
         }
+        html += '<div class="card"><div class="card-title">Statements</div>' +
+          '<p class="muted">One statement per payee, filled from the &quot;iM4 Health Statement Template&quot; in Forms. Generating again skips statements that have not changed and replaces ones that have.</p>' +
+          (isAdmin ? '<p><button class="btn btn-primary" id="rf-gen">Generate statements</button></p>' : '') +
+          '<div id="rf-gen-out"></div><div id="rf-statements"><p class="muted">Loading statements...</p></div></div>';
         box.innerHTML = html;
+        loadStatements();
+        var gb = document.getElementById('rf-gen');
+        if (gb) gb.onclick = function () {
+          var out = document.getElementById('rf-gen-out');
+          out.innerHTML = '<p class="muted">Generating statements...</p>';
+          api.post('/api/admin/referral-fees/periods/' + selectedId + '/generate-statements', {}).then(function (r) {
+            out.innerHTML = okHtml('Statements done: ' + r.created + ' created, ' + r.replaced + ' replaced, ' + r.unchanged + ' unchanged (' + r.total + ' payees).');
+            loadStatements();
+          }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+        };
         var delBtn = document.getElementById('rf-delete');
         if (delBtn) delBtn.onclick = function () {
           var seen = {};
@@ -1556,6 +1573,59 @@ function viewReferralFees() {
             loadPeriods();
           }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
         };
+      }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
+    }
+
+    function loadStatements() {
+      var box = document.getElementById('rf-statements');
+      if (!box) return;
+      api.get('/api/referral-fees/periods/' + selectedId + '/statements').then(function (list) {
+        if (!list || !list.length) {
+          box.innerHTML = '<p class="muted">No statements generated for this period yet.</p>';
+          return;
+        }
+        var total = list.reduce(function (a, s) { return a + Number(s.total || 0); }, 0);
+        box.innerHTML = '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+          '<th>Payee</th><th>Statement Date</th><th>Total</th><th>File</th><th>Generated</th><th></th>' +
+          '</tr></thead><tbody>' +
+          list.map(function (s) {
+            return '<tr><td>' + esc(s.payee_name || '') + '</td>' +
+              '<td>' + esc(String(s.statement_date).slice(0, 10)) + '</td>' +
+              '<td><b>' + money(s.total) + '</b></td>' +
+              '<td>' + esc(s.file_name || '') + '</td>' +
+              '<td>' + esc(String(s.generated_at || '').slice(0, 10)) + '</td>' +
+              '<td style="white-space:nowrap;">' +
+              (canDownload ? '<button class="btn btn-small" data-stmt-dl="' + s.id + '" data-fn="' + esc(s.file_name || '') + '">Download</button> ' : '') +
+              (isAdmin ? '<button class="btn btn-small btn-danger" data-stmt-del="' + s.id + '">Delete</button>' : '') +
+              '</td></tr>';
+          }).join('') +
+          '</tbody></table></div>' +
+          '<p style="margin-top:8px;">' + list.length + ' statements &mdash; total <b>' + money(total) + '</b></p>';
+        Array.prototype.forEach.call(box.querySelectorAll('[data-stmt-dl]'), function (b) {
+          b.onclick = function () {
+            var headers = {};
+            if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+            fetch('/api/referral-fees/statements/' + b.getAttribute('data-stmt-dl') + '/download', { headers: headers }).then(function (resp) {
+              if (!resp.ok) throw new Error('Download failed');
+              return resp.blob();
+            }).then(function (blob) {
+              var el = document.createElement('a');
+              el.href = URL.createObjectURL(blob);
+              el.download = b.getAttribute('data-fn');
+              document.body.appendChild(el);
+              el.click();
+              setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+            }).catch(function (err) { alert(err.message); });
+          };
+        });
+        Array.prototype.forEach.call(box.querySelectorAll('[data-stmt-del]'), function (b) {
+          b.onclick = function () {
+            if (!confirm('Delete this statement? It can be generated again from the pending rows.')) return;
+            api.delete('/api/admin/referral-fees/statements/' + b.getAttribute('data-stmt-del')).then(function () {
+              loadStatements();
+            }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
+          };
+        });
       }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
     }
 
