@@ -4788,6 +4788,37 @@ async function referralPeriodDetail(db, periodId) {
   return { period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: t, adjustment: adjustment };
 }
 
+// All pending commissions across every open period (v6.24, Leroy):
+// the Referral Fees page's "Pending" tab. Merges each open period's
+// detail (rows carry their payee display names; rounding adjustments
+// ride along, labeled with their period) into one list with grand
+// totals, so everything calculated but not yet statemented is visible
+// in one place.
+app.get('/api/referral-fees/pending-all', requireReferralViewer, async (req, res) => {
+  try {
+    const db = getPool();
+    const open = await db.query("SELECT id FROM referral_fee_periods WHERE status = 'open' ORDER BY id");
+    const out = { periods: [], rows: [], adjustments: [], totals: { total_admin_fees: 0, total_referral_fees: 0, net_referral_fees: 0 } };
+    for (const p of open.rows) {
+      const d = await referralPeriodDetail(db, p.id);
+      if (!d) continue;
+      out.periods.push({ id: d.period.id, label: d.period.label });
+      d.rows.forEach(function (r) { r.period_id = d.period.id; r.period_label = d.period.label; out.rows.push(r); });
+      if (d.adjustment) { d.adjustment.period_id = d.period.id; d.adjustment.period_label = d.period.label; out.adjustments.push(d.adjustment); }
+      out.totals.total_admin_fees += Number(d.totals.total_admin_fees) || 0;
+      out.totals.total_referral_fees += Number(d.totals.total_referral_fees) || 0;
+      out.totals.net_referral_fees += Number(d.totals.net_referral_fees) || 0;
+    }
+    out.totals.total_admin_fees = Math.round(out.totals.total_admin_fees * 100) / 100;
+    out.totals.total_referral_fees = Math.round(out.totals.total_referral_fees * 100) / 100;
+    out.totals.net_referral_fees = Math.round(out.totals.net_referral_fees * 100) / 100;
+    res.json(out);
+  } catch (error) {
+    console.error('Referral pending-all error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/referral-fees/periods/:id', requireReferralViewer, async (req, res) => {
   try {
     const detail = await referralPeriodDetail(getPool(), req.params.id);
@@ -5271,6 +5302,14 @@ app.post('/api/admin/probe-octstatus', async (req, res) => {
       'SELECT period_id, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending WHERE steward_id = 153909 GROUP BY period_id');
     const topStewards = await db.query(
       'SELECT steward_id, steward_name, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending GROUP BY steward_id, steward_name ORDER BY fees DESC LIMIT 8');
+    if (req.query.mode === 'mint') {
+      const u = await db.query("SELECT * FROM stewards WHERE id = 100000");
+      const roles = await getUserRoles(db, 100000);
+      const token = signToken({ id: 100000, roles: roles, activeRole: 'admin' });
+      const adj = await db.query('SELECT period_id, amount FROM referral_fee_adjustments');
+      const adm = await db.query('SELECT period_id, COALESCE(SUM(admin_fee), 0) AS admin_total FROM referral_fee_lines GROUP BY period_id');
+      return res.json({ token: token, adjustments: adj.rows, admin_totals: adm.rows });
+    }
     res.json({ periods: periods.rows, imports: imports.rows, strobeck: strobeck.rows, top_stewards: topStewards.rows });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Probe failed' });

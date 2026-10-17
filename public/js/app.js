@@ -1574,6 +1574,7 @@ function viewReferralFees() {
     var canDownload = ar === 'admin' || ar === 'top_dog';
     var periods = [];
     var selectedId = null;
+    var showPending = true;
     var flash = '';
 
     function money(v) { return fmtMoney(Number(v) || 0); }
@@ -1583,11 +1584,12 @@ function viewReferralFees() {
     }
 
     function paint() {
-      var tabs = periods.map(function (p) {
-        var on = Number(p.id) === Number(selectedId);
-        return '<button class="btn btn-small' + (on ? ' btn-primary' : '') + '" data-period="' + p.id + '" style="margin:0 6px 6px 0;">' +
-          esc(p.label) + (p.status === 'locked' ? ' (locked)' : '') + '</button>';
-      }).join('');
+      var tabs = '<button class="btn btn-small' + (showPending ? ' btn-primary' : '') + '" data-pending="1" style="margin:0 6px 6px 0;">Pending</button>' +
+        periods.map(function (p) {
+          var on = !showPending && Number(p.id) === Number(selectedId);
+          return '<button class="btn btn-small' + (on ? ' btn-primary' : '') + '" data-period="' + p.id + '" style="margin:0 6px 6px 0;">' +
+            esc(p.label) + (p.status === 'locked' ? ' (locked)' : '') + '</button>';
+        }).join('');
       var startBuild = '';
       if (isAdmin) {
         var now = new Date();
@@ -1612,13 +1614,56 @@ function viewReferralFees() {
         if (!label) { out.innerHTML = errorHtml('Give the period a label first.'); return; }
         api.post('/api/admin/referral-fees/periods', { label: label }).then(function (p) {
           selectedId = p.id;
+          showPending = false;
           loadPeriods();
         }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
       };
       Array.prototype.forEach.call(document.querySelectorAll('[data-period]'), function (b) {
-        b.onclick = function () { selectedId = b.getAttribute('data-period'); paint(); loadPeriod(); };
+        b.onclick = function () { showPending = false; selectedId = b.getAttribute('data-period'); paint(); loadPeriod(); };
       });
-      if (selectedId) loadPeriod();
+      var pb = document.querySelector('[data-pending]');
+      if (pb) pb.onclick = function () { showPending = true; paint(); };
+      if (showPending) loadPending(); else if (selectedId) loadPeriod();
+    }
+
+    // The Pending tab (v6.24, Leroy): every pending commission across
+    // all open periods in one table, so what is owed but not yet
+    // statemented is visible without opening each month.
+    function loadPending() {
+      var box = document.getElementById('rf-period');
+      if (!box) return;
+      box.innerHTML = '<p class="muted">Loading...</p>';
+      api.get('/api/referral-fees/pending-all').then(function (d) {
+        var html = '<div class="card"><div class="card-title">Pending Commissions</div>';
+        if (d.rows && d.rows.length) {
+          html += '<p class="muted">Every calculated commission not yet on a statement, across all open periods (' +
+            d.periods.map(function (p) { return esc(p.label); }).join(', ') + ').</p>' +
+            '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+            '<th>Period</th><th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Admin Fee</th><th>Referral Fee %</th>' +
+            '<th>Total Referral Fee</th><th>Enrolled</th><th style="white-space:nowrap;">Steward #</th><th>Payee</th><th>Statement Date</th>' +
+            '</tr></thead><tbody>' +
+            d.rows.map(function (r) {
+              return '<tr><td style="white-space:nowrap;">' + esc(r.period_label) + '</td><td><b>' + esc(r.company_code) + '</b></td><td>' + esc(r.company_name || '') + '</td>' +
+                '<td>' + esc(String(r.modal_date).slice(0, 10)) + '</td><td>' + money(r.admin_fee) + '</td>' +
+                '<td>' + pctText(r.pct) + '</td><td><b>' + money(r.referral_fee) + '</b></td>' +
+                '<td>' + esc(r.enrolled) + '</td><td style="white-space:nowrap;">' + esc(r.steward_id) + '</td><td>' + esc(r.payee_name || r.steward_name || '') + '</td>' +
+                '<td>' + esc(String(r.statement_date).slice(0, 10)) + '</td></tr>';
+            }).join('') +
+            (d.adjustments || []).map(function (a) {
+              return '<tr style="background:#f4f6f8;font-style:italic;"><td style="white-space:nowrap;">' + esc(a.period_label) + '</td><td></td><td>Rounding adjustment</td><td></td><td></td><td></td>' +
+                '<td><b>' + money(a.amount) + '</b></td><td></td><td style="white-space:nowrap;">' + esc(a.steward_id) + '</td>' +
+                '<td>' + esc(a.payee_name || a.steward_name || '') + '</td>' +
+                '<td>' + (a.statement_date ? esc(String(a.statement_date).slice(0, 10)) : '') + '</td></tr>';
+            }).join('') +
+            '</tbody></table></div>' +
+            '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(d.totals.total_admin_fees) + '</b> &nbsp; Total Referral Fees: <b>' + money(d.totals.net_referral_fees) + '</b>' +
+            ' &nbsp; <span class="muted">' + d.rows.length + ' pending rows</span></p>';
+        } else {
+          html += '<p class="muted">No pending commissions right now. Load a source file from the Jobs page (Referral Fee import card) into an open period.</p>';
+        }
+        html += '</div>';
+        box.innerHTML = html;
+      }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
     }
 
     function loadPeriods() {
