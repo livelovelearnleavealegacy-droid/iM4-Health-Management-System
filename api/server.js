@@ -256,6 +256,13 @@ async function migrate() {
     ['stewards', 'first_name', 'TEXT'],
     ['stewards', 'last_name', 'TEXT'],
     ['stewards', 'phone', 'TEXT'],
+    ['stewards', 'steward_company_name', 'TEXT'],
+    ['stewards', 'address', 'TEXT'],
+    ['stewards', 'city', 'TEXT'],
+    ['stewards', 'state', 'TEXT'],
+    ['stewards', 'zip', 'TEXT'],
+    ['stewards', 'payee', 'TEXT'],
+    ['stewards', 'tax_id', 'TEXT'],
     ['stewards', 'statement_email', 'TEXT'],
     ['stewards', 'reset_token', 'TEXT'],
     ['stewards', 'reset_expires', 'TIMESTAMPTZ'],
@@ -3102,13 +3109,66 @@ app.post('/api/admin/billing/delete-bills', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: stewards (read-only list; import only; password + roles set here)
+// ------------------------------------------- steward payee / tax id (v6.18, Leroy)
+// Stewards gained company/address fields plus Payee and Tax ID (used by
+// the referral fee statement process). Payee is 'Steward' or 'Company'
+// and decides the Tax ID format: Steward = SSN (###-##-####), Company =
+// EIN (##-#######). Tax IDs are stored digits-only. The full number is
+// returned ONLY by the editor's reveal endpoint (Admin + Onboarding);
+// every list payload carries the masked form - last four digits visible,
+// the rest X's (XXX-XX-1234 for an SSN, XX-XXX1234 for an EIN).
+function taxIdDigits(v) { return String(v || '').replace(/[^0-9]/g, ''); }
+function formatTaxId(digits, payee) {
+  if (!digits) return '';
+  if (payee === 'Company') return digits.slice(0, 2) + '-' + digits.slice(2);
+  return digits.slice(0, 3) + '-' + digits.slice(3, 5) + '-' + digits.slice(5);
+}
+function maskTaxId(digits, payee) {
+  if (!digits) return '';
+  const last4 = digits.slice(-4);
+  return payee === 'Company' ? 'XX-XXX' + last4 : 'XXX-XX-' + last4;
+}
+// Shared validation for the create/update steward endpoints. Returns
+// { payee, taxId, hasTax, error }: hasTax is false when the body carries
+// no tax_id key at all (update endpoints then leave the stored value
+// untouched, so a failed reveal can never wipe a Tax ID by accident).
+function parsePayeeTax(b) {
+  const payee = b.payee === undefined || b.payee === null ? '' : String(b.payee).trim();
+  if (payee !== '' && payee !== 'Steward' && payee !== 'Company') {
+    return { error: 'Payee must be Steward or Company' };
+  }
+  const hasTax = Object.prototype.hasOwnProperty.call(b, 'tax_id');
+  let taxId = null;
+  if (hasTax) {
+    const raw = b.tax_id === null || b.tax_id === undefined ? '' : String(b.tax_id).trim();
+    if (raw === '') { taxId = null; }
+    else {
+      const digits = taxIdDigits(raw);
+      if (digits.length !== 9) {
+        return { error: payee === 'Company'
+          ? 'Tax ID must be a 9-digit EIN (##-#######)'
+          : 'Tax ID must be a 9-digit SSN (###-##-####)' };
+      }
+      if (!payee) return { error: 'Choose a Payee (Steward or Company) - the Tax ID format depends on it' };
+      taxId = digits;
+    }
+  }
+  return { payee: payee || null, taxId: taxId, hasTax: hasTax };
+}
+function cleanOpt(v) { return v && String(v).trim() !== '' ? String(v).trim() : null; }
+
 app.get('/api/admin/stewards', requireStewardsAccess, async (req, res) => {
   try {
     const r = await getPool().query(
-      "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.statement_email, s.role, s.created_at, " +
+      "SELECT s.id, s.email, s.first_name, s.last_name, s.name, s.phone, s.steward_company_name, s.address, s.city, s.state, s.zip, s.payee, s.tax_id, s.statement_email, s.role, s.created_at, " +
       "COALESCE(array_agg(ur.role) FILTER (WHERE ur.role IS NOT NULL), '{}') AS roles " +
       "FROM stewards s LEFT JOIN user_roles ur ON ur.steward_id = s.id " +
       "GROUP BY s.id ORDER BY CASE WHEN s.role = 'admin' THEN 0 ELSE 1 END, s.id");
+    // v6.18: the full Tax ID never rides in a list payload - masked only.
+    r.rows.forEach(function (row) {
+      row.tax_id_masked = maskTaxId(row.tax_id, row.payee);
+      delete row.tax_id;
+    });
     // v6.16 (Leroy): nobody but an Admin may see the admin or commissions
     // roles, or who holds them. For every other viewer those two roles are
     // stripped from this payload (stored assignments are untouched), and a
@@ -3124,6 +3184,21 @@ app.get('/api/admin/stewards', requireStewardsAccess, async (req, res) => {
     res.json(r.rows);
   } catch (error) {
     console.error('Admin stewards error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// The steward editor's reveal: the ONLY endpoint that returns a full
+// Tax ID, and only to the roles that maintain stewards (Admin +
+// Onboarding). Returns the number formatted per the steward's Payee.
+app.get('/api/admin/stewards/:id/tax-id', requireAdminOrOnboarding, async (req, res) => {
+  try {
+    const r = await getPool().query('SELECT payee, tax_id FROM stewards WHERE id = $1', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    const row = r.rows[0];
+    res.json({ payee: row.payee || '', tax_id: formatTaxId(row.tax_id, row.payee) });
+  } catch (error) {
+    console.error('Steward tax-id reveal error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3204,6 +3279,8 @@ app.post('/api/admin/stewards', requireAdminOrOnboarding, async (req, res) => {
     const phone = b.phone && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
     const stmtEmail = b.statement_email && String(b.statement_email).trim() !== '' ? String(b.statement_email).trim().toLowerCase() : null;
     if (stmtEmail && stmtEmail.indexOf('@') === -1) return res.status(400).json({ error: 'Statement Email must be a valid email address' });
+    const pt = parsePayeeTax(b);
+    if (pt.error) return res.status(400).json({ error: pt.error });
     let pwHash = null;
     if (b.password && String(b.password) !== '') {
       if (String(b.password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
@@ -3231,8 +3308,8 @@ app.post('/api/admin/stewards', requireAdminOrOnboarding, async (req, res) => {
     try {
       await client.query('BEGIN');
       await client.query(
-        "INSERT INTO stewards (id, email, name, first_name, last_name, phone, statement_email, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'steward')",
-        [newId, email, (first + ' ' + last).trim(), first, last, phone, stmtEmail, pwHash]);
+        "INSERT INTO stewards (id, email, name, first_name, last_name, phone, steward_company_name, address, city, state, zip, payee, tax_id, statement_email, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'steward')",
+        [newId, email, (first + ' ' + last).trim(), first, last, phone, cleanOpt(b.steward_company_name), cleanOpt(b.address), cleanOpt(b.city), cleanOpt(b.state), cleanOpt(b.zip), pt.payee, pt.hasTax ? pt.taxId : null, stmtEmail, pwHash]);
       await client.query("INSERT INTO user_roles (steward_id, role) VALUES ($1, 'steward') ON CONFLICT DO NOTHING", [newId]);
       await client.query('COMMIT');
     } catch (e) {
@@ -3273,6 +3350,13 @@ app.put('/api/admin/stewards/:id', requireAdminOrOnboarding, async (req, res) =>
     if (!em || em.indexOf('@') === -1) return res.status(400).json({ error: 'A valid email is required' });
     const stmtEmail = statement_email && String(statement_email).trim() !== '' ? String(statement_email).trim().toLowerCase() : null;
     if (stmtEmail && stmtEmail.indexOf('@') === -1) return res.status(400).json({ error: 'Statement Email must be a valid email address' });
+    const pt = parsePayeeTax(req.body || {});
+    if (pt.error) return res.status(400).json({ error: pt.error });
+    const coName = cleanOpt(req.body.steward_company_name);
+    const addr = cleanOpt(req.body.address);
+    const city = cleanOpt(req.body.city);
+    const state = cleanOpt(req.body.state);
+    const zip = cleanOpt(req.body.zip);
     let pwHash = null;
     if (password && String(password) !== '') {
       if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
@@ -3284,6 +3368,16 @@ app.put('/api/admin/stewards/:id', requireAdminOrOnboarding, async (req, res) =>
     const sets = ['first_name = $1', 'last_name = $2', 'email = $3', 'phone = $4', 'statement_email = $5',
       "name = TRIM(COALESCE($1,'') || ' ' || COALESCE($2,''))"];
     const params = [first, last, em, phone && String(phone).trim() !== '' ? String(phone).trim() : null, stmtEmail];
+    params.push(coName); sets.push('steward_company_name = $' + params.length);
+    params.push(addr); sets.push('address = $' + params.length);
+    params.push(city); sets.push('city = $' + params.length);
+    params.push(state); sets.push('state = $' + params.length);
+    params.push(zip); sets.push('zip = $' + params.length);
+    params.push(pt.payee); sets.push('payee = $' + params.length);
+    // tax_id joins the update only when the body carries the key (see
+    // parsePayeeTax): an editor that could not reveal the stored number
+    // omits it, and the stored Tax ID is left untouched.
+    if (pt.hasTax) { params.push(pt.taxId); sets.push('tax_id = $' + params.length); }
     if (pwHash) { params.push(pwHash); sets.push('password_hash = $' + params.length); }
     params.push(req.params.id);
     const r = await db.query(
@@ -4562,6 +4656,20 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
   }
+});
+
+// TEMP v6.18 probe (remove after verification): schema + tax-id rules.
+app.get('/api/admin/probe-taxid-schema', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  const r = await getPool().query(
+    "SELECT column_name FROM information_schema.columns WHERE table_name = 'stewards' AND column_name IN ('steward_company_name', 'address', 'city', 'state', 'zip', 'payee', 'tax_id') ORDER BY column_name");
+  res.json({ columns: r.rows.map(function (x) { return x.column_name; }) });
+});
+app.post('/api/admin/probe-taxid', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  const pt = parsePayeeTax(req.body || {});
+  if (pt.error) return res.json({ error: pt.error });
+  res.json({ payee: pt.payee, digits: pt.taxId, formatted: formatTaxId(pt.taxId, pt.payee), masked: maskTaxId(pt.taxId, pt.payee), hasTax: pt.hasTax });
 });
 
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.

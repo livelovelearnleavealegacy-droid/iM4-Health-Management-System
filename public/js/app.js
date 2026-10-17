@@ -1124,6 +1124,7 @@ function viewAdminStewards() {
     var editId = null;
     var adding = false;
     var nextId = null;
+    var editTax = null; // revealed full Tax ID for the row in edit mode (v6.18)
 
     function rolesOf(s) {
       if (s.roles && s.roles.length) return s.roles;
@@ -1134,6 +1135,17 @@ function viewAdminStewards() {
         var on = selected.indexOf(r) !== -1;
         return '<label style="margin-right:10px;"><input type="checkbox" class="stw-role" value="' + r + '"' + (on ? ' checked' : '') + '> ' + roleLabel(r) + '</label>';
       }).join('');
+    }
+    // Tax ID input (v6.18): the list only ever carries the masked number;
+    // the full number reaches this form through the reveal endpoint when
+    // Edit is clicked (see editTax). If the reveal failed, the input is
+    // disabled and Save omits tax_id entirely, so the stored number is
+    // never wiped by accident.
+    function taxInputHtml(s) {
+      if (!s) return '<input id="stw-tax" value="" placeholder="9 digits - SSN or EIN per Payee" style="width:100%;">';
+      if (editTax && editTax.error) return '<input id="stw-tax" value="" placeholder="On file (could not load - saving keeps it)" disabled style="width:100%;">';
+      var v = editTax ? (editTax.value || '') : '';
+      return '<input id="stw-tax" value="' + esc(v) + '" placeholder="' + (s.tax_id_masked ? 'On file: ' + esc(s.tax_id_masked) : '9 digits - SSN or EIN per Payee') + '" style="width:100%;">';
     }
     function editorRow(idDisplay, s) {
       var idCell = isAdmin
@@ -1147,6 +1159,15 @@ function viewAdminStewards() {
         '<td><input id="stw-last" value="' + esc(s ? (s.last_name || '') : '') + '" style="width:100%;"></td>' +
         '<td><input id="stw-email" value="' + esc(s ? (s.email || '') : '') + '" style="width:100%;"><input id="stw-password" type="password" placeholder="' + (s ? 'New password (blank = keep current)' : 'Password (optional)') + '" style="width:100%;margin-top:4px;"></td>' +
         '<td><input id="stw-phone" value="' + esc(s ? (s.phone || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-coname" value="' + esc(s ? (s.steward_company_name || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-address" value="' + esc(s ? (s.address || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-city" value="' + esc(s ? (s.city || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-state" value="' + esc(s ? (s.state || '') : '') + '" style="width:100%;"></td>' +
+        '<td><input id="stw-zip" value="' + esc(s ? (s.zip || '') : '') + '" style="width:100%;"></td>' +
+        '<td><select id="stw-payee"><option value=""' + (!s || !s.payee ? ' selected' : '') + '>-</option>' +
+        '<option value="Steward"' + (s && s.payee === 'Steward' ? ' selected' : '') + '>Steward</option>' +
+        '<option value="Company"' + (s && s.payee === 'Company' ? ' selected' : '') + '>Company</option></select></td>' +
+        '<td>' + taxInputHtml(s) + '</td>' +
         '<td><input id="stw-stmt" value="' + esc(s ? (s.statement_email || '') : '') + '" style="width:100%;"></td>' +
         '<td>' + rolesCell + '</td>' +
         (canDocs ? '<td></td><td></td>' : '') +
@@ -1186,17 +1207,21 @@ function viewAdminStewards() {
           var actions = canEdit ? '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>' : '';
           if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
-            '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td><td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
+            '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td>' +
+            '<td>' + esc(s.steward_company_name || '') + '</td><td>' + esc(s.address || '') + '</td><td>' + esc(s.city || '') + '</td>' +
+            '<td>' + esc(s.state || '') + '</td><td>' + esc(s.zip || '') + '</td><td>' + esc(s.payee || '') + '</td>' +
+            '<td>' + esc(s.tax_id_masked || '') + '</td>' +
+            '<td>' + esc(s.statement_email || '') + '</td><td>' + esc(roles || s.role || '') + '</td>' +
             (canDocs ? docCell(s, 'w9') + docCell(s, 'ach') : '') +
             '<td style="white-space:nowrap;">' + actions + '</td></tr>';
         }).join('');
-        var note = '<p class="muted">Onboarding can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
+        var note = '<p class="muted">Onboarding can add a Steward and add (or later update) First Name, Last Name, Email, Phone, Password, and Statement Email. Phone and Statement Email are optional. Steward Company Name, Address, City, State, Zip, Payee, and Tax ID support the referral fee statements: Payee is Steward (Tax ID is an SSN) or Company (Tax ID is an EIN). The Tax ID shows only its last four digits here - the full number appears only while editing. Password is empty by default but must be updated for the Steward to get access to the system, it can be updated at anytime (Steward should manage their own password, this feature is meant to start a new Steward or rescue an existing one). Admin has additional rights including deleting a Steward, changing the Steward ID and adding additional roles. If anyone else needs access to an account, they must be a Steward first, then associated on the Assignments page.</p>';
         render(shell(
           '<h2>Stewards</h2>' + note +
           '<div id="err"></div>' +
           (canEdit ? '<p><button class="btn" id="stw-add">Add Steward</button></p>' : '') +
-          '<table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Statement Email</th><th>Roles</th>' + (canDocs ? '<th>W9</th><th>ACH</th>' : '') + '<th>Edit</th></tr></thead>' +
-          '<tbody>' + bodyRows + '</tbody></table>',
+          '<div class="table-scroll"><table class="data-table"><thead><tr><th>Steward ID</th><th>First name</th><th>Last name</th><th>Email</th><th>Phone</th><th>Steward Company Name</th><th>Address</th><th>City</th><th>State</th><th>Zip</th><th>Payee</th><th>Tax ID</th><th>Statement Email</th><th>Roles</th>' + (canDocs ? '<th>W9</th><th>ACH</th>' : '') + '<th>Edit</th></tr></thead>' +
+          '<tbody>' + bodyRows + '</tbody></table></div>',
           '#/admin/stewards'));
         wire();
     }
@@ -1204,11 +1229,23 @@ function viewAdminStewards() {
       var addBtn = document.getElementById('stw-add');
       if (addBtn) addBtn.onclick = function () {
         api.get('/api/admin/stewards/next-id').then(function (r) {
-          nextId = r.next_id; adding = true; editId = null; load();
+          nextId = r.next_id; adding = true; editId = null; editTax = null; load();
         }).catch(function (err) { showErr(err.message); });
       };
       Array.prototype.forEach.call(document.querySelectorAll('[data-edit]'), function (b) {
-        b.onclick = function () { editId = parseInt(b.getAttribute('data-edit'), 10); adding = false; load(); };
+        b.onclick = function () {
+          var id = parseInt(b.getAttribute('data-edit'), 10);
+          // Reveal the full Tax ID for the editor (Admin + Onboarding
+          // only, server-side). Any failure leaves editTax.error set and
+          // the Tax ID input disabled, so saving cannot wipe it.
+          api.get('/api/admin/stewards/' + id + '/tax-id').then(function (r) {
+            editTax = { value: r.tax_id || '' };
+          }).catch(function () {
+            editTax = { error: true };
+          }).then(function () {
+            editId = id; adding = false; load();
+          });
+        };
       });
       Array.prototype.forEach.call(document.querySelectorAll('[data-del]'), function (b) {
         b.onclick = function () {
@@ -1269,7 +1306,7 @@ function viewAdminStewards() {
         };
       });
       var cancel = document.getElementById('stw-cancel');
-      if (cancel) cancel.onclick = function () { adding = false; editId = null; load(); };
+      if (cancel) cancel.onclick = function () { adding = false; editId = null; editTax = null; load(); };
       var save = document.getElementById('stw-save');
       if (!save) return;
       save.onclick = function () {
@@ -1284,7 +1321,30 @@ function viewAdminStewards() {
         if (!email || email.indexOf('@') === -1) { showErr('A valid email is required'); return; }
         if (stmtEmail && stmtEmail.indexOf('@') === -1) { showErr('Statement Email must be a valid email address'); return; }
         if (pw && pw.length < 8) { showErr('Password must be at least 8 characters'); return; }
-        var fields = { first_name: first, last_name: last, email: email, phone: phone || null, statement_email: stmtEmail || null };
+        var coName = document.getElementById('stw-coname').value.trim();
+        var addr = document.getElementById('stw-address').value.trim();
+        var city = document.getElementById('stw-city').value.trim();
+        var state = document.getElementById('stw-state').value.trim();
+        var zip = document.getElementById('stw-zip').value.trim();
+        var payee = document.getElementById('stw-payee').value;
+        var taxEl = document.getElementById('stw-tax');
+        var fields = { first_name: first, last_name: last, email: email, phone: phone || null, statement_email: stmtEmail || null,
+          steward_company_name: coName || null, address: addr || null, city: city || null, state: state || null, zip: zip || null,
+          payee: payee || '' };
+        // Tax ID rides along only when its input is enabled (see
+        // taxInputHtml): the server leaves the stored number untouched
+        // when the key is absent. Client check mirrors the server rule.
+        if (taxEl && !taxEl.disabled) {
+          var taxVal = taxEl.value.trim();
+          if (taxVal) {
+            if (!payee) { showErr('Choose a Payee (Steward or Company) - the Tax ID format depends on it'); return; }
+            if (taxVal.replace(/[^0-9]/g, '').length !== 9) {
+              showErr(payee === 'Company' ? 'Tax ID must be a 9-digit EIN (##-#######)' : 'Tax ID must be a 9-digit SSN (###-##-####)');
+              return;
+            }
+          }
+          fields.tax_id = taxVal;
+        }
         if (pw) fields.password = pw;
         if (adding) {
           var payload = fields;
@@ -1306,6 +1366,7 @@ function viewAdminStewards() {
         }
         var curId = editId;
         function after(id) {
+          editTax = null;
           if (isAdmin) {
             var roles = pickedRoles();
             if (roles.length === 0) { showErr('Pick at least one role'); return; }
