@@ -4424,9 +4424,14 @@ async function runReferralImportF(db, buffer, fileName, periodId, userId) {
     const lineId = ins.rows[0].id;
     linesCreated++;
     let splitTotal = 0;
+    const adminCents = Math.round(b.admin_fees * 100);
     for (const s of splits) {
       splitTotal += Number(s.pct);
-      const fee = Math.round(b.admin_fees * Number(s.pct)) / 100;
+      // Exact decimal money math in integers: a float product like
+      // 276.90 * 25 lands a hair under the true half-cent and rounds a
+      // cent low, so the fee is computed as integer cents x pct-thousandths.
+      const pctMilli = Math.round(Number(s.pct) * 1000);
+      const fee = Math.floor((adminCents * pctMilli + 50000) / 100000) / 100;
       await db.query(
         'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
         [lineId, periodId, b.company_code, s.steward_code, stName[s.steward_code] || ('Steward ' + s.steward_code), s.pct, fee]);
@@ -4524,6 +4529,11 @@ app.post('/api/admin/probe-rf-load', handleUpload('file'), async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
     const db = getPool();
+    // One-time: wipe the first probe load (it carried float-rounded fees)
+    // before reloading with the corrected calculation.
+    if (req.headers['x-probe-wipe'] === 'yes') {
+      await db.query('DELETE FROM referral_fee_periods');
+    }
     const label = String(req.headers['x-probe-label'] || 'July 2026');
     const per = await db.query('INSERT INTO referral_fee_periods (label) VALUES ($1) RETURNING *', [label]);
     const result = await runReferralImportF(db, req.file.buffer, req.file.originalname, per.rows[0].id, null);
