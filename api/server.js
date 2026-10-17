@@ -5244,51 +5244,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.22 probe (remove after the regeneration is verified):
-// mode=check reports the admin_fee assignments; the default run
-// executes Leroy's ordered regeneration - recompute every line's
-// enrolled from its company's Admin Fee rate, then regenerate the
-// statements for every period that has referral data.
-app.post('/api/admin/probe-adminfee', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    if (req.query.mode === 'check') {
-      const c35 = await db.query('SELECT company_code FROM companies WHERE admin_fee = 35 ORDER BY company_code');
-      const cnt = await db.query('SELECT COUNT(*) AS n FROM companies');
-      return res.json({ companies: Number(cnt.rows[0].n), fee35_codes: c35.rows.map(function (r) { return r.company_code; }) });
-    }
-    const rates = await db.query('SELECT company_code, admin_fee FROM companies');
-    const rateMap = {};
-    rates.rows.forEach(function (r) { rateMap[r.company_code] = r.admin_fee; });
-    const periods = await db.query('SELECT DISTINCT period_id FROM referral_fee_lines ORDER BY period_id');
-    const out = [];
-    for (const p of periods.rows) {
-      const before = await db.query('SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
-      const lines = await db.query('SELECT id, admin_fee, bill_mode, company_code FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
-      for (const l of lines.rows) {
-        const e = referralEnrolled(Number(l.admin_fee), l.bill_mode, rateMap[l.company_code]);
-        if (e !== null) await db.query('UPDATE referral_fee_lines SET enrolled = $1 WHERE id = $2', [e, l.id]);
-      }
-      const after = await db.query('SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1', [p.period_id]);
-      const dnd = await db.query("SELECT COALESCE(SUM(enrolled), 0) AS t FROM referral_fee_lines WHERE period_id = $1 AND company_code IN ('1085','1086','1087','1088','1089','1090','1091','1093','1095')", [p.period_id]);
-      const gen = await generateReferralStatements(db, p.period_id, null);
-      const sums = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS tot FROM referral_fee_statements WHERE period_id = $1', [p.period_id]);
-      const per = await db.query('SELECT label FROM referral_fee_periods WHERE id = $1', [p.period_id]);
-      out.push({
-        period: per.rows[0].label,
-        enrolled_before: Number(before.rows[0].t), enrolled_after: Number(after.rows[0].t),
-        dnd_lives: Number(dnd.rows[0].t),
-        gen: { created: gen.created, replaced: gen.replaced, unchanged: gen.unchanged, removed: gen.removed },
-        stmt_total: sums.rows[0].tot, stmt_count: Number(sums.rows[0].n)
-      });
-    }
-    res.json(out);
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
