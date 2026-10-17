@@ -4658,20 +4658,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.18 probe (remove after verification): schema + tax-id rules.
-app.get('/api/admin/probe-taxid-schema', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  const r = await getPool().query(
-    "SELECT column_name FROM information_schema.columns WHERE table_name = 'stewards' AND column_name IN ('steward_company_name', 'address', 'city', 'state', 'zip', 'payee', 'tax_id') ORDER BY column_name");
-  res.json({ columns: r.rows.map(function (x) { return x.column_name; }) });
-});
-app.post('/api/admin/probe-taxid', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  const pt = parsePayeeTax(req.body || {});
-  if (pt.error) return res.json({ error: pt.error });
-  res.json({ payee: pt.payee, digits: pt.taxId, formatted: formatTaxId(pt.taxId, pt.payee), masked: maskTaxId(pt.taxId, pt.payee), hasTax: pt.hasTax });
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
