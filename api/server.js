@@ -5223,34 +5223,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.21 probe (remove after verification): mint a real admin
-// token (and an already-impersonating admin variant) so the live
-// impersonation endpoint and guards can be exercised end-to-end, and
-// read back the audit log.
-app.post('/api/admin/probe-impersonate', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    if (req.query.mode === 'log') {
-      const r = await db.query('SELECT admin_id, admin_name, target_id, target_name, started_at FROM impersonation_log ORDER BY id DESC LIMIT 5');
-      return res.json(r.rows);
-    }
-    const a = await db.query("SELECT steward_id FROM user_roles WHERE role = 'admin' ORDER BY steward_id LIMIT 1");
-    if (!a.rows.length) return res.status(404).json({ error: 'No admin user' });
-    const adminId = a.rows[0].steward_id;
-    const u = await db.query('SELECT * FROM stewards WHERE id = $1', [adminId]);
-    const roles = await userRoles(db, adminId);
-    const activeRole = pickActiveRole(roles);
-    if (req.query.mode === 'mint-imp') {
-      const token = jwt.sign({ id: adminId, email: u.rows[0].email, roles: roles, activeRole: activeRole, imp: 999999 }, JWT_SECRET, { expiresIn: '10m' });
-      return res.json({ token: token, admin_id: adminId });
-    }
-    res.json({ token: signToken(u.rows[0], roles, activeRole), admin_id: adminId });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
