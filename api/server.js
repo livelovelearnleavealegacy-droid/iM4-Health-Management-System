@@ -4898,6 +4898,34 @@ async function deriveReferralFromS(db, fileName, userId) {
   return { source: 'S', groups_seen: paidRes.rows.length, periods: periods, skipped: allSkipped };
 }
 
+// TEMP derivation probe (remove after use).
+app.post('/api/admin/probe-derive', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'state') {
+      const periods = await db.query('SELECT id, label, status FROM referral_fee_periods ORDER BY id');
+      const counts = await db.query('SELECT (SELECT COUNT(*) FROM referral_fee_lines) AS lines, (SELECT COUNT(*) FROM referral_fee_pending) AS pending, (SELECT COUNT(*) FROM referral_fee_imports) AS imports');
+      const aSplit = await db.query('SELECT company_code, steward_code, pct FROM commissions ORDER BY company_code LIMIT 3');
+      return res.json({ periods: periods.rows, counts: counts.rows[0], sample_splits: aSplit.rows });
+    }
+    if (req.query.mode === 'derivef') {
+      const bills = [{ company_code: req.query.co, company_name: '', payroll_date: '2027-01-05', payroll_end_date: null, bill_mode: '4', total_invoice: 500, admin_fees: 400, lives_count: 10, paid_date: '2027-01-15', ein: null, bill_type: 'F' }];
+      const out = await deriveReferralFromF(db, bills, 'fixture.xlsx', 100000);
+      return res.json(out);
+    }
+    if (req.query.mode === 'clean') {
+      const p = await db.query("SELECT id FROM referral_fee_periods WHERE label = 'January 2027'");
+      if (!p.rows.length) return res.json({ cleaned: 0 });
+      await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [p.rows[0].id]);
+      return res.json({ cleaned: 1 });
+    }
+    res.status(400).json({ error: 'mode required' });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
 // Periods list for the Referral Fees page: one tab per period, kept as history.
 app.get('/api/referral-fees/periods', requireReferralViewer, async (req, res) => {
   try {
