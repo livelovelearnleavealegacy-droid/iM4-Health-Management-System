@@ -4690,25 +4690,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.18.1 probe (remove after verification): period detail payee names.
-app.get('/api/admin/probe-payee', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const d = await referralPeriodDetail(getPool(), parseInt(req.query.period, 10) || 4);
-    if (!d) return res.status(404).json({ error: 'Period not found' });
-    res.json({
-      sample_rows: d.rows.slice(0, 4).map(function (r) { return { steward_id: r.steward_id, steward_payee: r.steward_payee, payee_name: r.payee_name }; }),
-      distinct_payee_names: new Set(d.rows.map(function (r) { return r.payee_name; })).size,
-      adjustment: d.adjustment ? { steward_id: d.adjustment.steward_id, payee_name: d.adjustment.payee_name, statement_date: d.adjustment.statement_date, amount: d.adjustment.amount } : null,
-      synthetic_company: payeeDisplayName({ payee: 'Company', steward_company_name: 'ACME BENEFITS LLC', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner'),
-      synthetic_steward: payeeDisplayName({ payee: 'Steward', steward_company_name: 'ACME BENEFITS LLC', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner'),
-      synthetic_company_noname: payeeDisplayName({ payee: 'Company', steward_company_name: '', first_name: 'Bob', last_name: 'Gardner', name: 'Bob Gardner' }, 'Bob Gardner')
-    });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
