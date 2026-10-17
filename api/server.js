@@ -5244,47 +5244,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP wipe probe (remove after use): mode=dump returns the full
-// referral fee dataset (statement metadata only, no file bytes) as a
-// safety backup; mode=wipe deletes ALL referral fee periods, which
-// cascades to lines, pending rows, imports, adjustments, and
-// statements, and reports before/after counts. Ordered by Leroy
-// 2026-10-17: wipe the slate clean before October and the backload.
-app.post('/api/admin/probe-rf-wipe', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const counts = async function () {
-      const q = async function (t) { return Number((await db.query('SELECT COUNT(*) AS n FROM ' + t)).rows[0].n); };
-      return {
-        periods: await q('referral_fee_periods'),
-        lines: await q('referral_fee_lines'),
-        pending: await q('referral_fee_pending'),
-        imports: await q('referral_fee_imports'),
-        adjustments: await q('referral_fee_adjustments'),
-        statements: await q('referral_fee_statements')
-      };
-    };
-    if (req.query.mode === 'dump') {
-      const grab = async function (sql) { return (await db.query(sql)).rows; };
-      return res.json({
-        periods: await grab('SELECT * FROM referral_fee_periods ORDER BY id'),
-        lines: await grab('SELECT * FROM referral_fee_lines ORDER BY id'),
-        pending: await grab('SELECT * FROM referral_fee_pending ORDER BY id'),
-        imports: await grab('SELECT id, period_id, source, file_name, bills_found, lines_created, duplicates, imported_by, imported_at FROM referral_fee_imports ORDER BY id'),
-        adjustments: await grab('SELECT * FROM referral_fee_adjustments ORDER BY id'),
-        statements: await grab('SELECT id, period_id, steward_id, payee_name, statement_date, total, enrolled, file_name, content_hash, generated_at, generated_by FROM referral_fee_statements ORDER BY id')
-      });
-    }
-    const before = await counts();
-    await db.query('DELETE FROM referral_fee_periods');
-    const after = await counts();
-    res.json({ before: before, after: after });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
