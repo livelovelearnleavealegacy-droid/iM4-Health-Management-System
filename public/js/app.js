@@ -279,6 +279,9 @@ function navLinks() {
   if (role === 'admin' || role === 'commissions' || role === 'top_dog') {
     links.push(['#/referral-fees', 'Referral Fees']);
   }
+  if (role === 'steward') {
+    links.push(['#/statements', 'Statements']);
+  }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/parent-page', 'Parent']);
   }
@@ -1424,6 +1427,78 @@ function viewAdminStewards() {
 }
 
 // ---------------------------------------------------------------- admin: commissions (cards per company)
+// ---------------------------------------------------------------- steward statements page (v6.20, Leroy)
+// A steward's own referral fee money: the current month's pending
+// payment (shown until statements are generated for it - then the
+// month is closed) and a downloadable card for each closed month's
+// statement, with its lives and total. A steward only ever sees and
+// downloads their own.
+function viewMyStatements() {
+  requireUser(function () {
+    render(shell('<h2>Statements</h2><div id="my-stmt"><p class="muted">Loading...</p></div>', '#/statements'));
+    function money(v) { return fmtMoney(Number(v) || 0); }
+    function pctText(v) { var n = Number(v) || 0; return (Math.round(n * 100) / 100) + '%'; }
+    api.get('/api/my/statements').then(function (d) {
+      var box = document.getElementById('my-stmt');
+      if (!box) return;
+      var html = '';
+      if (d.pending) {
+        var p = d.pending;
+        html += '<div class="card"><div class="card-title">Pending Payment &mdash; ' + esc(p.period.label) + '</div>' +
+          '<p class="muted">Your referral fees building for the current month. Once statements are generated this month is closed, and the statement appears below for download.</p>' +
+          '<div class="table-scroll"><table class="data-table"><thead><tr>' +
+          '<th>Company Code</th><th>Company Name</th><th>Payroll Date</th><th>Admin Fee</th><th>Referral Fee %</th><th>Total Referral Fee</th><th>Enrolled</th>' +
+          '</tr></thead><tbody>' +
+          p.rows.map(function (r) {
+            return '<tr><td><b>' + esc(r.company_code) + '</b></td><td>' + esc(r.company_name || '') + '</td>' +
+              '<td>' + esc(String(r.modal_date).slice(0, 10)) + '</td><td>' + money(r.admin_fee) + '</td>' +
+              '<td>' + pctText(r.pct) + '</td><td><b>' + money(r.referral_fee) + '</b></td><td>' + esc(r.enrolled) + '</td></tr>';
+          }).join('') +
+          (p.adjustment ? '<tr style="background:#f4f6f8;font-style:italic;"><td></td><td>Rounding adjustment</td><td></td><td></td><td></td><td><b>' + money(p.adjustment.amount) + '</b></td><td></td></tr>' : '') +
+          '</tbody></table></div>' +
+          '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(p.totals.admin_fees) + '</b> &nbsp; Your Pending Payment: <b>' + money(p.totals.referral_fees) + '</b> &nbsp; Lives: <b>' + esc(p.totals.enrolled) + '</b></p></div>';
+      } else {
+        html += '<div class="card"><div class="card-title">Pending Payment</div><p class="muted">No pending payment right now.</p></div>';
+      }
+      if (d.statements && d.statements.length) {
+        html += '<h3 style="margin:18px 0 10px;">Your Statements</h3><div style="display:flex;flex-wrap:wrap;gap:12px;">' +
+          d.statements.map(function (s) {
+            return '<div class="card" style="flex:1 1 260px;max-width:340px;margin:0;">' +
+              '<div class="card-title">' + esc(s.period_label) + '</div>' +
+              '<p style="margin:4px 0;">' + esc(s.payee_name || '') + '<br>' +
+              'Statement Date: ' + esc(String(s.statement_date).slice(0, 10)) + '<br>' +
+              'Lives: <b>' + esc(s.enrolled === null || s.enrolled === undefined ? '&mdash;' : s.enrolled) + '</b><br>' +
+              'Total: <b>' + money(s.total) + '</b></p>' +
+              '<p style="margin:6px 0 0;"><button class="btn btn-primary btn-small" data-my-dl="' + s.id + '" data-fn="' + esc(s.file_name || '') + '">Download statement</button></p></div>';
+          }).join('') + '</div>';
+      } else {
+        html += '<div class="card"><div class="card-title">Your Statements</div><p class="muted">No statements yet. When a month is finalized, its statement will appear here for download.</p></div>';
+      }
+      box.innerHTML = html;
+      Array.prototype.forEach.call(box.querySelectorAll('[data-my-dl]'), function (b) {
+        b.onclick = function () {
+          var headers = {};
+          if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+          fetch('/api/referral-fees/statements/' + b.getAttribute('data-my-dl') + '/download', { headers: headers }).then(function (resp) {
+            if (!resp.ok) throw new Error('Download failed');
+            return resp.blob();
+          }).then(function (blob) {
+            var el = document.createElement('a');
+            el.href = URL.createObjectURL(blob);
+            el.download = b.getAttribute('data-fn');
+            document.body.appendChild(el);
+            el.click();
+            setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+          }).catch(function (err) { alert(err.message); });
+        };
+      });
+    }).catch(function (err) {
+      var box = document.getElementById('my-stmt');
+      if (box) box.innerHTML = errorHtml(err.message);
+    });
+  });
+}
+
 // ---------------------------------------------------------------- referral fees (v6.16 page; v6.17 build, Leroy)
 // One tab per referral fee period (kept as history). Source files are
 // uploaded and validated on the Jobs page (or right here, Admin only) and
@@ -4493,6 +4568,7 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
   if (pathParts[0] === 'parent-page') return viewParentPage();
   if (pathParts[0] === 'referral-fees') return viewReferralFees();
+  if (pathParts[0] === 'statements') return viewMyStatements();
   if (pathParts[0] === 'tickets') {
     if (pathParts[1] === 'new') return viewNewTicket();
     if (pathParts[1]) return viewTicketDetail(pathParts[1]);

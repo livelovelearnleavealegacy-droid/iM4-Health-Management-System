@@ -542,6 +542,13 @@ async function migrate() {
     'generated_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'generated_by INT, ' +
     'UNIQUE (period_id, steward_id))');
+  // v6.20: statements also carry their lives (enrolled) total - it is a
+  // headline number on the steward's Statements page. Backfilled from
+  // the pending rows each statement was generated from.
+  await db.query('ALTER TABLE referral_fee_statements ADD COLUMN IF NOT EXISTS enrolled INT');
+  await db.query('UPDATE referral_fee_statements s SET enrolled = ' +
+    '(SELECT COALESCE(SUM(l.enrolled), 0) FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
+    'WHERE pp.period_id = s.period_id AND pp.steward_id = s.steward_id) WHERE s.enrolled IS NULL');
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -5006,14 +5013,14 @@ async function generateReferralStatements(db, periodId, userId) {
     const buf = buildStatementXlsx(templateBuf, Object.assign({}, c, { sheetName: base }));
     if (ex.rows.length) {
       await db.query(
-        'UPDATE referral_fee_statements SET payee_name = $1, statement_date = $2, total = $3, file_name = $4, file_data = $5, content_hash = $6, generated_at = NOW(), generated_by = $7 WHERE id = $8',
-        [c.payeeName, c.statementDate, c.totals.fee, fileName, buf, hash, userId, ex.rows[0].id]);
+        'UPDATE referral_fee_statements SET payee_name = $1, statement_date = $2, total = $3, enrolled = $4, file_name = $5, file_data = $6, content_hash = $7, generated_at = NOW(), generated_by = $8 WHERE id = $9',
+        [c.payeeName, c.statementDate, c.totals.fee, c.totals.enrolled, fileName, buf, hash, userId, ex.rows[0].id]);
       replaced++;
       list.push({ steward_id: c.steward_id, payee_name: c.payeeName, total: c.totals.fee, status: 'replaced' });
     } else {
       await db.query(
-        'INSERT INTO referral_fee_statements (period_id, steward_id, payee_name, statement_date, total, file_name, file_data, content_hash, generated_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-        [periodId, c.steward_id, c.payeeName, c.statementDate, c.totals.fee, fileName, buf, hash, userId]);
+        'INSERT INTO referral_fee_statements (period_id, steward_id, payee_name, statement_date, total, enrolled, file_name, file_data, content_hash, generated_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+        [periodId, c.steward_id, c.payeeName, c.statementDate, c.totals.fee, c.totals.enrolled, fileName, buf, hash, userId]);
       created++;
       list.push({ steward_id: c.steward_id, payee_name: c.payeeName, total: c.totals.fee, status: 'created' });
     }
@@ -5059,20 +5066,82 @@ app.get('/api/referral-fees/periods/:id/statements', requireReferralViewer, asyn
   }
 });
 
-// Statement download: Admin and Top Dog only (Leroy).
+// Statement download: Admin and Top Dog, plus the steward the
+// statement belongs to (v6.20, for the steward Statements page).
 app.get('/api/referral-fees/statements/:sid/download', requireAuth, async (req, res) => {
   try {
-    const role = req.user && req.user.activeRole;
-    if (role !== 'admin' && role !== 'top_dog') {
-      return res.status(403).json({ error: 'Statements can be downloaded by Admin and Top Dog only' });
-    }
-    const r = await getPool().query('SELECT file_name, file_data FROM referral_fee_statements WHERE id = $1', [req.params.sid]);
+    const r = await getPool().query('SELECT file_name, file_data, steward_id FROM referral_fee_statements WHERE id = $1', [req.params.sid]);
     if (!r.rows.length) return res.status(404).json({ error: 'Statement not found' });
+    const role = req.user && req.user.activeRole;
+    const own = Number(r.rows[0].steward_id) === Number(req.user.id);
+    if (role !== 'admin' && role !== 'top_dog' && !own) {
+      return res.status(403).json({ error: 'Statements can be downloaded by Admin, Top Dog, and the steward they belong to' });
+    }
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.set('Content-Disposition', 'attachment; filename="' + String(r.rows[0].file_name).replace(/"/g, '') + '"');
     res.send(r.rows[0].file_data);
   } catch (error) {
     console.error('Statement download error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------- steward Statements page (v6.20, Leroy)
+// A steward sees their own referral fee money in two parts:
+// - Pending payment: their rows in the current month - the newest
+//   period that has pending rows, judged by its statement date - shown
+//   only while no statement has been generated for them in that period.
+//   Once statements are generated the month is closed, not pending.
+// - Closed months: one downloadable statement per period, with its
+//   lives and total.
+async function myStatements(db, stewardId) {
+  const stmts = await db.query(
+    'SELECT st.id, st.period_id, p.label AS period_label, st.payee_name, st.statement_date, st.total, st.enrolled, st.file_name, st.generated_at ' +
+    'FROM referral_fee_statements st JOIN referral_fee_periods p ON p.id = st.period_id ' +
+    'WHERE st.steward_id = $1 ORDER BY st.statement_date DESC, st.id DESC', [stewardId]);
+  const cur = await db.query(
+    'SELECT l.period_id, MAX(l.statement_date) AS sd FROM referral_fee_lines l ' +
+    'WHERE EXISTS (SELECT 1 FROM referral_fee_pending pp WHERE pp.period_id = l.period_id) ' +
+    'GROUP BY l.period_id ORDER BY sd DESC NULLS LAST, l.period_id DESC LIMIT 1');
+  let pending = null;
+  if (cur.rows.length) {
+    const periodId = cur.rows[0].period_id;
+    const hasStmt = await db.query('SELECT id FROM referral_fee_statements WHERE period_id = $1 AND steward_id = $2', [periodId, stewardId]);
+    if (!hasStmt.rows.length) {
+      const rows = await db.query(
+        'SELECT pp.company_code, l.company_name, ' +
+        "to_char(l.modal_date, 'YYYY-MM-DD') AS modal_date, l.admin_fee, pp.pct, pp.referral_fee, l.enrolled, " +
+        "to_char(l.statement_date, 'YYYY-MM-DD') AS statement_date " +
+        'FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
+        'WHERE pp.period_id = $1 AND pp.steward_id = $2 ORDER BY pp.company_code, l.modal_date', [periodId, stewardId]);
+      if (rows.rows.length) {
+        const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
+        const adjRes = await db.query('SELECT amount FROM referral_fee_adjustments WHERE period_id = $1 AND steward_id = $2', [periodId, stewardId]);
+        const adjustment = adjRes.rows.length ? { amount: Number(adjRes.rows[0].amount) } : null;
+        let adminC = 0, feeC = 0, enr = 0;
+        rows.rows.forEach(function (r) {
+          adminC += Math.round(Number(r.admin_fee) * 100);
+          feeC += Math.round(Number(r.referral_fee) * 100);
+          enr += Number(r.enrolled) || 0;
+        });
+        if (adjustment) feeC += Math.round(adjustment.amount * 100);
+        pending = {
+          period: per.rows[0],
+          rows: rows.rows,
+          adjustment: adjustment,
+          totals: { admin_fees: adminC / 100, referral_fees: feeC / 100, enrolled: enr }
+        };
+      }
+    }
+  }
+  return { pending: pending, statements: stmts.rows };
+}
+
+app.get('/api/my/statements', requireAuth, async (req, res) => {
+  try {
+    res.json(await myStatements(getPool(), req.user.id));
+  } catch (error) {
+    console.error('My statements error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -5102,6 +5171,54 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.20 probe (remove after verification): the steward Statements
+// payload for a given steward, plus a fixture open month (future
+// statement date, so it is the current month) that flips from pending
+// to a downloadable card once statements are generated.
+app.post('/api/admin/probe-my-statements', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const stewardId = parseInt(req.query.steward, 10);
+    if (req.query.mode === 'fixture') {
+      const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE STMT PAGE') RETURNING id");
+      const pid = per.rows[0].id;
+      const line = await db.query(
+        "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
+        "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2027-01-05', '2027-01-20', '2027-02-01', '2', 184.60, 10) RETURNING id", [pid]);
+      await db.query(
+        'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [line.rows[0].id, pid, 'TESTX', stewardId, 'Probe Steward', 25, 46.15]);
+      const before = await myStatements(db, stewardId);
+      await generateReferralStatements(db, pid, null);
+      const after = await myStatements(db, stewardId);
+      await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [pid]);
+      return res.json({
+        before: {
+          pending_period: before.pending ? before.pending.period.label : null,
+          pending_total: before.pending ? before.pending.totals.referral_fees : null,
+          statements: before.statements.length
+        },
+        after: {
+          pending_period: after.pending ? after.pending.period.label : null,
+          statements: after.statements.map(function (s) {
+            return { period: s.period_label, total: s.total, enrolled: s.enrolled, file: s.file_name };
+          })
+        }
+      });
+    }
+    const out = await myStatements(db, stewardId);
+    res.json({
+      pending: out.pending ? { period: out.pending.period.label, rows: out.pending.rows.length, totals: out.pending.totals } : null,
+      statements: out.statements.map(function (s) {
+        return { period: s.period_label, total: s.total, enrolled: s.enrolled, file: s.file_name, statement_date: s.statement_date };
+      })
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 
