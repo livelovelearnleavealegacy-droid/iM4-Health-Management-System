@@ -4564,25 +4564,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.17.1 (remove after July is adjusted): apply the rounding
-// adjustment to an existing period via the sync secret.
-app.post('/api/admin/probe-rf-adjust', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const periodId = parseInt(req.query.period, 10);
-    if (!periodId) return res.status(400).json({ error: 'period query param required' });
-    const adjustment = await refreshReferralAdjustment(db, periodId);
-    const t = await db.query(
-      'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS admin_total, ' +
-      '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS fees_total', [periodId]);
-    const net = Math.round((Number(t.rows[0].fees_total) + (adjustment ? adjustment.amount : 0)) * 100) / 100;
-    res.json({ adjustment: adjustment, admin_total: t.rows[0].admin_total, fees_total: t.rows[0].fees_total, net_referral_fees: net, exact: net === Number(t.rows[0].admin_total) });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe adjust failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
