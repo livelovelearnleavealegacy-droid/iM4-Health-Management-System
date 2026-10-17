@@ -6,6 +6,11 @@
 (function () {
 'use strict';
 
+// Newline for confirm() messages. The steward-delete and period-delete
+// handlers were built with NL but it was never defined, so both delete
+// buttons threw and silently did nothing (fixed v6.18.3).
+var NL = '\n';
+
 var STAGES = ['Initiation', 'Data Gathering', 'Implementation', 'Go Live', 'Complete'];
 
 function esc(s) {
