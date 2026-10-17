@@ -445,6 +445,18 @@ async function migrate() {
     for (const c of rc2.rows) { await db.query('ALTER TABLE user_roles DROP CONSTRAINT ' + c.conname); }
     await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding', 'client', 'service'))");
   } catch (e) { console.error('Client/service role migration:', e.message); }
+  // v6.16 (Leroy): 'commissions' joins the allowed roles - the commission
+  // calculation + statement generation role. Assignable by Admin only
+  // (set-roles is requireAdmin) and, like 'admin', its assignments are
+  // hidden from every non-admin viewer (see GET /api/admin/stewards).
+  try {
+    const has16 = await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'user_roles'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%commissions%'");
+    if (has16.rows.length === 0) {
+      const olds16 = await db.query("SELECT conname FROM pg_constraint WHERE conrelid = 'user_roles'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%role%'");
+      for (const c of olds16.rows) { await db.query('ALTER TABLE user_roles DROP CONSTRAINT ' + c.conname); }
+      await db.query("ALTER TABLE user_roles ADD CONSTRAINT user_roles_role_check CHECK (role IN ('admin', 'steward', 'top_dog', 'onboarding', 'client', 'service', 'commissions'))");
+    }
+  } catch (e) { console.error('Commissions role migration:', e.message); }
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -725,6 +737,17 @@ function requireAdminTopDogOnboarding(req, res, next) {
   requireAuth(req, res, function () {
     const r = req.user && req.user.activeRole;
     if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding') return res.status(403).json({ error: 'Available to Admin, Top Dog, and Onboarding only' });
+    next();
+  });
+}
+
+// Commissions page data (v6.16, Leroy): Admin, Top Dog, Onboarding, and the
+// Commissions role (view only). Row edits stay Admin + Onboarding and row
+// delete stays Admin only - those endpoints keep their own guards.
+function requireCommissionsPageViewer(req, res, next) {
+  requireAuth(req, res, function () {
+    const r = req.user && req.user.activeRole;
+    if (r !== 'admin' && r !== 'top_dog' && r !== 'onboarding' && r !== 'commissions') return res.status(403).json({ error: 'Available to Admin, Top Dog, Onboarding, and Commissions only' });
     next();
   });
 }
@@ -1773,7 +1796,11 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 app.get('/api/billing', requireAuth, async (req, res) => {
   try {
     const status = req.query.status === 'paid' ? 'paid' : 'open';
-    const codes = await getVisibleCodes(req.user);
+    // v6.16 (Leroy): the Commissions role sees Billing for ALL accounts,
+    // like the full-visibility roles; every other scoped role keeps its
+    // assignment scoping. Deliberately NOT added to hasFullVisibility, so
+    // no other page's data opens up to the role.
+    const codes = req.user.activeRole === 'commissions' ? null : await getVisibleCodes(req.user);
     if (codes && codes.length === 0) return res.json([]);
     let where = "WHERE status = $1 AND NOT EXISTS (SELECT 1 FROM companies c WHERE c.company_code = invoices.company_code AND c.company_status = 'TERMED')";
     if (status === 'open') where += ' AND is_estimate = FALSE';
@@ -3012,6 +3039,18 @@ app.get('/api/admin/stewards', requireStewardsAccess, async (req, res) => {
       "COALESCE(array_agg(ur.role) FILTER (WHERE ur.role IS NOT NULL), '{}') AS roles " +
       "FROM stewards s LEFT JOIN user_roles ur ON ur.steward_id = s.id " +
       "GROUP BY s.id ORDER BY CASE WHEN s.role = 'admin' THEN 0 ELSE 1 END, s.id");
+    // v6.16 (Leroy): nobody but an Admin may see the admin or commissions
+    // roles, or who holds them. For every other viewer those two roles are
+    // stripped from this payload (stored assignments are untouched), and a
+    // person whose only visible trace was a hidden role shows their next
+    // visible role instead.
+    if (req.user.activeRole !== 'admin') {
+      const hiddenRoles = { admin: true, commissions: true };
+      r.rows.forEach(function (row) {
+        row.roles = (row.roles || []).filter(function (x) { return !hiddenRoles[x]; });
+        if (hiddenRoles[row.role]) row.role = row.roles[0] || 'steward';
+      });
+    }
     res.json(r.rows);
   } catch (error) {
     console.error('Admin stewards error:', error);
@@ -3320,7 +3359,7 @@ app.post('/api/admin/set-roles', requireAdmin, async (req, res) => {
   try {
     const steward_id = req.body && req.body.steward_id;
     const roles = req.body && req.body.roles;
-    const allowed = ['admin', 'steward', 'top_dog', 'onboarding', 'client', 'service'];
+    const allowed = ['admin', 'steward', 'top_dog', 'onboarding', 'client', 'service', 'commissions'];
     if (!steward_id || !Array.isArray(roles) || roles.length === 0) {
       return res.status(400).json({ error: 'steward_id and a non-empty roles array are required' });
     }
@@ -4139,7 +4178,7 @@ app.post('/api/admin/import-commissions', requireAdmin, async (req, res) => {
 });
 
 // Commissions page data: one entry per company with its stewards and percentages.
-app.get('/api/admin/commissions-by-company', requireCompaniesAccess, async (req, res) => {
+app.get('/api/admin/commissions-by-company', requireCommissionsPageViewer, async (req, res) => {
   try {
     const r = await getPool().query(
       'SELECT co.company_code, co.company_name, co.ein, co.company_status, c.steward_code, c.pct, ' +

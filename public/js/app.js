@@ -47,6 +47,7 @@ function roleLabel(r) {
   if (r === 'onboarding') return 'Onboarding';
   if (r === 'service') return 'Service';
   if (r === 'client') return 'Client';
+  if (r === 'commissions') return 'Commissions';
   return 'Steward';
 }
 
@@ -209,6 +210,9 @@ function activeRole() {
 // steward: Dashboard, Companies, Billing, Implementation, Tickets
 // service: Tickets, Companies, Implementation, Billing (assigned companies only)
 // client: Tickets (own company only), Billing (own company only)
+// commissions (v6.16): Commissions + Referral Fees + Billing only, all accounts, view only.
+//   The role is assigned by Admin only, and nobody but Admin sees the admin or
+//   commissions roles or who holds them (server strips them from role lists).
 // Billing (v6.1, Leroy): every role; scoped roles see only their assigned companies (server-enforced)
 function navLinks() {
   var role = activeRole();
@@ -221,7 +225,9 @@ function navLinks() {
   if (role === 'service') {
     links.push(['#/clients', 'Companies']);
   }
-  links.push(['#/implementations', 'Implementation']);
+  if (role !== 'commissions') {
+    links.push(['#/implementations', 'Implementation']);
+  }
   if (role === 'admin') {
     links.push(['#/tickets', 'Tickets']);
   }
@@ -236,7 +242,14 @@ function navLinks() {
   }
   if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/admin/companies', 'Companies']);
+  }
+  if (role === 'admin' || role === 'top_dog' || role === 'onboarding' || role === 'commissions') {
     links.push(['#/admin/commissions', 'Commissions']);
+  }
+  if (role === 'admin' || role === 'commissions') {
+    links.push(['#/referral-fees', 'Referral Fees']);
+  }
+  if (role === 'admin' || role === 'top_dog' || role === 'onboarding') {
     links.push(['#/parent-page', 'Parent']);
   }
   if (role === 'admin' || role === 'top_dog') {
@@ -537,6 +550,7 @@ function requireUser(next) {
 function viewDashboard() {
   requireUser(function () {
     if (activeRole() === 'onboarding') { location.hash = '#/onboarding'; return; }
+    if (activeRole() === 'commissions') { location.hash = '#/admin/commissions'; return; }
     api.get('/api/dashboard').then(function (d) {
       return api.get('/api/accountability').then(function (a) { return { d: d, a: a }; });
     }).then(function (both) {
@@ -1106,7 +1120,7 @@ function viewAdminStewards() {
     var canEdit = ar === 'admin' || ar === 'onboarding';
     var canDocs = canEdit; // W9/ACH columns: admin + onboarding only; top_dog never sees them
     var docStatus = {};
-    var ROLE_OPTS = ['admin', 'top_dog', 'onboarding', 'steward'];
+    var ROLE_OPTS = ['admin', 'top_dog', 'onboarding', 'steward', 'commissions'];
     var editId = null;
     var adding = false;
     var nextId = null;
@@ -1319,10 +1333,25 @@ function viewAdminStewards() {
 }
 
 // ---------------------------------------------------------------- admin: commissions (cards per company)
+// ---------------------------------------------------------------- referral fees (v6.16, Leroy)
+// Blank placeholder page for now: referral fee tracking is built here with
+// the commission calculation and statement generation process.
+// Visible to Admin and the Commissions role only.
+function viewReferralFees() {
+  requireUser(function () {
+    var ar = activeRole();
+    if (ar !== 'admin' && ar !== 'commissions') { location.hash = '#/dashboard'; return; }
+    render(shell(
+      '<h2>Referral Fees</h2>' +
+      '<div class="card"><p class="muted">This page is intentionally blank for now. Referral Fees will be built here as part of the commission calculation and statement generation process.</p></div>',
+      '#/referral-fees'));
+  });
+}
+
 function viewAdminCommissions() {
   requireUser(function () {
     var ar = activeRole();
-    if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding') { location.hash = '#/dashboard'; return; }
+    if (ar !== 'admin' && ar !== 'top_dog' && ar !== 'onboarding' && ar !== 'commissions') { location.hash = '#/dashboard'; return; }
     var canEdit = ar === 'admin' || ar === 'onboarding';
     var isAdmin = ar === 'admin';
     var SLOTS = 7;
@@ -3409,7 +3438,7 @@ function viewAdminJobs() {
         '<button class="btn btn-primary" type="submit">Save</button></form><div id="es-pwmsg"></div></div>' +
         '<div class="card"><div class="card-title">Set roles</div>' +
         '<form id="es-rolef" class="form-inline">' +
-        chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' + chk('service') + ' ' + chk('client') + ' ' +
+        chk('steward') + ' ' + chk('top_dog') + ' ' + chk('onboarding') + ' ' + chk('admin') + ' ' + chk('service') + ' ' + chk('client') + ' ' + chk('commissions') + ' ' +
         '<button class="btn btn-primary" type="submit">Save roles</button></form><div id="es-rolemsg"></div></div>' +
         '<div class="card"><div class="card-title">Renumber</div>' +
         '<p class="muted">Changes the Steward ID everywhere it is used. If this is your own account, sign out and back in afterwards.</p>' +
@@ -4111,6 +4140,7 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'commissions') return viewAdminCommissions();
   if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
   if (pathParts[0] === 'parent-page') return viewParentPage();
+  if (pathParts[0] === 'referral-fees') return viewReferralFees();
   if (pathParts[0] === 'tickets') {
     if (pathParts[1] === 'new') return viewNewTicket();
     if (pathParts[1]) return viewTicketDetail(pathParts[1]);
