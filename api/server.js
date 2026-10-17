@@ -4750,7 +4750,7 @@ app.post('/api/admin/probe-rf-delete', async (req, res) => {
     const per2 = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE DELETE TEST 2') RETURNING id");
     try {
       await db.query(
-        "INSERT INTO referral_fee_lines (period_id, source, company_code, modal_date, admin_fee, enrolled) VALUES ($1, 'F', 'TESTX', '2026-01-05', 1, 1)",
+        "INSERT INTO referral_fee_lines (period_id, source, company_code, modal_date, statement_date, admin_fee, enrolled) VALUES ($1, 'F', 'TESTX', '2026-01-05', '2026-02-01', 1, 1)",
         [per2.rows[0].id]);
       reinsert = 'ok';
     } catch (e) { reinsert = 'blocked: ' + e.message; }
