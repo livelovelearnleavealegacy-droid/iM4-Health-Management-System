@@ -5254,42 +5254,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP W9 load probe (remove after verification): applies the W9
-// extraction values (company name, address, payee, tax id) to steward
-// records for the September-matched stewards, and reads them back
-// masked for verification.
-app.post('/api/admin/probe-w9load', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    if (req.query.mode === 'verify') {
-      const ids = String(req.query.ids || '').split(',').map(function (x) { return parseInt(x, 10); }).filter(Boolean);
-      const r = await db.query(
-        "SELECT id, steward_company_name, address, city, state, zip, payee, " +
-        "CASE WHEN tax_id IS NULL THEN NULL ELSE '...' || RIGHT(tax_id, 4) END AS tax_masked " +
-        'FROM stewards WHERE id = ANY($1) ORDER BY id', [ids]);
-      return res.json(r.rows);
-    }
-    const items = (req.body && req.body.items) || [];
-    let updated = 0;
-    for (const it of items) {
-      if (it.payee && it.tax_id) {
-        await db.query(
-          'UPDATE stewards SET steward_company_name = $1, address = $2, city = $3, state = $4, zip = $5, payee = $6, tax_id = $7 WHERE id = $8',
-          [it.company_name || null, it.address || null, it.city || null, it.state || null, it.zip || null, it.payee, String(it.tax_id).replace(/\D/g, ''), it.steward_id]);
-      } else {
-        await db.query(
-          'UPDATE stewards SET steward_company_name = $1, address = $2, city = $3, state = $4, zip = $5 WHERE id = $6',
-          [it.company_name || null, it.address || null, it.city || null, it.state || null, it.zip || null, it.steward_id]);
-      }
-      updated++;
-    }
-    res.json({ updated: updated });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
