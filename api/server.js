@@ -5303,9 +5303,8 @@ app.post('/api/admin/probe-octstatus', async (req, res) => {
     const topStewards = await db.query(
       'SELECT steward_id, steward_name, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending GROUP BY steward_id, steward_name ORDER BY fees DESC LIMIT 8');
     if (req.query.mode === 'mint') {
-      const u = await db.query("SELECT * FROM stewards WHERE id = 100000");
-      const roles = await getUserRoles(db, 100000);
-      const token = signToken({ id: 100000, roles: roles, activeRole: 'admin' });
+      const rr = await db.query('SELECT role FROM user_roles WHERE steward_id = 100000 ORDER BY role');
+      const token = signToken({ id: 100000, roles: rr.rows.map(function (x) { return x.role; }), activeRole: 'admin' });
       const adj = await db.query('SELECT period_id, amount FROM referral_fee_adjustments');
       const adm = await db.query('SELECT period_id, COALESCE(SUM(admin_fee), 0) AS admin_total FROM referral_fee_lines GROUP BY period_id');
       return res.json({ token: token, adjustments: adj.rows, admin_totals: adm.rows });
