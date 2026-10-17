@@ -1576,6 +1576,35 @@ function viewMyStatements() {
 // statements that have not changed and replaces ones that have.
 // Visible to Admin and the Commissions role; Top Dog can also view, and
 // statements can be downloaded by Admin and Top Dog only.
+// Shared renderer for the Jobs-page billing import results (v6.26):
+// both the FTJ and Soluta imports also derive pending commissions,
+// and the server returns the derivation summary on the import result.
+function referralSummaryHtml(imp) {
+  if (imp.referral_error) return errorHtml('Bills imported, but the pending-commission update failed: ' + imp.referral_error);
+  var r = imp.referral;
+  if (!r) return '';
+  var html = '';
+  if (!r.periods || !r.periods.length) {
+    html = '<p style="margin-top:8px;"><b>Pending commissions:</b> nothing new calculated.</p>';
+  } else {
+    html = '<p style="margin-top:8px;"><b>Pending commissions updated:</b> ' + r.periods.map(function (p) {
+      var bits = [];
+      if (p.lines_created) bits.push(p.lines_created + ' calculated');
+      if (p.lines_updated) bits.push(p.lines_updated + ' refreshed');
+      if (p.duplicates_ignored) bits.push(p.duplicates_ignored + ' already calculated');
+      if (p.swept) bits.push(p.swept + ' removed (bill gone)');
+      bits.push(p.rows_created + ' pending rows');
+      return esc(p.label) + ' - ' + bits.join(', ');
+    }).join('; ') + '.</p>';
+  }
+  if (r.skipped && r.skipped.length) {
+    html += '<p style="color:#b3261e;">Skipped ' + r.skipped.length + ':</p>' + r.skipped.slice(0, 25).map(function (sk) {
+      return '<div>&bull; ' + esc(sk.company_code) + ' ' + esc(String(sk.modal_date).slice(0, 10)) + ' - ' + esc(sk.reason) + '</div>';
+    }).join('') + (r.skipped.length > 25 ? '<div class="muted">...and ' + (r.skipped.length - 25) + ' more.</div>' : '');
+  }
+  return html;
+}
+
 function viewReferralFees() {
   requireUser(function () {
     var ar = activeRole();
@@ -1605,10 +1634,10 @@ function viewReferralFees() {
         var now = new Date();
         var defLabel = now.toLocaleString('en-US', { month: 'long' }) + ' ' + now.getFullYear();
         startBuild =
-          '<div class="card"><div class="card-title">Start a referral fee build</div>' +
-          '<p class="muted">Opens a new period tab below. Load the FTJ file (and later the Soluta file) into it from the Jobs page; when both sources are in, the period gets locked and statements generated.</p>' +
+          '<div class="card"><div class="card-title">Periods</div>' +
+          '<p class="muted">Periods open on their own when FTJ or Soluta payments are uploaded on the Jobs page - each payroll lands in the period of its applied month, and a period opens automatically for the current or previous month. Open one by hand only for a special case.</p>' +
           '<label>Period label <input id="rf-label" type="text" value="' + esc(defLabel) + '" style="min-width:200px;"></label> ' +
-          '<button class="btn btn-primary" id="rf-create">Start build</button><div id="rf-create-out"></div></div>';
+          '<button class="btn btn-primary" id="rf-create">Open period</button><div id="rf-create-out"></div></div>';
       }
       var flashHtml = flash ? okHtml(flash) : '';
       flash = '';
@@ -1669,7 +1698,7 @@ function viewReferralFees() {
             '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(d.totals.total_admin_fees) + '</b> &nbsp; Total Referral Fees: <b>' + money(d.totals.net_referral_fees) + '</b>' +
             ' &nbsp; <span class="muted">' + d.rows.length + ' pending rows</span></p>';
         } else {
-          html += '<p class="muted">No pending commissions right now. Load a source file from the Jobs page (Referral Fee import card) into an open period.</p>';
+          html += '<p class="muted">No pending commissions right now. Pending commissions arrive automatically when FTJ or Soluta payments are uploaded on the Jobs page.</p>';
         }
         html += '</div>';
         box.innerHTML = html;
@@ -1709,8 +1738,8 @@ function viewReferralFees() {
           html += '<p class="muted">No files loaded into this period yet.</p>';
         }
         if (isAdmin && p.status === 'open') {
-          html += '<p style="margin-top:10px;"><label>FTJ file (Premium Applied Report) <input type="file" id="rf-file" accept=".xlsx,.xls"></label> ' +
-            '<button class="btn btn-primary" id="rf-load">Upload &amp; calculate</button></p><div id="rf-load-out"></div>';
+          html += '<p style="margin-top:10px;"><button class="btn btn-small" id="rf-lock">Lock this period</button> ' +
+            '<span class="muted">Once the month\'s statements are closed out, lock the period: uploads stop calculating into it and its statements become the permanent record.</span></p>';
         }
         if (isAdmin) {
           html += '<p style="margin-top:10px;"><button class="btn btn-small btn-danger" id="rf-delete">Delete this entire period</button> ' +
@@ -1739,7 +1768,7 @@ function viewReferralFees() {
             (d.adjustment ? ' <span class="muted">(rows ' + money(d.totals.total_referral_fees) + ' + rounding adjustment ' + money(d.adjustment.amount) + ' to ' + esc(d.adjustment.steward_name || 'RLJAT') + ')</span>' : '') +
             ' &nbsp; <span class="muted">' + d.rows.length + ' pending rows</span></p></div>';
         } else {
-          html += '<div class="card"><div class="card-title">Pending Commissions</div><p class="muted">Nothing calculated yet. Load a source file from the Jobs page (Referral Fee import card) or above.</p></div>';
+          html += '<div class="card"><div class="card-title">Pending Commissions</div><p class="muted">Nothing calculated yet. Pending commissions arrive automatically when FTJ or Soluta payments are uploaded on the Jobs page.</p></div>';
         }
         html += '<div class="card"><div class="card-title">Statements</div>' +
           '<p class="muted">One statement per payee, filled from the &quot;iM4 Health Statement Template&quot; in Forms. Generating again skips statements that have not changed and replaces ones that have.</p>' +
@@ -1772,20 +1801,13 @@ function viewReferralFees() {
             loadPeriods();
           }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
         };
-        var lb = document.getElementById('rf-load');
-        if (lb) lb.onclick = function () {
-          var fi = document.getElementById('rf-file');
-          var out = document.getElementById('rf-load-out');
-          if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
-          var fd = new FormData();
-          fd.append('file', fi.files[0]);
-          fd.append('period_id', selectedId);
-          fd.append('source', 'F');
-          out.innerHTML = '<p class="muted">Calculating referral fees...</p>';
-          uploadFile('/api/admin/referral-fees/import', fd).then(function (r) {
-            out.innerHTML = okHtml('Done: ' + r.lines_created + ' calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created' + (r.skipped && r.skipped.length ? ', ' + r.skipped.length + ' skipped (see the file list above).' : '.') + (r.adjustment ? ' Rounding adjustment to ' + esc(r.adjustment.steward_name || 'RLJAT') + ': ' + money(r.adjustment.amount) + '.' : ''));
+        var lockBtn = document.getElementById('rf-lock');
+        if (lockBtn) lockBtn.onclick = function () {
+          if (!confirm('Lock the period "' + p.label + '"?' + NL + NL + 'Its statements become the permanent record: uploads will no longer calculate into it and statements cannot be regenerated. This cannot be undone.')) return;
+          api.post('/api/admin/referral-fees/periods/' + selectedId + '/lock', {}).then(function () {
+            flash = 'Period "' + p.label + '" is locked.';
             loadPeriods();
-          }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
+          }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { box.innerHTML = errorHtml(err.message); });
     }
@@ -3161,20 +3183,15 @@ function viewAdminJobs() {
       '<select id="editstewardsel" style="max-width: 100%;"><option value="">Loading...</option></select>' +
       '<div id="editstewardbox" style="margin-top:8px;"></div><div id="editstewardmsg"></div></div>' +
       '<div class="card"><div class="card-title">FTJ billing (F): Premium Applied Report</div>' +
-      '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report.</p>' +
+      '<p class="muted">Upload the Premium Applied Report spreadsheet. It re-derives every paid F bill from the report: preview the bills first, then import to add new, update changed, and delete bills missing from the report. Importing also derives pending commissions from the same file - each payroll lands in the period of its applied month.</p>' +
       '<input type="file" id="ftjfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="ftjpreview">Upload &amp; preview</button><div id="ftjout"></div>' +
       '<hr><p class="muted"><b>Unpaid estimates — retired.</b> The Billing page now reports only bills imported into the system, so estimates are no longer created or shown. Any estimates already in the system can be removed with Delete all estimates.</p>' +
       '<label>Only accounts paid within the last <input id="ftjestdays" type="number" value="90" min="1" max="3650" style="width: 70px;"> days</label> ' +
       '<button class="btn btn-primary" id="ftjest">Preview estimates</button> ' +
       '<button class="btn btn-small" id="ftjestclear">Delete all estimates</button><div id="ftjestout"></div></div>' +
-      '<div class="card"><div class="card-title">Referral Fee import (FTJ)</div>' +
-      '<p class="muted">Upload a Premium Applied Report to calculate referral fees (commissions) into a Referral Fees period. Only the Admin Fees are used: one pending row per company, payroll date, and steward, split by the commission percentages on file. A company payroll date that has already been calculated is ignored. Periods are started on the Referral Fees page.</p>' +
-      '<label>Period <select id="rfperiod"></select></label> ' +
-      '<input type="file" id="rffile" accept=".xlsx,.xls"> ' +
-      '<button class="btn btn-primary" id="rfimport">Upload &amp; calculate</button><div id="rfout"></div></div>' +
       '<div class="card"><div class="card-title">Soluta billing (S): Soluta report</div>' +
-      '<p class="muted">Upload the Soluta iM4H Invoice Report spreadsheet. It contains both paid and pending S bills \u2014 no estimating. Preview the bills first, then import to add new, update changed, and delete S bills missing from the report.</p>' +
+      '<p class="muted">Upload the Soluta iM4H Invoice Report spreadsheet. It contains both paid and pending S bills \u2014 no estimating. Preview the bills first, then import to add new, update changed, and delete S bills missing from the report. Importing also derives pending commissions from the paid bills.</p>' +
       '<input type="file" id="solfile" accept=".xlsx,.xls,.csv"> ' +
       '<button class="btn btn-primary" id="solpreview">Upload &amp; preview</button> ' +
       '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
@@ -3472,48 +3489,11 @@ function viewAdminJobs() {
           var iout = document.getElementById('ftjimportout');
           iout.innerHTML = '<p class="muted">Importing...</p>';
           api.post('/api/admin/jobs/ftj-import', { preview_token: r.preview_token }).then(function (imp) {
-            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
+            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).') + referralSummaryHtml(imp);
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
     };
-    // Referral Fee import card (v6.17): fill the period list, then upload
-    // + validate + calculate into the chosen open period.
-    (function () {
-      var sel = document.getElementById('rfperiod');
-      if (!sel) return;
-      api.get('/api/referral-fees/periods').then(function (list) {
-        var open = (list || []).filter(function (p) { return p.status === 'open'; });
-        if (!open.length) {
-          sel.innerHTML = '<option value="">No open period - start a build on the Referral Fees page</option>';
-          return;
-        }
-        sel.innerHTML = open.map(function (p) {
-          return '<option value="' + p.id + '">' + esc(p.label) + '</option>';
-        }).join('');
-      }).catch(function () { sel.innerHTML = '<option value="">Could not load periods</option>'; });
-      document.getElementById('rfimport').onclick = function () {
-        var out = document.getElementById('rfout');
-        var fi = document.getElementById('rffile');
-        var pid = sel.value;
-        if (!pid) { out.innerHTML = errorHtml('Start a referral fee build on the Referral Fees page first.'); return; }
-        if (!fi.files.length) { out.innerHTML = errorHtml('Choose a spreadsheet first.'); return; }
-        var fd = new FormData();
-        fd.append('file', fi.files[0]);
-        fd.append('period_id', pid);
-        fd.append('source', 'F');
-        out.innerHTML = '<p class="muted">Calculating referral fees - this can take a moment on a large report...</p>';
-        uploadFile('/api/admin/referral-fees/import', fd).then(function (r) {
-          var html = okHtml('Done: ' + r.lines_created + ' payroll dates calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created. See them on the Referral Fees page.' + (r.adjustment ? ' Rounding adjustment to ' + esc(r.adjustment.steward_name || 'RLJAT') + ': ' + fmtMoney(r.adjustment.amount) + '.' : ''));
-          if (r.skipped && r.skipped.length) {
-            html += '<p style="color:#b3261e;">Skipped ' + r.skipped.length + ':</p>' + r.skipped.map(function (sk) {
-              return '<div>&bull; ' + esc(sk.company_code) + ' ' + esc(String(sk.modal_date).slice(0, 10)) + ' - ' + esc(sk.reason) + '</div>';
-            }).join('');
-          }
-          out.innerHTML = html;
-        }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
-      };
-    })();
     document.getElementById('ftjest').onclick = function () {
       var out = document.getElementById('ftjestout');
       var days = parseInt(document.getElementById('ftjestdays').value, 10) || 90;
@@ -3616,7 +3596,7 @@ function viewAdminJobs() {
           var iout = document.getElementById('solimportout');
           iout.innerHTML = '<p class="muted">Importing...</p>';
           api.post('/api/admin/jobs/sol-import', { preview_token: r.preview_token }).then(function (imp) {
-            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).');
+            iout.innerHTML = okHtml('Done: ' + imp.added + ' added, ' + imp.updated + ' updated, ' + imp.deleted + ' deleted (' + imp.total + ' in report).') + referralSummaryHtml(imp);
           }).catch(function (err) { iout.innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { out.innerHTML = errorHtml(err.message); });

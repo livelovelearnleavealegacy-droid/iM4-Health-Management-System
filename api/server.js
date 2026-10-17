@@ -2388,7 +2388,13 @@ app.post('/api/admin/jobs/ftj-import', requireAdmin, async (req, res) => {
       }
     }
     ftjPreviewCache.delete(previewToken);
-    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
+    // v6.26 (Leroy): the same upload also derives pending commissions -
+    // no separate referral upload. A derivation failure never fails
+    // the billing import; it is reported alongside.
+    let referral = null, referralError = null;
+    try { referral = await deriveReferralFromF(db, bills, cached.fileName, req.user.id); }
+    catch (e) { console.error('Referral derivation (F) error:', e); referralError = e.message || 'Referral derivation failed'; }
+    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length, referral: referral, referral_error: referralError });
   } catch (error) { console.error('FTJ import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
@@ -3072,7 +3078,12 @@ app.post('/api/admin/jobs/sol-import', requireAdmin, async (req, res) => {
       }
     }
     solPreviewCache.delete(previewToken);
-    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length });
+    // v6.26 (Leroy): the same upload also derives pending commissions
+    // from the paid S bills now on file.
+    let referral = null, referralError = null;
+    try { referral = await deriveReferralFromS(db, cached.fileName, req.user.id); }
+    catch (e) { console.error('Referral derivation (S) error:', e); referralError = e.message || 'Referral derivation failed'; }
+    res.json({ ok: true, added: added, updated: updated, deleted: deleted, total: bills.length, referral: referral, referral_error: referralError });
   } catch (error) { console.error('Soluta import error:', error); res.status(500).json({ error: error.message || 'Internal server error' }); }
 });
 
@@ -4621,11 +4632,55 @@ async function refreshReferralAdjustment(db, periodId) {
 // A (source, company, modal date) that has already been calculated - in
 // ANY period - is ignored. Groups that cannot be calculated are reported
 // in `skipped` with the reason (never silently dropped).
-async function runReferralImportF(db, buffer, fileName, periodId, userId) {
-  const bills = parsePremiumApplied(buffer);
-  const per = await db.query('SELECT * FROM referral_fee_periods WHERE id = $1', [periodId]);
-  if (!per.rows.length) throw new Error('Referral fee period not found.');
-  if (per.rows[0].status !== 'open') throw new Error('That referral fee period is locked.');
+// ------------------------------------------------------------------
+// Referral derivation (v6.26, Leroy): pending commissions are DERIVED
+// from the same FTJ / Soluta payment uploads that feed Billing - there
+// is no separate referral upload. Each calculated payroll is routed
+// to the period of its APPLIED month (the statement date is the 1st
+// of the month after). A period is found by its 'Month YYYY' label; a
+// missing period is opened automatically only for the current or the
+// previous month (the close-out window) - older months stay history,
+// because their as-sent statements are the record. Locked periods are
+// never written to. Both derivations share the calc context (companies
+// with their Admin Fee rates, commission splits, steward names), the
+// exact integer-cent fee math, one import record per touched period,
+// and a rounding-adjustment refresh per touched period.
+const REFERRAL_MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+function referralMonthKey(iso) { return iso ? String(iso).slice(0, 7) : null; }
+function referralPeriodLabelFor(iso) {
+  return REFERRAL_MONTH_NAMES[parseInt(iso.slice(5, 7), 10) - 1] + ' ' + iso.slice(0, 4);
+}
+function referralMonthWindow() {
+  const now = new Date();
+  const cur = now.getUTCFullYear() + '-' + ('0' + (now.getUTCMonth() + 1)).slice(-2);
+  const pd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  const prev = pd.getUTCFullYear() + '-' + ('0' + (pd.getUTCMonth() + 1)).slice(-2);
+  return { current: cur, previous: prev };
+}
+async function resolveReferralPeriod(db, appliedISO, userId, cache) {
+  const key = referralMonthKey(appliedISO);
+  if (!key) return { skip: 'No applied date - cannot place the period' };
+  if (cache.has(key)) return cache.get(key);
+  const label = referralPeriodLabelFor(appliedISO);
+  let out;
+  const found = await db.query('SELECT id, status FROM referral_fee_periods WHERE label = $1', [label]);
+  if (found.rows.length) {
+    out = found.rows[0].status === 'open'
+      ? { periodId: found.rows[0].id, label: label }
+      : { skip: 'The ' + label + ' period is locked' };
+  } else {
+    const win = referralMonthWindow();
+    if (key === win.current || key === win.previous) {
+      const ins = await db.query("INSERT INTO referral_fee_periods (label, status, created_by) VALUES ($1, 'open', $2) RETURNING id", [label, userId || null]);
+      out = { periodId: ins.rows[0].id, label: label, created: true };
+    } else {
+      out = { skip: 'No open period for ' + label + ' - that month is closed history' };
+    }
+  }
+  cache.set(key, out);
+  return out;
+}
+async function referralCalcContext(db) {
   const compR = await db.query('SELECT company_code, company_name, admin_fee FROM companies');
   const compMap = {};
   compR.rows.forEach(function (c) { compMap[c.company_code] = c; });
@@ -4637,69 +4692,210 @@ async function runReferralImportF(db, buffer, fileName, periodId, userId) {
   });
   const stR = await db.query('SELECT id, first_name, last_name, name FROM stewards');
   const stName = {};
-  stR.rows.forEach(function (s) {
-    stName[s.id] = displayName(s) || ('Steward ' + s.id);
-  });
-  const imp = await db.query(
-    'INSERT INTO referral_fee_imports (period_id, source, file_name, imported_by, groups_seen) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-    [periodId, 'F', fileName || null, userId || null, bills.length]);
-  const importId = imp.rows[0].id;
-  let linesCreated = 0;
-  let duplicates = 0;
-  let rowsCreated = 0;
+  stR.rows.forEach(function (s) { stName[s.id] = displayName(s) || ('Steward ' + s.id); });
+  return { compMap: compMap, splitMap: splitMap, stName: stName };
+}
+function referralFeeFor(adminFee, pct) {
+  const adminCents = Math.round(adminFee * 100);
+  const pctMilli = Math.round(Number(pct) * 1000);
+  return Math.floor((adminCents * pctMilli + 50000) / 100000) / 100;
+}
+async function insertReferralPending(db, lineId, periodId, companyCode, adminFee, splits, stName) {
+  let rows = 0;
+  for (const s of splits) {
+    await db.query(
+      'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [lineId, periodId, companyCode, s.steward_code, stName[s.steward_code] || ('Steward ' + s.steward_code), s.pct, referralFeeFor(adminFee, s.pct)]);
+    rows++;
+  }
+  return rows;
+}
+function referralBucketFactory(db, source, fileName, userId, perPeriod) {
+  return async function bucket(periodId, label) {
+    if (!perPeriod[periodId]) {
+      const imp = await db.query(
+        'INSERT INTO referral_fee_imports (period_id, source, file_name, imported_by, groups_seen) VALUES ($1, $2, $3, $4, 0) RETURNING id',
+        [periodId, source, fileName || null, userId || null]);
+      perPeriod[periodId] = { period_id: periodId, label: label, import_id: imp.rows[0].id, groups_seen: 0, lines_created: 0, lines_updated: 0, duplicates_ignored: 0, rows_created: 0, swept: 0, skipped: [] };
+    }
+    return perPeriod[periodId];
+  };
+}
+async function finishReferralBuckets(db, perPeriod) {
+  const out = [];
+  for (const k of Object.keys(perPeriod)) {
+    const b = perPeriod[k];
+    await db.query('UPDATE referral_fee_imports SET groups_seen = $1, lines_created = $2, duplicates_ignored = $3, rows_created = $4, skipped = $5 WHERE id = $6',
+      [b.groups_seen, b.lines_created, b.duplicates_ignored, b.rows_created, JSON.stringify(b.skipped), b.import_id]);
+    const adjustment = await refreshReferralAdjustment(db, b.period_id);
+    out.push({ period_id: b.period_id, label: b.label, lines_created: b.lines_created, lines_updated: b.lines_updated, duplicates_ignored: b.duplicates_ignored, rows_created: b.rows_created, swept: b.swept, adjustment: adjustment ? adjustment.amount : null });
+  }
+  return out;
+}
+function splitTotalNote(splits) {
+  let t = 0;
+  splits.forEach(function (s) { t += Number(s.pct); });
+  return Math.abs(t - 100) > 0.001 ? t : null;
+}
+
+// FTJ derivation: the parsed Premium Applied groups (the same bills
+// the Billing import just reconciled). Admin fees come from the
+// file's ADMIN product rows; enrolled uses the company's Admin Fee
+// rate; a (company, payroll date) already calculated - in any period -
+// is ignored as a duplicate, exactly as before.
+async function deriveReferralFromF(db, bills, fileName, userId) {
+  const ctx = await referralCalcContext(db);
+  const cache = new Map();
+  const perPeriod = {};
+  const bucket = referralBucketFactory(db, 'F', fileName, userId, perPeriod);
   const skipped = [];
   for (const b of bills) {
     if (!(b.admin_fees > 0)) {
       skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Admin Fees total $0.00 in this file - nothing to calculate' });
       continue;
     }
-    const company = compMap[b.company_code];
+    const company = ctx.compMap[b.company_code];
     if (!company) {
       skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Company code is not on the Companies table' });
       continue;
     }
-    const splits = splitMap[b.company_code] || [];
+    const splits = ctx.splitMap[b.company_code] || [];
     if (!splits.length) {
       skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'No commission split on file for this company' });
       continue;
     }
+    const applied = b.paid_date || b.payroll_date;
+    const res = await resolveReferralPeriod(db, applied, userId, cache);
+    if (res.skip) {
+      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: res.skip });
+      continue;
+    }
+    const bk = await bucket(res.periodId, res.label);
+    bk.groups_seen++;
     const enrolledCalc = referralEnrolled(b.admin_fees, b.bill_mode, company.admin_fee);
     const enrolled = enrolledCalc === null ? (b.lives_count || 0) : enrolledCalc;
-    const stmt = statementDateFor(b.paid_date);
     const ins = await db.query(
       'INSERT INTO referral_fee_lines (period_id, import_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) ' +
       'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (source, company_code, modal_date) DO NOTHING RETURNING id',
-      [periodId, importId, 'F', b.company_code, company.company_name, b.payroll_date, b.paid_date, stmt, b.bill_mode, b.admin_fees, enrolled]);
-    if (!ins.rows.length) { duplicates++; continue; }
-    const lineId = ins.rows[0].id;
-    linesCreated++;
-    let splitTotal = 0;
-    const adminCents = Math.round(b.admin_fees * 100);
-    for (const s of splits) {
-      splitTotal += Number(s.pct);
-      // Exact decimal money math in integers: a float product like
-      // 276.90 * 25 lands a hair under the true half-cent and rounds a
-      // cent low, so the fee is computed as integer cents x pct-thousandths.
-      const pctMilli = Math.round(Number(s.pct) * 1000);
-      const fee = Math.floor((adminCents * pctMilli + 50000) / 100000) / 100;
-      await db.query(
-        'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [lineId, periodId, b.company_code, s.steward_code, stName[s.steward_code] || ('Steward ' + s.steward_code), s.pct, fee]);
-      rowsCreated++;
-    }
-    if (Math.abs(splitTotal - 100) > 0.001) {
-      skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Commission split on file totals ' + splitTotal + '% - the remaining ' + Math.round((100 - splitTotal) * 100) / 100 + '% has no steward and was not calculated' });
+      [res.periodId, bk.import_id, 'F', b.company_code, company.company_name, b.payroll_date, applied, statementDateFor(applied), b.bill_mode, b.admin_fees, enrolled]);
+    if (!ins.rows.length) { bk.duplicates_ignored++; continue; }
+    bk.lines_created++;
+    bk.rows_created += await insertReferralPending(db, ins.rows[0].id, res.periodId, b.company_code, b.admin_fees, splits, ctx.stName);
+    const badTotal = splitTotalNote(splits);
+    if (badTotal !== null) {
+      bk.skipped.push({ company_code: b.company_code, modal_date: b.payroll_date, reason: 'Commission split on file totals ' + badTotal + '% - the remaining ' + Math.round((100 - badTotal) * 100) / 100 + '% has no steward and was not calculated' });
     }
   }
-  await db.query(
-    'UPDATE referral_fee_imports SET lines_created = $1, duplicates_ignored = $2, rows_created = $3, skipped = $4 WHERE id = $5',
-    [linesCreated, duplicates, rowsCreated, JSON.stringify(skipped), importId]);
-  const adjustment = await refreshReferralAdjustment(db, periodId);
-  return {
-    import_id: importId, period_id: periodId, source: 'F', file_name: fileName || null,
-    groups_seen: bills.length, lines_created: linesCreated, duplicates_ignored: duplicates,
-    rows_created: rowsCreated, skipped: skipped, adjustment: adjustment
-  };
+  const periods = await finishReferralBuckets(db, perPeriod);
+  const allSkipped = skipped.slice();
+  Object.keys(perPeriod).forEach(function (k) { perPeriod[k].skipped.forEach(function (s) { allSkipped.push(s); }); });
+  return { source: 'F', groups_seen: bills.length, periods: periods, skipped: allSkipped };
+}
+
+// Soluta derivation: runs on the S invoices as reconciled in Billing.
+// Only PAID S bills calculate (paid and cleared, per Leroy), and the
+// admin fee is derived from the bill's Enrolled lives at the
+// company's Admin Fee rate for its pay frequency - the mirror of the
+// FTJ lives math. S lines are refreshed in place when a bill changes
+// (Soluta re-states its bills), and an S line in an open period whose
+// paid bill has vanished is swept away.
+function referralModeForSoluta(raw) {
+  if (!raw) return null;
+  const k = String(raw).trim().toUpperCase();
+  if (REFERRAL_FACTORS[k]) return k;
+  if (k.indexOf('SEMI') !== -1) return '3';
+  if (k.indexOf('BI') !== -1) return '2';
+  if (k.indexOf('WEEK') !== -1) return '1';
+  if (k.indexOf('MONTH') !== -1) return '4';
+  return null;
+}
+function referralAdminFromEnrolled(enrolled, billMode, monthlyRate) {
+  if (!REFERRAL_FACTORS[billMode]) return null;
+  const rate = Number(monthlyRate) > 0 ? Number(monthlyRate) : 40;
+  if (rate === 40) return Math.round(enrolled * REFERRAL_FACTORS[billMode] * 100) / 100;
+  return Math.round(enrolled * (rate * 12 / REFERRAL_PERIODS[billMode]) * 100) / 100;
+}
+function isoOf(v) { return v ? new Date(v).toISOString().slice(0, 10) : null; }
+async function deriveReferralFromS(db, fileName, userId) {
+  const ctx = await referralCalcContext(db);
+  const cache = new Map();
+  const perPeriod = {};
+  const bucket = referralBucketFactory(db, 'S', fileName, userId, perPeriod);
+  const skipped = [];
+  const paidRes = await db.query("SELECT * FROM invoices WHERE bill_type = 'S' AND status = 'paid'");
+  for (const inv of paidRes.rows) {
+    const modal = isoOf(inv.payroll_date);
+    const applied = isoOf(inv.paid_date) || modal;
+    const company = ctx.compMap[inv.company_code];
+    if (!company) {
+      skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'Company code is not on the Companies table' });
+      continue;
+    }
+    const splits = ctx.splitMap[inv.company_code] || [];
+    if (!splits.length) {
+      skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'No commission split on file for this company' });
+      continue;
+    }
+    const mode = referralModeForSoluta(inv.bill_mode);
+    if (!mode) {
+      skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'Soluta BillingMode "' + (inv.bill_mode || '') + '" is not a recognized pay frequency' });
+      continue;
+    }
+    const lives = inv.lives_count === null || inv.lives_count === undefined ? null : Number(inv.lives_count);
+    if (!lives || lives <= 0) {
+      skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'No Enrolled lives on the Soluta bill - cannot derive its Admin Fee' });
+      continue;
+    }
+    const admin = referralAdminFromEnrolled(lives, mode, company.admin_fee);
+    const res = await resolveReferralPeriod(db, applied, userId, cache);
+    if (res.skip) {
+      skipped.push({ company_code: inv.company_code, modal_date: modal, reason: res.skip });
+      continue;
+    }
+    const bk = await bucket(res.periodId, res.label);
+    bk.groups_seen++;
+    const existing = await db.query('SELECT id, period_id FROM referral_fee_lines WHERE source = $1 AND company_code = $2 AND modal_date = $3', ['S', inv.company_code, modal]);
+    if (existing.rows.length) {
+      const lineId = existing.rows[0].id;
+      const linePeriod = await db.query('SELECT status FROM referral_fee_periods WHERE id = $1', [existing.rows[0].period_id]);
+      if (linePeriod.rows.length && linePeriod.rows[0].status !== 'open') {
+        bk.skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'Already calculated in a locked period' });
+        continue;
+      }
+      await db.query('DELETE FROM referral_fee_pending WHERE line_id = $1', [lineId]);
+      await db.query('UPDATE referral_fee_lines SET period_id = $1, import_id = $2, applied_date = $3, statement_date = $4, bill_mode = $5, admin_fee = $6, enrolled = $7 WHERE id = $8',
+        [res.periodId, bk.import_id, applied, statementDateFor(applied), mode, admin, lives, lineId]);
+      bk.lines_updated++;
+      bk.rows_created += await insertReferralPending(db, lineId, res.periodId, inv.company_code, admin, splits, ctx.stName);
+    } else {
+      const ins = await db.query(
+        'INSERT INTO referral_fee_lines (period_id, import_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id',
+        [res.periodId, bk.import_id, 'S', inv.company_code, company.company_name, modal, applied, statementDateFor(applied), mode, admin, lives]);
+      bk.lines_created++;
+      bk.rows_created += await insertReferralPending(db, ins.rows[0].id, res.periodId, inv.company_code, admin, splits, ctx.stName);
+    }
+    const badTotal = splitTotalNote(splits);
+    if (badTotal !== null) {
+      bk.skipped.push({ company_code: inv.company_code, modal_date: modal, reason: 'Commission split on file totals ' + badTotal + '% - the remaining ' + Math.round((100 - badTotal) * 100) / 100 + '% has no steward and was not calculated' });
+    }
+  }
+  // Sweep: S lines in open periods whose paid S bill no longer exists.
+  const sweep = await db.query(
+    'SELECT l.id, l.period_id FROM referral_fee_lines l JOIN referral_fee_periods p ON p.id = l.period_id ' +
+    "WHERE l.source = 'S' AND p.status = 'open' AND NOT EXISTS (" +
+    "SELECT 1 FROM invoices i WHERE i.bill_type = 'S' AND i.status = 'paid' AND i.company_code = l.company_code AND i.payroll_date = l.modal_date)");
+  for (const row of sweep.rows) {
+    await db.query('DELETE FROM referral_fee_pending WHERE line_id = $1', [row.id]);
+    await db.query('DELETE FROM referral_fee_lines WHERE id = $1', [row.id]);
+    const lbl = await db.query('SELECT label FROM referral_fee_periods WHERE id = $1', [row.period_id]);
+    const bk = await bucket(row.period_id, lbl.rows.length ? lbl.rows[0].label : '');
+    bk.swept++;
+  }
+  const periods = await finishReferralBuckets(db, perPeriod);
+  const allSkipped = skipped.slice();
+  Object.keys(perPeriod).forEach(function (k) { perPeriod[k].skipped.forEach(function (s) { allSkipped.push(s); }); });
+  return { source: 'S', groups_seen: paidRes.rows.length, periods: periods, skipped: allSkipped };
 }
 
 // Periods list for the Referral Fees page: one tab per period, kept as history.
@@ -5293,19 +5489,20 @@ app.delete('/api/admin/referral-fees/statements/:sid', requireAdmin, async (req,
 });
 
 // Upload + validate + calculate a referral fee source file (Jobs page).
-// FTJ (F) is built; the Soluta (S) import arrives with its own build.
-app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), async (req, res) => {
+// Lock a referral period (v6.26, Leroy): the month's statements are
+// closed out and the period becomes the permanent record - imports
+// and generation stop, exactly like the as-sent backload periods.
+// One-way by design.
+app.post('/api/admin/referral-fees/periods/:id/lock', requireAdmin, async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const source = String((req.body && req.body.source) || 'F').toUpperCase();
-    const periodId = parseInt(req.body && req.body.period_id, 10);
-    if (!periodId) return res.status(400).json({ error: 'Choose a referral fee period first (start a build on the Referral Fees page).' });
-    if (source !== 'F') return res.status(400).json({ error: 'The Soluta (S) referral fee import is not built yet.' });
-    const result = await runReferralImportF(getPool(), req.file.buffer, req.file.originalname, periodId, req.user.id);
-    res.json(Object.assign({ success: true }, result));
+    const r = await getPool().query(
+      "UPDATE referral_fee_periods SET status = 'locked' WHERE id = $1 AND status = 'open' RETURNING *",
+      [req.params.id]);
+    if (!r.rows.length) return res.status(400).json({ error: 'Period not found, or already locked.' });
+    res.json(r.rows[0]);
   } catch (error) {
-    console.error('Referral import error:', error);
-    res.status(400).json({ error: error.message || 'Import failed' });
+    console.error('Referral period lock error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
