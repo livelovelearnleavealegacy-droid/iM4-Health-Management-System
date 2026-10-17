@@ -549,6 +549,15 @@ async function migrate() {
   await db.query('UPDATE referral_fee_statements s SET enrolled = ' +
     '(SELECT COALESCE(SUM(l.enrolled), 0) FROM referral_fee_pending pp JOIN referral_fee_lines l ON l.id = pp.line_id ' +
     'WHERE pp.period_id = s.period_id AND pp.steward_id = s.steward_id) WHERE s.enrolled IS NULL');
+  // v6.21: admin impersonation audit trail - every impersonation start
+  // is recorded with who impersonated whom and when.
+  await db.query('CREATE TABLE IF NOT EXISTS impersonation_log (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'admin_id INT NOT NULL, ' +
+    'admin_name TEXT, ' +
+    'target_id INT NOT NULL, ' +
+    'target_name TEXT, ' +
+    'started_at TIMESTAMPTZ DEFAULT NOW())');
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -774,6 +783,10 @@ async function requireAuth(req, res, next) {
       name: row.name, role: activeRole, roles: roles, activeRole: activeRole,
       two_factor_enabled: !!row.two_factor_enabled
     };
+    // v6.21: impersonation tokens carry the impersonating admin's id.
+    // Everything else about the request is the target user's, exactly
+    // as if they had signed in themselves.
+    if (payload.imp) req.user.impersonatorId = payload.imp;
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Session expired, please sign in again' });
@@ -1061,6 +1074,42 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ success: true, token: signToken(user, roles, activeRole), user: publicUser(user, roles, activeRole) });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin impersonation (v6.21, Leroy): an admin can become any user
+// without their password. The issued token is the target's own session
+// (their id, roles, and default active role - identical to their own
+// sign-in) plus an `imp` claim naming the admin, which requireAuth
+// surfaces as req.user.impersonatorId. Every start is audit-logged.
+// No nesting: an impersonating session cannot start another.
+app.post('/api/admin/impersonate/:userId', requireAdmin, async (req, res) => {
+  try {
+    if (req.user.impersonatorId) {
+      return res.status(400).json({ error: 'You are already impersonating. Stop impersonating before starting another.' });
+    }
+    const db = getPool();
+    const t = await db.query('SELECT * FROM stewards WHERE id = $1', [req.params.userId]);
+    if (!t.rows.length) return res.status(404).json({ error: 'User not found' });
+    const target = t.rows[0];
+    if (Number(target.id) === Number(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot impersonate yourself' });
+    }
+    const roles = await userRoles(db, target.id);
+    const activeRole = pickActiveRole(roles);
+    await db.query('INSERT INTO impersonation_log (admin_id, admin_name, target_id, target_name) VALUES ($1, $2, $3, $4)',
+      [req.user.id, displayName(req.user), target.id, displayName(target)]);
+    const token = jwt.sign(
+      { id: target.id, email: target.email, roles: roles, activeRole: activeRole, imp: req.user.id },
+      JWT_SECRET, { expiresIn: '12h' });
+    res.json({
+      success: true, token: token,
+      user: publicUser(target, roles, activeRole),
+      impersonator: { id: req.user.id, name: displayName(req.user) }
+    });
+  } catch (error) {
+    console.error('Impersonate error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -5171,6 +5220,34 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.21 probe (remove after verification): mint a real admin
+// token (and an already-impersonating admin variant) so the live
+// impersonation endpoint and guards can be exercised end-to-end, and
+// read back the audit log.
+app.post('/api/admin/probe-impersonate', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'log') {
+      const r = await db.query('SELECT admin_id, admin_name, target_id, target_name, started_at FROM impersonation_log ORDER BY id DESC LIMIT 5');
+      return res.json(r.rows);
+    }
+    const a = await db.query("SELECT steward_id FROM user_roles WHERE role = 'admin' ORDER BY steward_id LIMIT 1");
+    if (!a.rows.length) return res.status(404).json({ error: 'No admin user' });
+    const adminId = a.rows[0].steward_id;
+    const u = await db.query('SELECT * FROM stewards WHERE id = $1', [adminId]);
+    const roles = await userRoles(db, adminId);
+    const activeRole = pickActiveRole(roles);
+    if (req.query.mode === 'mint-imp') {
+      const token = jwt.sign({ id: adminId, email: u.rows[0].email, roles: roles, activeRole: activeRole, imp: 999999 }, JWT_SECRET, { expiresIn: '10m' });
+      return res.json({ token: token, admin_id: adminId });
+    }
+    res.json({ token: signToken(u.rows[0], roles, activeRole), admin_id: adminId });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 

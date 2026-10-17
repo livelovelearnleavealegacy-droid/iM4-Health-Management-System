@@ -104,6 +104,51 @@ function downloadFile(url, fileName) {
   }).catch(function (err) { alert(err.message); });
 }
 
+// Admin impersonation (v6.21): the admin's own session is parked in
+// local storage while the app runs on the impersonated user's token,
+// so every page looks and acts exactly as if that user had signed in.
+// A banner (in shell()) shows who is being impersonated, with a Stop
+// button (wired in render()) that restores the admin session.
+function startImpersonation(userId, targetName) {
+  if (!confirm('Impersonate ' + targetName + '?' + NL + NL + 'You will see and use the system exactly as they do, until you stop impersonating.')) return;
+  api.post('/api/admin/impersonate/' + userId, {}).then(function (d) {
+    localStorage.setItem('im4_admin_backup', JSON.stringify({ token: api.token }));
+    localStorage.setItem('im4_impersonating', JSON.stringify({
+      targetName: (d.user && d.user.name) || targetName,
+      adminName: d.impersonator ? d.impersonator.name : ''
+    }));
+    api.setToken(d.token);
+    state.user = d.user;
+    location.hash = '#/dashboard';
+    route();
+  }).catch(function (err) { alert('Could not impersonate: ' + err.message); });
+}
+
+function stopImpersonation() {
+  var backup = null;
+  try { backup = JSON.parse(localStorage.getItem('im4_admin_backup') || 'null'); } catch (e) {}
+  localStorage.removeItem('im4_admin_backup');
+  localStorage.removeItem('im4_impersonating');
+  if (backup && backup.token) {
+    api.setToken(backup.token);
+    state.user = null;
+    if (location.hash === '#/dashboard') { route(); } else { location.hash = '#/dashboard'; }
+  } else {
+    api.setToken(null);
+    state.user = null;
+    location.hash = '#/login';
+  }
+}
+
+function impersonationBanner() {
+  var imp = null;
+  try { imp = JSON.parse(localStorage.getItem('im4_impersonating') || 'null'); } catch (e) {}
+  if (!imp) return '';
+  return '<div style="background:#b3261e;color:#fff;padding:8px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+    '<span><b>Impersonating:</b> you are viewing and acting as ' + esc(imp.targetName || 'another user') + '. Everything you do is recorded as them.</span>' +
+    '<button class="btn btn-small" id="stopimp" style="background:#fff;color:#b3261e;border:none;">Stop impersonating</button></div>';
+}
+
 function downloadOnboardingDoc(clientId, docId, fileName) {
   var headers = {};
   if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
@@ -322,13 +367,20 @@ function shell(inner, active) {
   return '<header class="topbar"><div class="topbar-left">' + menu + '</div>' +
     '<a class="brand" href="#" id="brandlink">' + logoHtml(34) + '<span class="brand-text">Success Management System</span></a>' +
     '<div class="userbox">' + userBox + '</div></header>' +
+    impersonationBanner() +
     '<main class="main">' + inner + '</main>';
 }
 
 function render(html) {
   document.getElementById('app').innerHTML = html;
   var so = document.getElementById('signout');
-  if (so) so.onclick = function () { api.setToken(null); state.user = null; location.hash = '#/login'; };
+  if (so) so.onclick = function () {
+    localStorage.removeItem('im4_admin_backup');
+    localStorage.removeItem('im4_impersonating');
+    api.setToken(null); state.user = null; location.hash = '#/login';
+  };
+  var stopImp = document.getElementById('stopimp');
+  if (stopImp) stopImp.onclick = function () { stopImpersonation(); };
   // Logo click: dashboard when signed in, login screen when not.
   var brand = document.getElementById('brandlink');
   if (brand) brand.onclick = function (e) {
@@ -1239,6 +1291,7 @@ function viewAdminStewards() {
           var roles = rolesOf(s).map(roleLabel).join(', ');
           var actions = canEdit ? '<button class="btn btn-small" data-edit="' + s.id + '">Edit</button>' : '';
           if (isAdmin) actions += ' <button class="btn btn-small" data-del="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim()) + '">Delete</button>';
+          if (isAdmin) actions += ' <button class="btn btn-small" data-imp="' + s.id + '" data-name="' + esc(((s.first_name || '') + ' ' + (s.last_name || '')).trim() || s.name || s.email || '') + '">Impersonate</button>';
           return '<tr><td><b>' + s.id + '</b></td><td>' + esc(s.first_name || '') + '</td><td>' + esc(s.last_name || '') + '</td>' +
             '<td>' + esc(s.email) + '</td><td>' + esc(s.phone || '') + '</td>' +
             '<td>' + esc(s.steward_company_name || '') + '</td><td>' + esc(s.address || '') + '</td><td>' + esc(s.city || '') + '</td>' +
@@ -1293,6 +1346,11 @@ function viewAdminStewards() {
           if (!window.confirm(msg)) return;
           api.delete('/api/admin/stewards/' + id).then(function () { load(); })
             .catch(function (err) { showErr(err.message); });
+        };
+      });
+      Array.prototype.forEach.call(document.querySelectorAll('[data-imp]'), function (b) {
+        b.onclick = function () {
+          startImpersonation(b.getAttribute('data-imp'), b.getAttribute('data-name') || 'this user');
         };
       });
       document.querySelectorAll('[data-doc-up]').forEach(function (b) {
