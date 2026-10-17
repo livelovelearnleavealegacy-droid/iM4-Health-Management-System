@@ -79,6 +79,31 @@ function uploadFile(url, formData) {
   });
 }
 
+// Generic authenticated file download (v6.19.1): the Companies-page ACH
+// download and the Parent-page document download buttons were wired to
+// downloadFile() but it was never defined, so both buttons were dead.
+// Same fetch-blob pattern as downloadOnboardingDoc; the file name comes
+// from the server's Content-Disposition unless one is passed in.
+function downloadFile(url, fileName) {
+  var headers = {};
+  if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
+  var name = fileName || 'download';
+  fetch(url, { headers: headers }).then(function (resp) {
+    if (!resp.ok) throw new Error('Download failed');
+    var cd = resp.headers.get('Content-Disposition') || '';
+    var m = cd.match(/filename="([^"]+)"/);
+    if (!fileName && m) name = m[1];
+    return resp.blob();
+  }).then(function (blob) {
+    var el = document.createElement('a');
+    el.href = URL.createObjectURL(blob);
+    el.download = name;
+    document.body.appendChild(el);
+    el.click();
+    setTimeout(function () { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+  }).catch(function (err) { alert(err.message); });
+}
+
 function downloadOnboardingDoc(clientId, docId, fileName) {
   var headers = {};
   if (api.token) headers['Authorization'] = 'Bearer ' + api.token;
@@ -1539,7 +1564,7 @@ function viewReferralFees() {
           var out = document.getElementById('rf-gen-out');
           out.innerHTML = '<p class="muted">Generating statements...</p>';
           api.post('/api/admin/referral-fees/periods/' + selectedId + '/generate-statements', {}).then(function (r) {
-            out.innerHTML = okHtml('Statements done: ' + r.created + ' created, ' + r.replaced + ' replaced, ' + r.unchanged + ' unchanged (' + r.total + ' payees).');
+            out.innerHTML = okHtml('Statements done: ' + r.created + ' created, ' + r.replaced + ' replaced, ' + r.unchanged + ' unchanged, ' + (r.removed || 0) + ' removed (' + r.total + ' payees).');
             loadStatements();
           }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
         };
