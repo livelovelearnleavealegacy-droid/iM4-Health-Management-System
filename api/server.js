@@ -5097,6 +5097,16 @@ async function runGithubSync() {
   }
 }
 
+// TEMP PROBE v6.16 (remove after verification): report the user_roles
+// CHECK constraint so the 'commissions' migration can be confirmed live.
+app.get('/api/admin/probe-v616', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const c = await getPool().query("SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'user_roles'::regclass AND contype = 'c'");
+    res.json({ constraints: c.rows.map(function (r) { return r.def; }) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/sync-github', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   try {
