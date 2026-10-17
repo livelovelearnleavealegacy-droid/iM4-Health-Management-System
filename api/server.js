@@ -5254,6 +5254,41 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
+// TEMP W9 fix probe (remove after verification): applies Leroy's
+// resolutions for the six both-TIN W9s (Company/EIN side), the E3 and
+// One Arc ZIP corrections, and the Oliver / Nelson record renames.
+app.post('/api/admin/probe-w9fix', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'verify') {
+      const ids = String(req.query.ids || '').split(',').map(function (x) { return parseInt(x, 10); }).filter(Boolean);
+      const r = await db.query(
+        "SELECT id, first_name, last_name, name, email, steward_company_name, zip, payee, " +
+        "CASE WHEN tax_id IS NULL THEN NULL ELSE '...' || RIGHT(tax_id, 4) END AS tax_masked " +
+        'FROM stewards WHERE id = ANY($1) ORDER BY id', [ids]);
+      return res.json(r.rows);
+    }
+    const items = (req.body && req.body.items) || [];
+    let updated = 0;
+    for (const it of items) {
+      const sets = [];
+      const vals = [];
+      const FIELDS = { payee: 'payee', tax_id: 'tax_id', company_name: 'steward_company_name', zip: 'zip', first_name: 'first_name', last_name: 'last_name', name: 'name' };
+      for (const k of Object.keys(FIELDS)) {
+        if (it[k] !== undefined && it[k] !== null) { vals.push(k === 'tax_id' ? String(it[k]).replace(/\D/g, '') : it[k]); sets.push(FIELDS[k] + ' = $' + vals.length); }
+      }
+      if (!sets.length) continue;
+      vals.push(it.steward_id);
+      await db.query('UPDATE stewards SET ' + sets.join(', ') + ' WHERE id = $' + vals.length, vals);
+      updated++;
+    }
+    res.json({ updated: updated });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
