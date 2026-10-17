@@ -5254,6 +5254,42 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
+// TEMP diagnostic probe (remove after use): why did Leroy's Oct 1-15
+// FTJ load produce no Strobeck pending commissions? Reports referral
+// periods, recent imports with skip-reason tallies, Strobeck's pending
+// rows anywhere, and F-bill counts (in case the Billing card was used).
+app.post('/api/admin/probe-octload', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const periods = await db.query(
+      'SELECT p.id, p.label, p.status, ' +
+      '(SELECT COUNT(*) FROM referral_fee_lines l WHERE l.period_id = p.id) AS lines, ' +
+      '(SELECT COUNT(*) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS pending_rows, ' +
+      '(SELECT COUNT(*) FROM referral_fee_statements st WHERE st.period_id = p.id) AS statements ' +
+      'FROM referral_fee_periods p ORDER BY p.id');
+    const imports = await db.query(
+      'SELECT id, period_id, source, file_name, groups_seen, lines_created, duplicates_ignored, rows_created, skipped, imported_at FROM referral_fee_imports ORDER BY id DESC LIMIT 5');
+    const impOut = imports.rows.map(function (r) {
+      const tally = {};
+      const sk = Array.isArray(r.skipped) ? r.skipped : [];
+      sk.forEach(function (s) { const k = String(s.reason || '').slice(0, 60); tally[k] = (tally[k] || 0) + 1; });
+      return { id: r.id, period_id: r.period_id, source: r.source, file_name: r.file_name, groups_seen: r.groups_seen, lines_created: r.lines_created, duplicates_ignored: r.duplicates_ignored, rows_created: r.rows_created, imported_at: r.imported_at, skip_tally: tally, skip_sample: sk.slice(0, 5) };
+    });
+    const strobeck = await db.query(
+      'SELECT period_id, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending WHERE steward_id = 153909 GROUP BY period_id');
+    const fBills = await db.query(
+      "SELECT COUNT(*) AS f_total, COUNT(*) FILTER (WHERE payroll_date >= '2026-10-01') AS f_oct FROM invoices WHERE bill_type = 'F'");
+    const commissions = await db.query(
+      'SELECT COUNT(*) AS split_rows, COUNT(DISTINCT company_code) AS companies FROM commissions');
+    const strobeckSplits = await db.query(
+      'SELECT COUNT(*) AS rows, COUNT(DISTINCT company_code) AS companies FROM commissions WHERE steward_code = 153909');
+    res.json({ periods: periods.rows, imports: impOut, strobeck_pending: strobeck.rows, f_bills: fBills.rows[0], commissions: commissions.rows[0], strobeck_splits: strobeckSplits.rows[0] });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
