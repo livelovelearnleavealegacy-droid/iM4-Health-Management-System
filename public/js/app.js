@@ -1688,7 +1688,8 @@ function viewReferralFees() {
         }
         html += '<div class="card"><div class="card-title">Statements</div>' +
           '<p class="muted">One statement per payee, filled from the &quot;iM4 Health Statement Template&quot; in Forms. Generating again skips statements that have not changed and replaces ones that have.</p>' +
-          (isAdmin ? '<p><button class="btn btn-primary" id="rf-gen">Generate statements</button></p>' : '') +
+          (isAdmin && d.period && d.period.status === 'open' ? '<p><button class="btn btn-primary" id="rf-gen">Generate statements</button></p>' : '') +
+          (d.period && d.period.status !== 'open' ? '<p class="muted">This period is locked — its statements are the as-sent record and cannot be regenerated.</p>' : '') +
           '<div id="rf-gen-out"></div><div id="rf-statements"><p class="muted">Loading statements...</p></div></div>';
         box.innerHTML = html;
         loadStatements();

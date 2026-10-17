@@ -5053,6 +5053,16 @@ function statementFileBase(content, collision) {
 }
 
 async function generateReferralStatements(db, periodId, userId) {
+  // Locked periods are the as-sent record (v6.23, Leroy's Option A
+  // backload): their statements were loaded from the files actually
+  // sent and must never be regenerated away - the mirror rule would
+  // otherwise delete them, since no calculated rows stand behind them.
+  const perChk = await db.query('SELECT status FROM referral_fee_periods WHERE id = $1', [periodId]);
+  if (perChk.rows.length && perChk.rows[0].status !== 'open') {
+    const e = new Error('That period is locked. Its statements are the as-sent record and cannot be regenerated.');
+    e.status = 400;
+    throw e;
+  }
   const tpl = await db.query('SELECT file_data FROM forms WHERE name = $1', [STATEMENT_TEMPLATE_FORM]);
   if (!tpl.rows.length) {
     const e = new Error('Statement template not found in Forms. Upload an .xlsx named "' + STATEMENT_TEMPLATE_FORM + '" on the Forms page first.');
@@ -5241,6 +5251,55 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.23 backload probe (remove after the September load is
+// verified): mode=directory returns the stewards list for matching;
+// mode=load creates the locked period if needed and inserts as-sent
+// statements (idempotent per steward); mode=verify lists the period's
+// statements with md5 hashes for byte-exact comparison.
+app.post('/api/admin/probe-backload', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.mode === 'directory') {
+      const r = await db.query('SELECT id, first_name, last_name, name, email, statement_email, steward_company_name, payee FROM stewards ORDER BY id');
+      return res.json(r.rows);
+    }
+    if (req.query.mode === 'verify') {
+      const r = await db.query(
+        "SELECT st.steward_id, st.payee_name, st.total, st.enrolled, st.file_name, st.statement_date, octet_length(st.file_data) AS bytes, md5(st.file_data) AS md5 " +
+        'FROM referral_fee_statements st JOIN referral_fee_periods p ON p.id = st.period_id WHERE p.label = $1 ORDER BY st.payee_name', [req.query.label]);
+      const per = await db.query('SELECT id, label, status FROM referral_fee_periods WHERE label = $1', [req.query.label]);
+      return res.json({ period: per.rows[0] || null, statements: r.rows });
+    }
+    const body = req.body || {};
+    const label = String(body.label || '').trim();
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!label || !items.length) return res.status(400).json({ error: 'label and items are required' });
+    let per = await db.query('SELECT id, status FROM referral_fee_periods WHERE label = $1', [label]);
+    if (!per.rows.length) {
+      per = await db.query("INSERT INTO referral_fee_periods (label, status) VALUES ($1, 'locked') RETURNING id, status", [label]);
+    }
+    const periodId = per.rows[0].id;
+    let inserted = 0, skipped = 0;
+    for (const it of items) {
+      const buf = Buffer.from(String(it.file_b64 || ''), 'base64');
+      if (!buf.length) { skipped++; continue; }
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      const ex = await db.query('SELECT id FROM referral_fee_statements WHERE period_id = $1 AND steward_id = $2', [periodId, it.steward_id]);
+      if (ex.rows.length) { skipped++; continue; }
+      await db.query(
+        'INSERT INTO referral_fee_statements (period_id, steward_id, payee_name, statement_date, total, enrolled, file_name, file_data, content_hash, generated_by) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)',
+        [periodId, it.steward_id, it.payee_name, it.statement_date, it.total, it.enrolled, it.file_name, buf, hash]);
+      inserted++;
+    }
+    const sums = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS tot FROM referral_fee_statements WHERE period_id = $1', [periodId]);
+    res.json({ period_id: periodId, status: per.rows[0].status, inserted: inserted, skipped: skipped, stmt_count: Number(sums.rows[0].n), stmt_total: sums.rows[0].tot });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 
