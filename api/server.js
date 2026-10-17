@@ -5115,10 +5115,10 @@ app.post('/api/admin/probe-stmt-mirror', async (req, res) => {
     if (req.query.mode === 'fixture') {
       const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE MIRROR TEST') RETURNING id");
       const pid = per.rows[0].id;
+      const line = await db.query(
+        "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
+        "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
       const mk = async function (stewardId, stewardName, fee) {
-        const line = await db.query(
-          "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
-          "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
         await db.query(
           'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
           [line.rows[0].id, pid, 'TESTX', stewardId, stewardName, 25, fee]);
