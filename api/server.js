@@ -5105,45 +5105,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.19.1 probe (remove after verification): orphan-statement
-// removal on a throwaway fixture period, and a regenerate of a real
-// period with its stored totals.
-app.post('/api/admin/probe-stmt-mirror', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    if (req.query.mode === 'fixture') {
-      const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE MIRROR TEST') RETURNING id");
-      const pid = per.rows[0].id;
-      const line = await db.query(
-        "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
-        "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
-      const mk = async function (stewardId, stewardName, fee) {
-        await db.query(
-          'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-          [line.rows[0].id, pid, 'TESTX', stewardId, stewardName, 25, fee]);
-      };
-      await mk(153909, 'Logan Strobeck', 46.15);
-      await mk(156001, 'Jessica Jones', 46.15);
-      const g1 = await generateReferralStatements(db, pid, null);
-      await db.query('DELETE FROM referral_fee_pending WHERE period_id = $1 AND steward_id = $2', [pid, 156001]);
-      const g2 = await generateReferralStatements(db, pid, null);
-      const left = await db.query('SELECT steward_id FROM referral_fee_statements WHERE period_id = $1', [pid]);
-      await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [pid]);
-      return res.json({
-        first: { created: g1.created, removed: g1.removed, total: g1.total },
-        after_payee_removed: { created: g2.created, unchanged: g2.unchanged, removed: g2.removed, total: g2.total },
-        statements_left_for_period: left.rows.map(function (r) { return r.steward_id; })
-      });
-    }
-    const out = await generateReferralStatements(db, parseInt(req.query.period, 10), null);
-    const sums = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS tot FROM referral_fee_statements WHERE period_id = $1', [req.query.period]);
-    res.json({ generate: { created: out.created, replaced: out.replaced, unchanged: out.unchanged, removed: out.removed, total: out.total }, stored: sums.rows[0] });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
