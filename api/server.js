@@ -507,6 +507,17 @@ async function migrate() {
     'pct NUMERIC NOT NULL, ' +
     'referral_fee NUMERIC NOT NULL, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW())');
+  // v6.17.1 (Leroy): ONE rounding adjustment record per period. Per-row
+  // cent rounding makes the pending rows total a few cents off the admin
+  // fee total; the difference is posted to RLJAT (steward 155026) as a
+  // single adjustment so the period foots exactly.
+  await db.query('CREATE TABLE IF NOT EXISTS referral_fee_adjustments (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'period_id INT NOT NULL UNIQUE REFERENCES referral_fee_periods(id) ON DELETE CASCADE, ' +
+    'steward_id INT, ' +
+    'steward_name TEXT, ' +
+    'amount NUMERIC NOT NULL DEFAULT 0, ' +
+    'updated_at TIMESTAMPTZ DEFAULT NOW())');
   // v5.30: accounts receivable module.
   await db.query('CREATE TABLE IF NOT EXISTS ar_followups (' +
     'id SERIAL PRIMARY KEY, ' +
@@ -4365,6 +4376,29 @@ function statementDateFor(appliedISO) {
 // divided by the factor for the pay frequency.
 const REFERRAL_FACTORS = { '1': 9.23, '2': 18.46, '3': 20, '4': 40, 'M': 40 };
 
+// Rounding rule (v6.17.1, Leroy): each pending row is rounded to the cent,
+// so a period's rows can total a few cents more or less than its admin
+// fees. ONE adjustment record per period carries the exact difference,
+// posted to RLJAT (steward 155026, per Leroy's commission files), so the
+// period always foots exactly: rows + adjustment = admin fees. Recomputed
+// after every import into the period.
+const REFERRAL_ROUNDING_STEWARD_ID = 155026;
+async function refreshReferralAdjustment(db, periodId) {
+  const t = await db.query(
+    'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS admin_total, ' +
+    '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS fees_total, ' +
+    '(SELECT COUNT(*) FROM referral_fee_lines WHERE period_id = $1) AS line_count', [periodId]);
+  const lineCount = parseInt(t.rows[0].line_count, 10);
+  if (!lineCount) return null;
+  const adjCents = Math.round(Number(t.rows[0].admin_total) * 100) - Math.round(Number(t.rows[0].fees_total) * 100);
+  const amount = adjCents / 100;
+  await db.query(
+    'INSERT INTO referral_fee_adjustments (period_id, steward_id, steward_name, amount, updated_at) VALUES ($1, $2, $3, $4, NOW()) ' +
+    'ON CONFLICT (period_id) DO UPDATE SET steward_id = EXCLUDED.steward_id, steward_name = EXCLUDED.steward_name, amount = EXCLUDED.amount, updated_at = NOW()',
+    [periodId, REFERRAL_ROUNDING_STEWARD_ID, 'RLJAT', amount]);
+  return { steward_id: REFERRAL_ROUNDING_STEWARD_ID, steward_name: 'RLJAT', amount: amount };
+}
+
 // Calculate one FTJ Premium Applied Report into pending referral fee rows
 // for a period. Only the Admin Fees are used (products with PRODUCT ID
 // 'ADMIN', signed amounts, so backouts net out). One calculated line per
@@ -4446,10 +4480,11 @@ async function runReferralImportF(db, buffer, fileName, periodId, userId) {
   await db.query(
     'UPDATE referral_fee_imports SET lines_created = $1, duplicates_ignored = $2, rows_created = $3, skipped = $4 WHERE id = $5',
     [linesCreated, duplicates, rowsCreated, JSON.stringify(skipped), importId]);
+  const adjustment = await refreshReferralAdjustment(db, periodId);
   return {
     import_id: importId, period_id: periodId, source: 'F', file_name: fileName || null,
     groups_seen: bills.length, lines_created: linesCreated, duplicates_ignored: duplicates,
-    rows_created: rowsCreated, skipped: skipped
+    rows_created: rowsCreated, skipped: skipped, adjustment: adjustment
   };
 }
 
@@ -4461,7 +4496,8 @@ app.get('/api/referral-fees/periods', requireReferralViewer, async (req, res) =>
       '(SELECT COUNT(*) FROM referral_fee_lines l WHERE l.period_id = p.id) AS line_count, ' +
       '(SELECT COUNT(*) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS row_count, ' +
       '(SELECT COALESCE(SUM(l.admin_fee), 0) FROM referral_fee_lines l WHERE l.period_id = p.id) AS total_admin_fees, ' +
-      '(SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS total_referral_fees ' +
+      '(SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp WHERE pp.period_id = p.id) + ' +
+      '(SELECT COALESCE(adj.amount, 0) FROM referral_fee_adjustments adj WHERE adj.period_id = p.id) AS total_referral_fees ' +
       'FROM referral_fee_periods p ORDER BY p.id');
     res.json(r.rows);
   } catch (error) {
@@ -4500,7 +4536,11 @@ app.get('/api/referral-fees/periods/:id', requireReferralViewer, async (req, res
     const totals = await db.query(
       'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS total_admin_fees, ' +
       '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS total_referral_fees', [req.params.id]);
-    res.json({ period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: totals.rows[0] });
+    const adj = await db.query('SELECT * FROM referral_fee_adjustments WHERE period_id = $1', [req.params.id]);
+    const adjustment = adj.rows.length ? adj.rows[0] : null;
+    const t = totals.rows[0];
+    t.net_referral_fees = Math.round((Number(t.total_referral_fees) + (adjustment ? Number(adjustment.amount) : 0)) * 100) / 100;
+    res.json({ period: per.rows[0], imports: imports.rows, rows: rows.rows, totals: t, adjustment: adjustment });
   } catch (error) {
     console.error('Referral period detail error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -4521,6 +4561,25 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
+  }
+});
+
+// TEMP v6.17.1 (remove after July is adjusted): apply the rounding
+// adjustment to an existing period via the sync secret.
+app.post('/api/admin/probe-rf-adjust', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    const periodId = parseInt(req.query.period, 10);
+    if (!periodId) return res.status(400).json({ error: 'period query param required' });
+    const adjustment = await refreshReferralAdjustment(db, periodId);
+    const t = await db.query(
+      'SELECT (SELECT COALESCE(SUM(admin_fee), 0) FROM referral_fee_lines WHERE period_id = $1) AS admin_total, ' +
+      '(SELECT COALESCE(SUM(referral_fee), 0) FROM referral_fee_pending WHERE period_id = $1) AS fees_total', [periodId]);
+    const net = Math.round((Number(t.rows[0].fees_total) + (adjustment ? adjustment.amount : 0)) * 100) / 100;
+    res.json({ adjustment: adjustment, admin_total: t.rows[0].admin_total, fees_total: t.rows[0].fees_total, net_referral_fees: net, exact: net === Number(t.rows[0].admin_total) });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe adjust failed' });
   }
 });
 

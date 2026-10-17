@@ -1441,8 +1441,13 @@ function viewReferralFees() {
                 '<td>' + esc(r.enrolled) + '</td><td>' + esc(r.steward_id) + '</td><td>' + esc(r.steward_name || '') + '</td>' +
                 '<td>' + esc(String(r.statement_date).slice(0, 10)) + '</td></tr>';
             }).join('') +
+            (d.adjustment ? '<tr style="background:#f4f6f8;font-style:italic;"><td></td><td>Rounding adjustment</td><td></td><td></td><td></td>' +
+              '<td><b>' + money(d.adjustment.amount) + '</b></td><td></td><td>' + esc(d.adjustment.steward_id) + '</td>' +
+              '<td>' + esc(d.adjustment.steward_name || '') + '</td><td></td></tr>' : '') +
             '</tbody></table></div>' +
-            '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(d.totals.total_admin_fees) + '</b> &nbsp; Total Referral Fees: <b>' + money(d.totals.total_referral_fees) + '</b> &nbsp; <span class="muted">' + d.rows.length + ' pending rows</span></p></div>';
+            '<p style="margin-top:8px;">Total Admin Fees: <b>' + money(d.totals.total_admin_fees) + '</b> &nbsp; Total Referral Fees: <b>' + money(d.totals.net_referral_fees) + '</b>' +
+            (d.adjustment ? ' <span class="muted">(rows ' + money(d.totals.total_referral_fees) + ' + rounding adjustment ' + money(d.adjustment.amount) + ' to ' + esc(d.adjustment.steward_name || 'RLJAT') + ')</span>' : '') +
+            ' &nbsp; <span class="muted">' + d.rows.length + ' pending rows</span></p></div>';
         } else {
           html += '<div class="card"><div class="card-title">Pending Commissions</div><p class="muted">Nothing calculated yet. Load a source file from the Jobs page (Referral Fee import card) or above.</p></div>';
         }
@@ -1458,7 +1463,7 @@ function viewReferralFees() {
           fd.append('source', 'F');
           out.innerHTML = '<p class="muted">Calculating referral fees...</p>';
           uploadFile('/api/admin/referral-fees/import', fd).then(function (r) {
-            out.innerHTML = okHtml('Done: ' + r.lines_created + ' calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created' + (r.skipped && r.skipped.length ? ', ' + r.skipped.length + ' skipped (see the file list above).' : '.'));
+            out.innerHTML = okHtml('Done: ' + r.lines_created + ' calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created' + (r.skipped && r.skipped.length ? ', ' + r.skipped.length + ' skipped (see the file list above).' : '.') + (r.adjustment ? ' Rounding adjustment to ' + esc(r.adjustment.steward_name || 'RLJAT') + ': ' + money(r.adjustment.amount) + '.' : ''));
             loadPeriods();
           }).catch(function (err) { out.innerHTML = errorHtml(err.message); });
         };
@@ -3122,7 +3127,7 @@ function viewAdminJobs() {
         fd.append('source', 'F');
         out.innerHTML = '<p class="muted">Calculating referral fees - this can take a moment on a large report...</p>';
         uploadFile('/api/admin/referral-fees/import', fd).then(function (r) {
-          var html = okHtml('Done: ' + r.lines_created + ' payroll dates calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created. See them on the Referral Fees page.');
+          var html = okHtml('Done: ' + r.lines_created + ' payroll dates calculated, ' + r.duplicates_ignored + ' already calculated (ignored), ' + r.rows_created + ' pending rows created. See them on the Referral Fees page.' + (r.adjustment ? ' Rounding adjustment to ' + esc(r.adjustment.steward_name || 'RLJAT') + ': ' + fmtMoney(r.adjustment.amount) + '.' : ''));
           if (r.skipped && r.skipped.length) {
             html += '<p style="color:#b3261e;">Skipped ' + r.skipped.length + ':</p>' + r.skipped.map(function (sk) {
               return '<div>&bull; ' + esc(sk.company_code) + ' ' + esc(String(sk.modal_date).slice(0, 10)) + ' - ' + esc(sk.reason) + '</div>';
