@@ -4720,47 +4720,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
-// TEMP v6.18.2 probe (remove after verification): build a throwaway
-// period with one line, one pending row, and an adjustment, delete it
-// through the real delete path, and confirm everything is gone -
-// including that the freed (company, payroll date) can be inserted
-// again (no longer marked calculated).
-app.post('/api/admin/probe-rf-delete', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const per = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE DELETE TEST') RETURNING id");
-    const pid = per.rows[0].id;
-    const line = await db.query(
-      "INSERT INTO referral_fee_lines (period_id, source, company_code, company_name, modal_date, applied_date, statement_date, bill_mode, admin_fee, enrolled) " +
-      "VALUES ($1, 'F', 'TESTX', 'Probe Co', '2026-01-05', '2026-01-20', '2026-02-01', '2', 184.60, 10) RETURNING id", [pid]);
-    await db.query(
-      'INSERT INTO referral_fee_pending (line_id, period_id, company_code, steward_id, steward_name, pct, referral_fee) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [line.rows[0].id, pid, 'TESTX', 155026, 'RLJAT', 100, 184.60]);
-    await db.query(
-      'INSERT INTO referral_fee_adjustments (period_id, steward_id, steward_name, amount) VALUES ($1, $2, $3, $4)',
-      [pid, 155026, 'RLJAT', -0.01]);
-    const out = await deleteReferralPeriod(db, pid);
-    const left = await db.query(
-      'SELECT (SELECT COUNT(*) FROM referral_fee_periods WHERE id = $1) AS periods, ' +
-      '(SELECT COUNT(*) FROM referral_fee_lines WHERE period_id = $1) AS lines, ' +
-      '(SELECT COUNT(*) FROM referral_fee_pending WHERE period_id = $1) AS pending_rows, ' +
-      '(SELECT COUNT(*) FROM referral_fee_adjustments WHERE period_id = $1) AS adjustments', [pid]);
-    let reinsert = 'failed';
-    const per2 = await db.query("INSERT INTO referral_fee_periods (label) VALUES ('PROBE DELETE TEST 2') RETURNING id");
-    try {
-      await db.query(
-        "INSERT INTO referral_fee_lines (period_id, source, company_code, modal_date, statement_date, admin_fee, enrolled) VALUES ($1, 'F', 'TESTX', '2026-01-05', '2026-02-01', 1, 1)",
-        [per2.rows[0].id]);
-      reinsert = 'ok';
-    } catch (e) { reinsert = 'blocked: ' + e.message; }
-    await db.query('DELETE FROM referral_fee_periods WHERE id = $1', [per2.rows[0].id]);
-    res.json({ deleted: out, left: left.rows[0], reinsert_after_delete: reinsert });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
-  }
-});
-
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
