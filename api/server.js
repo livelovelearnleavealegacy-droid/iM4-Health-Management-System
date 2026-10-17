@@ -4720,6 +4720,25 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   }
 });
 
+// TEMP v6.19 probe (remove after the statement build): list forms and
+// fetch one form file (base64) so the statement template can be inspected.
+app.get('/api/admin/probe-forms', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    const db = getPool();
+    if (req.query.id) {
+      const r = await db.query('SELECT id, name, file_name, mime_type, file_data FROM forms WHERE id = $1', [req.query.id]);
+      if (!r.rows.length) return res.status(404).json({ error: 'Form not found' });
+      const f = r.rows[0];
+      return res.json({ id: f.id, name: f.name, file_name: f.file_name, mime_type: f.mime_type, base64: f.file_data.toString('base64') });
+    }
+    const r = await db.query('SELECT id, name, file_name, mime_type, LENGTH(file_data) AS bytes, updated_at FROM forms ORDER BY name');
+    res.json(r.rows);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Probe failed' });
+  }
+});
+
 // List tickets, scoped by role: service/admin/top_dog see all; client/steward see their companies.
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
