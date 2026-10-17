@@ -1871,7 +1871,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     const coParams = [];
     if (ids) {
       if (ids.length === 0) {
-        return res.json({ totalClients: 0, clientsByStage: [], totalLives: 0, totalEnrolled: 0, billingOpen: { count: 0, total: 0 }, billingPaid: { count: 0, total: 0 } });
+        return res.json({ totalClients: 0, clientsByStage: [], totalLives: 0, totalEnrolled: 0, billingOpen: { count: 0, total: 0 }, billingPaid: { count: 0, total: 0 }, commissionsPaidLastMonth: { label: null, total: 0 }, commissionsPending: { total: 0 } });
       }
       coWhere = 'WHERE c.id = ANY($1)';
       coParams.push(ids);
@@ -1930,6 +1930,28 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
         (ids ? "WHERE c2.id = ANY($1) AND c2.company_status <> 'TERMED'" : "WHERE c2.company_status <> 'TERMED'") + ')',
         eParams);
     } catch (e) { console.error('Enrolled last payroll error:', e); }
+    // Commissions figures for the Success Dashboard (v6.25, Leroy):
+    // "paid last month" = the statement total of the most recent period
+    // whose statements are dated on or before the 1st of this month
+    // (statements for a month are dated the 1st of the next month, so
+    // in October this is September's period); "pending this month" =
+    // every pending commission row plus rounding adjustments across
+    // all open periods - the same numbers as the Referral Fees
+    // Pending tab.
+    let commissionsPaidLastMonth = { label: null, total: 0 };
+    let commissionsPending = { total: 0 };
+    try {
+      const paid = await db.query(
+        'SELECT p.label AS label, COALESCE(SUM(st.total), 0)::float AS total ' +
+        'FROM referral_fee_statements st JOIN referral_fee_periods p ON p.id = st.period_id ' +
+        "WHERE st.statement_date <= date_trunc('month', CURRENT_DATE)::date " +
+        'GROUP BY p.id, p.label ORDER BY MAX(st.statement_date) DESC LIMIT 1');
+      if (paid.rows.length) commissionsPaidLastMonth = { label: paid.rows[0].label, total: paid.rows[0].total };
+      const pend = await db.query(
+        'SELECT (SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp JOIN referral_fee_periods p ON p.id = pp.period_id WHERE p.status = \'open\') ' +
+        '+ (SELECT COALESCE(SUM(a.amount), 0) FROM referral_fee_adjustments a JOIN referral_fee_periods p ON p.id = a.period_id WHERE p.status = \'open\') AS total');
+      commissionsPending = { total: Math.round(Number(pend.rows[0].total) * 100) / 100 };
+    } catch (e) { console.error('Dashboard commissions error:', e); }
     res.json({
       totalClients: tc.rows[0].c,
       clientsByStage: st.rows,
@@ -1937,6 +1959,8 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
       totalEnrolled: te.rows[0].t,
       billingOpen: billingOpen,
       billingPaid: billingPaid,
+      commissionsPaidLastMonth: commissionsPaidLastMonth,
+      commissionsPending: commissionsPending,
       enrolledLastPayroll: enrolledLast.rows[0] ? enrolledLast.rows[0].t : 0,
       lastPayrollDate: enrolledLast.rows[0] ? enrolledLast.rows[0].d : null
     });
@@ -5282,36 +5306,6 @@ app.post('/api/admin/referral-fees/import', requireAdmin, handleUpload('file'), 
   } catch (error) {
     console.error('Referral import error:', error);
     res.status(400).json({ error: error.message || 'Import failed' });
-  }
-});
-
-// TEMP October referral status probe (remove after use).
-app.post('/api/admin/probe-octstatus', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  try {
-    const db = getPool();
-    const periods = await db.query(
-      'SELECT p.id, p.label, p.status, ' +
-      '(SELECT COUNT(*) FROM referral_fee_lines l WHERE l.period_id = p.id) AS lines, ' +
-      '(SELECT COUNT(*) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS pending_rows, ' +
-      '(SELECT COALESCE(SUM(pp.referral_fee), 0) FROM referral_fee_pending pp WHERE pp.period_id = p.id) AS pending_fees ' +
-      'FROM referral_fee_periods p ORDER BY p.id');
-    const imports = await db.query(
-      'SELECT id, period_id, file_name, groups_seen, lines_created, duplicates_ignored, rows_created FROM referral_fee_imports ORDER BY id DESC LIMIT 3');
-    const strobeck = await db.query(
-      'SELECT period_id, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending WHERE steward_id = 153909 GROUP BY period_id');
-    const topStewards = await db.query(
-      'SELECT steward_id, steward_name, COUNT(*) AS rows, COALESCE(SUM(referral_fee), 0) AS fees FROM referral_fee_pending GROUP BY steward_id, steward_name ORDER BY fees DESC LIMIT 8');
-    if (req.query.mode === 'mint') {
-      const rr = await db.query('SELECT role FROM user_roles WHERE steward_id = 100000 ORDER BY role');
-      const token = signToken({ id: 100000, roles: rr.rows.map(function (x) { return x.role; }), activeRole: 'admin' });
-      const adj = await db.query('SELECT period_id, amount FROM referral_fee_adjustments');
-      const adm = await db.query('SELECT period_id, COALESCE(SUM(admin_fee), 0) AS admin_total FROM referral_fee_lines GROUP BY period_id');
-      return res.json({ token: token, adjustments: adj.rows, admin_totals: adm.rows });
-    }
-    res.json({ periods: periods.rows, imports: imports.rows, strobeck: strobeck.rows, top_stewards: topStewards.rows });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Probe failed' });
   }
 });
 

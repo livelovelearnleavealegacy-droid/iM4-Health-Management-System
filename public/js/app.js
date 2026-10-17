@@ -293,12 +293,12 @@ function navLinks() {
   var role = activeRole();
   var links = [];
   if (role === 'admin' || role === 'top_dog' || role === 'steward') {
-    links.push(['#/dashboard', 'Dashboard']);
-    links.push(['#/clients', 'Companies']);
+    links.push(['#/dashboard', 'Success Dashboard']);
+    links.push(['#/clients', 'Clients']);
   }
   links.push(['#/billing', 'Billing']);
   if (role === 'service') {
-    links.push(['#/clients', 'Companies']);
+    links.push(['#/clients', 'Clients']);
   }
   if (role !== 'commissions') {
     links.push(['#/implementations', 'Implementation']);
@@ -654,21 +654,32 @@ function viewDashboard() {
         }
       });
       render(shell(
-        '<h2>Dashboard</h2><div id="err"></div>' +
+        '<h2 style="text-align:center;font-size:30px;">Success Dashboard</h2><div id="err"></div>' +
+        '<h3>Client</h3>' +
         '<div class="card-grid">' +
         '<div class="card"><div class="card-title">Total Clients</div><div class="stat-big">' + d.totalClients + '</div></div>' +
         '<div class="card"><div class="card-title">Total Enrolled</div><div class="stat-big">' + (d.totalEnrolled || 0) + '</div></div>' +
+        '</div>' +
+        '<h3>Commissions</h3>' +
+        '<div class="card-grid">' +
+        '<div class="card"><div class="card-title">Paid Last Month</div><div class="stat-big">' + fmtMoney(d.commissionsPaidLastMonth ? d.commissionsPaidLastMonth.total : 0) + '</div>' +
+        (d.commissionsPaidLastMonth && d.commissionsPaidLastMonth.label ? '<p class="muted" style="margin:4px 0 0;">' + esc(d.commissionsPaidLastMonth.label) + ' statements</p>' : '') + '</div>' +
+        '<div class="card"><div class="card-title">Pending This Month</div><div class="stat-big">' + fmtMoney(d.commissionsPending ? d.commissionsPending.total : 0) + '</div></div>' +
+        '</div>' +
+        '<h3>Invoices</h3>' +
+        '<div class="card-grid">' +
         '<div class="card"><div class="card-title">Open Invoices</div><div class="stat-big">' + d.billingOpen.count + '</div></div>' +
         '<div class="card"><div class="card-title">$ Outstanding</div><div class="stat-big">' + fmtMoney(d.billingOpen.total) + '</div></div>' +
         '</div>' +
-        '<h3>Implementation Stage</h3>' +
-        '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>' +
         '<h3>Service Tickets</h3>' +
         '<div class="card-grid">' +
         '<div class="card"><div class="card-title">My Open Tickets</div><div class="stat-big">' + (a.my_open_tickets || 0) + '</div></div>' +
         '<div class="card"><div class="card-title">Resolved (30d)</div><div class="stat-big">' + (a.my_resolved_30d || 0) + '</div></div>' +
         '</div>' +
-        (a.team && a.team.length ? '<h3>Team Accountability</h3><div class="card"><table class="data-table"><thead><tr><th>Person</th><th>Open Tickets</th><th>Resolved (30d)</th></tr></thead><tbody>' +
+        '<h3>Implementation</h3>' +
+        '<div class="card">' + (stageRows || '<p class="muted">No implementations on the kanban yet.</p>') + '</div>' +
+        '<h3>Accountability</h3>' +
+        (a.team && a.team.length ? '<div class="card"><table class="data-table"><thead><tr><th>Person</th><th>Open Tickets</th><th>Resolved (30d)</th></tr></thead><tbody>' +
         a.team.map(function (m) {
           var nm = ((m.first_name || '') + ' ' + (m.last_name || '')).trim() || m.email;
           return '<tr><td>' + esc(nm) + '</td><td><b>' + m.open_tickets + '</b></td><td>' + m.resolved_30d + '</td></tr>';
@@ -677,7 +688,6 @@ function viewDashboard() {
         // signed-in person will be listed here with a checkmark; checking
         // one grays it out and it disappears 48 hours later. Tasks will be
         // created from the Implementation Kanban boards (details TBD).
-        '<h3>Accountability</h3>' +
         '<div class="card"><p class="muted">Tasks assigned to you will be listed here. Check a task when it is done — it grays out and disappears after 48 hours. Tasks will be created from the Implementation Kanban boards. (Coming soon.)</p></div>',
         '#/dashboard'));
     }).catch(function (err) { render(shell(errorHtml(err.message), '#/dashboard')); });
@@ -860,7 +870,7 @@ function viewClients() {
           });
         }).join('');
         render(shell(
-          '<h2>Companies</h2>' + filterBar(q) + '<div id="err"></div>' +
+          '<h2>Clients</h2>' + filterBar(q) + '<div id="err"></div>' +
           (groups.length === 0
             ? '<p class="muted">No companies found. Ask your administrator to import companies and assign them to you.</p>'
             : '<div class="card-grid">' + cards + '</div>'),
@@ -937,7 +947,7 @@ function viewParent(code) {
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
       var implCards = d.implementations.map(implCard).join('');
       render(shell(
-        '<p><a href="#/clients">&larr; Companies</a></p>' +
+        '<p><a href="#/clients">&larr; Clients</a></p>' +
         '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
         '<div class="rollup"><b>Roll-up:</b> ' + enrolledLine(p.enrolled, p.eligible, p.has_payroll) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
@@ -1004,7 +1014,7 @@ function viewChild(id) {
       var eeName = c.parent_company_name || eeCode;
       var parentLink = (eeCode && eeCode !== c.company_code)
         ? '<p><a href="#/parent/' + esc(eeCode) + '">&larr; ' + esc(eeName) + '</a></p>'
-        : '<p><a href="#/clients">&larr; Companies</a></p>';
+        : '<p><a href="#/clients">&larr; Clients</a></p>';
       render(shell(parentLink +
         '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
         payrollTable(c) +
@@ -3041,7 +3051,7 @@ function viewParentPage() {
       '</div>' +
       '<p class="muted" id="parentCount"></p>' +
       '<div class="table-scroll"><table class="data-table"><thead><tr>' +
-      '<th>Parent Code</th><th>Parent Name</th><th>Parent Status</th><th>Companies</th>' +
+      '<th>Parent Code</th><th>Parent Name</th><th>Parent Status</th><th>Clients</th>' +
       '<th>Master Application</th><th>Pre-implementation Checklist</th><th>Actions</th>' +
       '</tr></thead><tbody id="parentRows"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody></table></div>' +
       '<input type="file" id="parentDocFile" style="display:none;">',
@@ -3170,7 +3180,7 @@ function viewAdminJobs() {
       '<button class="btn btn-small" id="soldltemplate">Download template</button> ' +
       '<button class="btn btn-small" id="soldelexport">Export current S bills</button><div id="solout"></div></div>' +
       '<div class="card"><div class="card-title">Payroll company summary (Power BI)</div>' +
-      '<p class="muted">Upload the Power BI payroll export spreadsheet. It takes the latest done case per company (EIN) and stores the headcounts plus the Bill and Savings Summary, then pushes those numbers to the Companies page via the EIN cross-reference \u2014 no employee PII is stored. Preview first, then import.</p>' +
+      '<p class="muted">Upload the Power BI payroll export spreadsheet. It takes the latest done case per company (EIN) and stores the headcounts plus the Bill and Savings Summary, then pushes those numbers to the Clients page via the EIN cross-reference \u2014 no employee PII is stored. Preview first, then import.</p>' +
       '<input type="file" id="payfile" accept=".xlsx,.xls"> ' +
       '<button class="btn btn-primary" id="paypreview">Upload &amp; preview</button><div id="payout"></div></div>' +
       '<div class="card"><div class="card-title">EIN \u2194 Account cross-reference</div>' +
@@ -3632,10 +3642,10 @@ function viewAdminJobs() {
               fmtMoney(g.total_admin_fee) + '</td></tr>';
           }).join('') + '</tbody></table></div>';
         html += '<p><button class="btn btn-primary" id="payimport">Import ' + s.companies + ' companies</button> ' +
-          '<span class="muted">Replaces the summary table and updates the Companies page payroll numbers. No employee PII is stored.</span></p><div id="payimportout"></div>';
+          '<span class="muted">Replaces the summary table and updates the Clients page payroll numbers. No employee PII is stored.</span></p><div id="payimportout"></div>';
         out.innerHTML = html;
         document.getElementById('payimport').onclick = function () {
-          if (!window.confirm('Import payroll summary? This replaces the company summary table and updates payroll numbers on the Companies page.')) return;
+          if (!window.confirm('Import payroll summary? This replaces the company summary table and updates payroll numbers on the Clients page.')) return;
           var iout = document.getElementById('payimportout');
           iout.innerHTML = '<p class="muted">Importing...</p>';
           api.post('/api/admin/jobs/payroll-import', { preview_token: r.preview_token }).then(function (imp) {
